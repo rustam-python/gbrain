@@ -109,8 +109,13 @@ Page slugs re-key on one `gbrain sync --full`, with no manual steps:
 * Each file with `й` or `ё` gets a page under its new slug (`андреи` →
   `андрей`), and the page the old grammar minted from the same file becomes a
   twin. The full-sync reconcile retires it: soft-deleted (recoverable 72h) and
-  its slug redirected to the new one through `slug_aliases`, so old links and
-  `get_page` calls still land, and a name both pages claimed resolves again.
+  its slug redirected to the new one through `slug_aliases` in one transaction,
+  so old links and `get_page` calls still land, and a name both pages claimed
+  resolves again. A page is only a twin when no file in the working tree still
+  derives to its slug: a live page can keep a stale `source_path` after a
+  rename, and sharing a path with another page does not make it a twin.
+  Retirement runs on source-scoped full syncs only, like every reconcile
+  delete; a sync with no source leaves twins in place.
 * Two files the old grammar collided (`Пётр Иванов.md` / `Петр Иванов.md` →
   one `петр-иванов` page) separate: each gets its own page.
 

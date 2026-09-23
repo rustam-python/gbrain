@@ -16,15 +16,16 @@ export const v214: Migration = {
   name: 'page_aliases_cyrillic_fold',
   idempotent: true,
   sql: `
-    DELETE FROM page_aliases a USING page_aliases b
-     WHERE regexp_replace(replace(a.alias_norm, 'ё', 'е'), '([Ѐ-ӿ])́+', '\\1', 'g') <> a.alias_norm
-       AND b.id <> a.id
-       AND b.source_id = a.source_id AND b.slug = a.slug
-       AND regexp_replace(replace(b.alias_norm, 'ё', 'е'), '([Ѐ-ӿ])́+', '\\1', 'g')
-         = regexp_replace(replace(a.alias_norm, 'ё', 'е'), '([Ѐ-ӿ])́+', '\\1', 'g')
-       AND (regexp_replace(replace(b.alias_norm, 'ё', 'е'), '([Ѐ-ӿ])́+', '\\1', 'g') = b.alias_norm
-            OR b.id < a.id);
-    UPDATE page_aliases SET alias_norm = regexp_replace(replace(alias_norm, 'ё', 'е'), '([Ѐ-ӿ])́+', '\\1', 'g')
-     WHERE regexp_replace(replace(alias_norm, 'ё', 'е'), '([Ѐ-ӿ])́+', '\\1', 'g') <> alias_norm;
+    WITH f AS (
+      SELECT id, source_id, slug, alias_norm, regexp_replace(replace(alias_norm, 'ё', 'е'), '([Ѐ-ӿ])́+', '\\1', 'g') AS k FROM page_aliases
+    ), dup AS (
+      SELECT fa.id FROM f fa JOIN f fb
+        ON fb.id <> fa.id AND fb.source_id = fa.source_id AND fb.slug = fa.slug AND fb.k = fa.k
+       WHERE fa.k <> fa.alias_norm AND (fb.k = fb.alias_norm OR fb.id < fa.id)
+    )
+    DELETE FROM page_aliases WHERE id IN (SELECT id FROM dup);
+    UPDATE page_aliases SET alias_norm = f.k
+      FROM (SELECT id, regexp_replace(replace(alias_norm, 'ё', 'е'), '([Ѐ-ӿ])́+', '\\1', 'g') AS k FROM page_aliases) f
+     WHERE f.id = page_aliases.id AND f.k <> page_aliases.alias_norm;
   `,
 };
