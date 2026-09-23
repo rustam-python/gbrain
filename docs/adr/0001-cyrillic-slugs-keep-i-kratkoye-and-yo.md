@@ -100,9 +100,18 @@ Alias rows re-key automatically: migration v164 (`page_aliases_cyrillic_fold`)
 applies the same `ё` → `е` and stress-mark folds to stored `alias_norm` values,
 so stored and queried keys agree without a manual `gbrain reindex --aliases`.
 
-Page slugs do not re-key by migration. A file whose name contains `й` or `ё`
-now slugs differently (`андреи` → `андрей`); the page re-keys on its next touch
-or one `gbrain sync --full`, and the old-slug twin is not retired for you.
-`gbrain orphans` lists the twin only if it has no links in either direction;
-otherwise find it by its folded spelling (`й` → `и`, `ё` → `е`,
-e.g. `gbrain get people/андреи`). Rename or delete it once.
+Page slugs re-key on one `gbrain sync --full`, with no manual steps:
+
+* The import checkpoint carries `SLUG_GRAMMAR_VERSION`; a checkpoint written
+  under the old grammar is discarded, so the run re-walks every file instead
+  of resuming past the ones that must re-key (unchanged files are cheap, skipped
+  by content hash).
+* Each file with `й` or `ё` gets a page under its new slug (`андреи` →
+  `андрей`), and the page the old grammar minted from the same file becomes a
+  twin. The full-sync reconcile retires it: soft-deleted (recoverable 72h) and
+  its slug redirected to the new one through `slug_aliases`, so old links and
+  `get_page` calls still land, and a name both pages claimed resolves again.
+* Two files the old grammar collided (`Пётр Иванов.md` / `Петр Иванов.md` →
+  one `петр-иванов` page) separate: each gets its own page.
+
+The version bumps whenever an existing file could slug differently.
