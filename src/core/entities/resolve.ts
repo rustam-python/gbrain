@@ -23,6 +23,7 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
+import { SLUG_NON_WORD_RUN_RE, foldSlugText } from '../cjk.ts';
 import { foldNonDecomposingLatin } from '../latin-fold.ts';
 import { isUndefinedTableError } from '../utils.ts';
 
@@ -106,18 +107,27 @@ function fallbackSlugify(trimmed: string): string {
   return slugify(trimmed);
 }
 
+let aliasExactWarned = false;
+
 /**
- * Alias-exact arm (v0.46.15, #3730): unambiguous single-slug page_aliases hit,
- * verified against LIVE pages — page_aliases has no FK to pages, so stale
- * alias rows for deleted/renamed pages linger (outside-voice R2-8).
- * Liveness is filtered BEFORE uniqueness (codex ship-review): a stale sibling
- * row must not veto the sole live target — that fall-through would land on
+ * Alias-exact arm (v0.46.15, #3730): normalize `raw` and return the ONE live
+ * page claiming that normalized name, or null — ambiguous, absent, or the
+ * alias table is missing; every failure falls through rather than throwing.
+ *
+ * Hits are verified against LIVE pages: page_aliases has no FK to pages, so
+ * alias rows for deleted/renamed pages linger (outside-voice R2-8). Liveness
+ * is filtered BEFORE uniqueness (codex ship-review) — a stale sibling row must
+ * not veto the sole live target, since that fall-through lands on
  * fuzzy/slugify and could recreate a phantom slug on a WRITE path.
  * Fail-open on undefined-table (pre-v110 brains have no page_aliases table);
  * other errors warn once per process so degradation isn't silent.
+ *
+ * Exported for enrichment-service, which consults it before minting an entity
+ * page (ADR-0001: two spellings slug apart, the alias layer merges them). The
+ * index is type-blind — any page may claim any name — so a caller that only
+ * accepts one namespace filters the result itself.
  */
-let aliasExactWarned = false;
-async function tryAliasExact(engine: BrainEngine, source_id: string, raw: string): Promise<string | null> {
+export async function tryAliasExact(engine: BrainEngine, source_id: string, raw: string): Promise<string | null> {
   const norm = normalizeAlias(raw);
   if (!norm) return null;
   try {
@@ -477,27 +487,18 @@ async function tryFuzzyMatch(
 
 /**
  * Deterministic slugify: lowercase, fold accents and stroke letters to their
- * base letter, replace non-alphanumerics with hyphens, collapse repeated
- * hyphens, trim leading/trailing hyphens.
+ * base letter, keep letters and digits of every script (Cyrillic й/ё
+ * included, ADR-0001), turn every other run into one hyphen, trim hyphens.
  *
  * Exported for tests + callers who want the same fallback shape independently.
  */
 export function slugify(raw: string): string {
-  // Stroke letters carry no decomposition, so the mark strip cannot fold them
-  // and the sweep below would DELETE them: "Đăng Example" slugged to
-  // "ang-example". Fold after the strip so composed forms reduce in one pass
-  // ("ǿ" → "ø" → "o").
-  const folded = foldNonDecomposingLatin(
-    raw
-      .toLowerCase()
-      .normalize('NFKD')
-      // NFKD decomposes accents into combining marks (U+0300..U+036F);
-      // strip them before replacing the rest with hyphens so "è" → "e",
-      // not "e" + "-".
-      .replace(/[̀-ͯ]/g, ''),
-  );
-  return folded
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/-+/g, '-')
+  // NFKD first so compatibility forms fold too ("ﬁ" → "fi"), then the shared
+  // letter fold (cjk.ts). Stroke letters carry no decomposition, so the mark
+  // strip cannot fold them and the sweep below would DELETE them ("Đăng
+  // Example" → "ang-example"); fold them after the strip so composed forms
+  // reduce in one pass ("ǿ" → "ø" → "o").
+  return foldNonDecomposingLatin(foldSlugText(raw.normalize('NFKD')))
+    .replace(SLUG_NON_WORD_RUN_RE, '-')
     .replace(/^-+|-+$/g, '');
 }

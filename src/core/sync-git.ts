@@ -612,6 +612,17 @@ export function gitRelativePath(
   return pathOps.relative(from, to).replace(/\\/g, '/');
 }
 
+/**
+ * Maps a git-root-relative path to a path relative to `base`, a directory in
+ * the same repo; a path outside `base` passes through unchanged. A source in a
+ * git subfolder under #4342 source-root slugs its pages from that folder, so
+ * an index of file slugs must derive them from the same base as its pages.
+ */
+export function gitPathUnder(gitContextRoot: string, base: string): (rel: string) => string {
+  const prefix = gitRelativePath(gitContextRoot, base);
+  return (rel) => (prefix !== '' && rel.startsWith(prefix + '/') ? rel.slice(prefix.length + 1) : rel);
+}
+
 export function isWithinRoot(
   childReal: string,
   rootReal: string,

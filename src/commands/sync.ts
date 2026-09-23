@@ -3,6 +3,7 @@ import { readSourceFileSync, hasSourceFilesystemLock, withSourceFilesystemLock, 
 import { currentJobSignal } from '../core/minions/submission-authority.ts';
 import { existsSync, readFileSync, writeFileSync, statSync, lstatSync, realpathSync } from 'fs';
 import { currentCompanyBrainSync, getCompanyBrainProfile, importCompanyBrainFile, softDeleteSyncPages } from '../core/company-brain/profile.ts';
+import { retireSupersededTwins } from '../core/sync-twins.ts';
 import { join, relative, resolve as pathResolve } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
 import { DELETE_BATCH_SIZE } from '../core/engine-constants.ts';
@@ -120,7 +121,7 @@ import {
   isWithinRoot,
   resolveNoEmbed,
   discoverGitRoot,
-  gitRelativePath,
+  gitRelativePath, gitPathUnder,
 } from '../core/sync-git.ts';
 import {
   readSyncAnchor,
@@ -815,7 +816,7 @@ function trackedSlugIndex(
   const listing = gitRawOutput(gitContextRoot, ['ls-files', '--cached', '--others', '--exclude-standard', '-z']);
   for (const rel of listing.split('\u0000')) {
     if (!rel) continue;
-    const slug = resolveSlugForPath(rel);
+    const slug = resolveSlugForPath(pathKey(rel));
     addSlug(slug);
     // Fallback-regime candidates are every non-code file whose path derives
     // no slug. NOT just `.md`/`.mdx`: importFromFile has no extension gate —
@@ -4336,6 +4337,7 @@ async function performFullSync(
       rows,
       currentFiles,
       p => (scopePrefix === '' || p.startsWith(scopePrefix)) && reconcileEligible(p),
+      p => resolveSlugForPath(p),
     );
     if (plan.staleSlugs.length > 0 && plan.massDelete && !massReconcileAllowed()) {
       // #2828 mass-delete safety valve: a reconcile that would sweep more than
@@ -4429,6 +4431,7 @@ async function performFullSync(
         }
       }
     }
+    await retireSupersededTwins(engine, sid, plan.superseded, slog, () => trackedSlugIndex(gitContextRoot, undefined, gitPathUnder(gitContextRoot, slugRoot ?? syncScopeRoot)));
   }
 
   // #3479 blocker 2 — the post-gate sweep above ran BEFORE this reconcile,

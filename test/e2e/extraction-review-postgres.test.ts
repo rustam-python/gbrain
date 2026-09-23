@@ -16,8 +16,10 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import type { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { hasDatabase, setupLegacyEmbeddingDB, teardownDB } from './helpers.ts';
 import { enrichEntity } from '../../src/core/enrichment-service.ts';
+import { normalizeAlias } from '../../src/core/search/alias-normalize.ts';
 import { isUnverifiedExtraction, STATUS_VERIFIED, EXTRACTION_STATUS_KEY } from '../../src/core/extraction-review.ts';
 import { operationsByName, type OperationContext } from '../../src/core/operations.ts';
+import { MIGRATIONS } from '../../src/core/migrate.ts';
 
 const RUN = hasDatabase();
 const d = RUN ? describe : describe.skip;
@@ -100,11 +102,54 @@ d('extraction quarantine lane (live Postgres)', () => {
     const promoted = await engine.getPage('people/pg-fake');
     expect(promoted!.frontmatter[EXTRACTION_STATUS_KEY]).toBe(STATUS_VERIFIED);
 
+    // The alias promotion publishes rides a positional $N::text::jsonb bind.
+    // PGLite cannot surface the postgres.js double-encode bug, so THIS is the
+    // backstop: a double-encoded array lands as a jsonb string scalar, and
+    // both assertions below fail (frontmatter.aliases is not an array; the
+    // projected index row never appears).
+    expect(Array.isArray(promoted!.frontmatter.aliases)).toBe(true);
+    expect(promoted!.frontmatter.aliases).toContain(promoted!.title);
+    const aliasHits = (await engine.resolveAliases([normalizeAlias(promoted!.title)], { sourceId: 'default' }))
+      .get(normalizeAlias(promoted!.title)) ?? [];
+    expect(aliasHits.map((h) => h.slug)).toContain('people/pg-fake');
+
     await enrichEntity(engine, { entityName: 'Pg Reject', entityType: 'person', context: 'c', sourceSlug: 's' });
     const rej = (await operationsByName['extraction_review']!.handler(ctx({ remote: false }), {
       action: 'reject', slugs: ['people/pg-reject'],
     })) as { results: Array<{ slug: string; status: string }> };
     expect(rej.results[0].status).toBe('rejected');
     expect(await engine.getPage('people/pg-reject')).toBeNull();
+  });
+
+  test('migration v164 re-keys Cyrillic alias rows on Postgres exactly as normalizeAlias does', async () => {
+    // PGLite and Postgres share the regex engine in theory; this proves the
+    // SQL twin (regexp_replace backreference, \uXXXX inside a bracket
+    // expression, the dedup DELETE) on the real server.
+    const migration = MIGRATIONS.find((m) => m.name === 'page_aliases_cyrillic_fold')!;
+    const names = ['Пётр Иванов', 'Андре\u0301й', 'Ё\u0301лка', 'Ѓорѓи', 'Café Olé'];
+    await engine.executeRaw(`DELETE FROM page_aliases WHERE slug LIKE 'people/fold-%'`);
+    for (const [i, name] of names.entries()) {
+      await engine.executeRaw(
+        `INSERT INTO page_aliases (source_id, alias_norm, slug) VALUES ('default', $1, $2)`,
+        [name.normalize('NFKC').toLowerCase(), `people/fold-${i}`],
+      );
+    }
+    // A page holding both spellings collapses to one row.
+    await engine.executeRaw(
+      `INSERT INTO page_aliases (source_id, alias_norm, slug) VALUES ('default', 'петр иванов', 'people/fold-0')`,
+    );
+    // Run it with managed-writer enforcement enabled, as on an operator-activated
+    // brain: the page_aliases trigger must not stop the upgrade.
+    await engine.executeRaw(`UPDATE persistence_brain SET enabled = true WHERE singleton = 1`);
+    try {
+      await engine.transaction((tx) => tx.runMigration(migration.version, migration.sql));
+      await engine.transaction((tx) => tx.runMigration(migration.version, migration.sql));
+    } finally {
+      await engine.executeRaw(`UPDATE persistence_brain SET enabled = false WHERE singleton = 1`);
+    }
+    const got = await engine.executeRaw<{ alias_norm: string }>(
+      `SELECT alias_norm FROM page_aliases WHERE slug LIKE 'people/fold-%' ORDER BY slug`,
+    );
+    expect(got.map((r) => r.alias_norm)).toEqual(names.map((n) => normalizeAlias(n)));
   });
 });

@@ -13,6 +13,7 @@ import { OperationError } from './contract.ts';
 import { sourceScopeOpts } from './context.ts';
 import { unverifiedExtractionFragment, isUnverifiedExtraction, EXTRACTION_STATUS_KEY, STATUS_VERIFIED } from '../extraction-review.ts';
 import { buildVisibilityClause } from '../search/sql-ranking.ts';
+import { aliasListValues, normalizeAlias } from '../search/alias-normalize.ts';
 
 // ---------------------------------------------------------------------------
 // Extraction quarantine lane (issue #160)
@@ -181,10 +182,9 @@ const extraction_review: Operation = {
     if (ctx.dryRun) return { dry_run: true, action: `extraction_review:${action}`, slugs };
     const results: Array<{ slug: string; status: string }> = [];
     for (const slug of slugs) {
-      // First-match read is safe here: BOTH writes below key on the RETURNED
-      // row's page.source_id, so read and write can never target different
-      // rows. gbrain-allow-unscoped-getpage: write follows the returned row
-      const page = await ctx.engine.getPage(slug, ctx.sourceId ? { sourceId: ctx.sourceId } : undefined);
+      // ctx.sourceId is required and always set for this local-only op, so the
+      // read is scoped: a slug that exists in two sources acts on the caller's.
+      const page = await ctx.engine.getPage(slug, { sourceId: ctx.sourceId });
       if (!page) {
         results.push({ slug, status: 'not_found' });
         continue;
@@ -194,20 +194,32 @@ const extraction_review: Operation = {
         continue;
       }
       if (action === 'promote') {
-        // Frontmatter-only flip via a targeted JSONB merge — NOT putPage,
-        // whose upsert would reset non-carried columns (page_kind →
-        // 'markdown', content_hash, …) for a change that only touches one
-        // frontmatter key. provenance stays 'auto-extracted' as the audit
-        // trail of HOW the page came to exist; status → 'verified' records
-        // the owner's call. jsonb_build_object binds as text (no
-        // JSON.stringify-into-::jsonb hazard); identical on both engines.
-        await ctx.engine.executeRaw(
-          `UPDATE pages
-           SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || jsonb_build_object($1::text, $2::text),
-               updated_at = now()
-           WHERE slug = $3 AND source_id = $4`,
-          [EXTRACTION_STATUS_KEY, STATUS_VERIFIED, slug, page.source_id],
-        );
+        // ADR-0001: a quarantined stub publishes no alias; promotion does, in
+        // the same transaction as the status flip (split, either half could
+        // land alone: a verified page with no alias row, or an unverified name
+        // already steering resolution). The stub has no file, so no later sync
+        // would project it. Union with the owner's own aliases, scalar or list,
+        // deduped on the normalized key. Frontmatter merge, not putPage (its
+        // upsert resets page_kind, content_hash, …).
+        const byKey = new Map<string, string>();
+        const title = typeof page.title === 'string' ? page.title : '';
+        for (const a of [...aliasListValues(page.frontmatter?.aliases), title.trim()]) {
+          const key = normalizeAlias(a);
+          if (key && !byKey.has(key)) byKey.set(key, a);
+        }
+        const patch: Record<string, unknown> = { [EXTRACTION_STATUS_KEY]: STATUS_VERIFIED };
+        if (byKey.size) patch.aliases = [...byKey.values()];
+        await ctx.engine.transaction(async (tx) => {
+          // setPageAliases([]) would delete existing rows: skip an empty set.
+          if (byKey.size) await tx.setPageAliases(slug, page.source_id, [...byKey.keys()]);
+          await tx.executeRaw(
+            `UPDATE pages
+             SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || $1::text::jsonb,
+                 updated_at = now()
+             WHERE slug = $2 AND source_id = $3`,
+            [JSON.stringify(patch), slug, page.source_id],
+          );
+        });
         results.push({ slug, status: 'promoted' });
       } else {
         await ctx.engine.softDeletePage(slug, { sourceId: page.source_id });

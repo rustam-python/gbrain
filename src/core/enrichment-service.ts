@@ -16,6 +16,8 @@
 import type { BrainEngine } from './engine.ts';
 import { waitForCapacity } from './backoff.ts';
 import { quarantineMarkers } from './extraction-review.ts';
+import { tryAliasExact } from './entities/resolve.ts';
+import { SLUG_NON_WORD_RUN_RE, foldSlugText } from './cjk.ts';
 // #3994: created stubs route through serializeMarkdown + importFromContent
 // (the same parse→chunk→embed pipeline put_page uses) instead of a bare
 // engine.putPage, so fresh entity pages land in the retrieval surface
@@ -78,16 +80,23 @@ export interface EnrichmentResult {
 // Entity naming utilities
 // ---------------------------------------------------------------------------
 
-/** Convert an entity name to a URL-safe slug. */
-export function slugifyEntity(name: string, type: 'person' | 'company'): string {
-  const slug = name
-    .toLowerCase()
-    .replace(/['']/g, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
+/** The page namespace an entity of this type lives under. */
+export function entityNamespace(type: 'person' | 'company'): 'people' | 'companies' {
+  return type === 'person' ? 'people' : 'companies';
+}
 
-  const prefix = type === 'person' ? 'people' : 'companies';
-  return `${prefix}/${slug}`;
+/**
+ * Convert an entity name to a page slug under its namespace. Letters of every
+ * script survive through the shared letter fold (cjk.ts:foldSlugText), so an
+ * entity minted here keeps the same letters as a file synced under
+ * brain/people/. Apostrophes drop ("O'Brien" → "obrien"); every other
+ * non-letter run becomes one hyphen, so the result passes PAGE_SLUG_SEG.
+ */
+export function slugifyEntity(name: string, type: 'person' | 'company'): string {
+  const slug = foldSlugText(name.replace(/['‘’]/g, ''))
+    .replace(SLUG_NON_WORD_RUN_RE, '-')
+    .replace(/^-+|-+$/g, '');
+  return `${entityNamespace(type)}/${slug}`;
 }
 
 /** Get the brain page path for an entity. */
@@ -110,7 +119,15 @@ export async function enrichEntity(
 ): Promise<EnrichmentResult> {
   const candidateSlug = slugifyEntity(request.entityName, request.entityType);
   const sourceId = opts?.sourceId ?? 'default';
-  const slug = await engine.resolveSlugWithAlias(candidateSlug, sourceId);
+  // ADR-0001: two spellings of one name slug apart on purpose; the alias layer
+  // (page_aliases) merges them, so consult it before minting a twin.
+  // resolveSlugWithAlias reads slug_aliases (rename redirects), a different
+  // table that cannot see name spellings. page_aliases is type-blind, so only
+  // a hit inside this entity's own namespace counts: `projects/атлас` claiming
+  // "Атлас" is not the company Атлас.
+  const aliasHit = await tryAliasExact(engine, sourceId, request.entityName);
+  const aliasSlug = aliasHit?.startsWith(`${entityNamespace(request.entityType)}/`) ? aliasHit : null;
+  const slug = aliasSlug ?? await engine.resolveSlugWithAlias(candidateSlug, sourceId);
   // Fail-closed: only an explicit `trusted: true` writes authoritative pages.
   const trusted = opts?.trusted === true;
   const scope = opts?.sourceId ? { sourceId: opts.sourceId } : undefined;
@@ -158,9 +175,14 @@ export async function enrichEntity(
       created: new Date().toISOString().split('T')[0],
       source: request.sourceSlug,
       tier,
+      // ADR-0001: a trusted stub claims its display name as an alias
+      // (projected into page_aliases by importFromContent, not by the putPage
+      // fallback below) so the next differently-spelled mention resolves here.
+      // A quarantined stub publishes no alias until `extraction_review
+      // promote` does it for it (ops/extraction.ts).
       // issue #160 quarantine lane: stubs extracted from untrusted input
       // carry provenance + unverified markers until the owner reviews them.
-      ...(trusted ? {} : quarantineMarkers()),
+      ...(trusted ? { aliases: [title] } : quarantineMarkers()),
     };
     try {
       // #3994: canonical import pipeline so the stub is chunked (+ embedded
@@ -342,7 +364,12 @@ export function extractEntities(text: string): Array<{ name: string; type: 'pers
   // and the Unicode line/paragraph separators (U+2028/U+2029) -- while
   // retaining horizontal whitespace (spaces, tabs, NBSP, other Unicode
   // space separators), unlike a plain `[ \t]+`.
-  const namePattern = /\b([A-Z][a-z]+(?:[^\S\r\n\v\f\u2028\u2029]+[A-Z][a-z]+){1,3})\b/g;
+  //
+  // Capitalization is the only name signal here, so detection covers scripts
+  // with letter case (Latin, Cyrillic, Greek, Armenian, …). Caseless scripts
+  // (CJK, Arabic, Hebrew, Devanagari) yield no candidates; names in them still
+  // slug correctly when they reach enrichEntity by another route.
+  const namePattern = /(?<!\p{L})(\p{Lu}[\p{Ll}\p{M}]+(?:[^\S\r\n\v\f\u2028\u2029]+\p{Lu}[\p{Ll}\p{M}]+){1,3})(?!\p{L})/gu;
   let match;
   while ((match = namePattern.exec(text)) !== null) {
     const name = match[1];
