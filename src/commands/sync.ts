@@ -4431,7 +4431,7 @@ async function performFullSync(
         }
       }
     }
-    await retireSupersededTwins(engine, sid, plan.superseded, slog);
+    await retireSupersededTwins(engine, sid, plan.superseded, slog, () => trackedSlugIndex(gitContextRoot));
   }
 
   // #3479 blocker 2 — the post-gate sweep above ran BEFORE this reconcile,
