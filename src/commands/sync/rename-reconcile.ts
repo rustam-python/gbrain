@@ -143,7 +143,9 @@ export function trackedSlugIndex(
   const listing = gitRawOutput(gitContextRoot, ['ls-files', '--cached', '--others', '--exclude-standard', '-z']);
   for (const rel of listing.split('\u0000')) {
     if (!rel) continue;
-    const slug = resolveSlugForPath(rel);
+    // The slug derives from the path in the caller's mode: under #4342
+    // source-root a page slugs from its source folder, not the git root.
+    const slug = resolveSlugForPath(pathKey(rel));
     addSlug(slug);
     // Fallback-regime candidates are every non-code file whose path derives
     // no slug. NOT just `.md`/`.mdx`: importFromFile has no extension gate —
