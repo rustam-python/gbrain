@@ -121,7 +121,7 @@ d('extraction quarantine lane (live Postgres)', () => {
     expect(await engine.getPage('people/pg-reject')).toBeNull();
   });
 
-  test('migration v164 re-keys Cyrillic alias rows on Postgres exactly as normalizeAlias does', async () => {
+  test('migration v165 re-keys Cyrillic alias rows on Postgres exactly as normalizeAlias does', async () => {
     // PGLite and Postgres share the regex engine in theory; this proves the
     // SQL twin (regexp_replace backreference, \uXXXX inside a bracket
     // expression, the dedup DELETE) on the real server.
