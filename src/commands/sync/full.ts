@@ -30,7 +30,7 @@ import { CHUNKER_VERSION } from '../../core/chunkers/code.ts';
 import { autoConcurrency } from '../../core/sync-concurrency.ts';
 import { slog, serr } from '../../core/console-prefix.ts';
 import { newestCommitMs } from '../../core/source-health.ts';
-import { gitRelativePath } from '../../core/sync-git.ts';
+import { gitRelativePath, gitPathUnder } from '../../core/sync-git.ts';
 import {
   readSyncAnchor,
   writeSyncAnchor,
@@ -527,14 +527,7 @@ async function reconcileFullSyncDeletes(
         }
       }
     }
-    // Slugs in the index derive from the same base as the reconcile's paths
-    // (slugRoot ?? syncScopeRoot); a git-root-relative slug never matches a
-    // source-root page, and the liveness check would spare nothing.
-    const slugBasePrefix = gitRelativePath(gitContextRoot, slugRoot ?? syncScopeRoot);
-    const slugBasePath = (rel: string): string =>
-      slugBasePrefix !== '' && rel.startsWith(slugBasePrefix + '/') ? rel.slice(slugBasePrefix.length + 1) : rel;
-    await retireSupersededTwins(engine, sid, plan.superseded, slog,
-      () => trackedSlugIndex(gitContextRoot, undefined, slugBasePath));
+    await retireSupersededTwins(engine, sid, plan.superseded, slog, () => trackedSlugIndex(gitContextRoot, undefined, gitPathUnder(gitContextRoot, slugRoot ?? syncScopeRoot)));
   }
   return reconciledDeletes;
 }
