@@ -6656,8 +6656,16 @@ CREATE TRIGGER minion_queue_protocol BEFORE INSERT OR UPDATE ON minion_jobs
     // (keeping an already-folded row, else the oldest), so the
     // (source_id, alias_norm, slug) unique key cannot fire. Idempotent.
     // test/cyrillic-slug-grammar.test.ts pins this SQL to normalizeAlias.
+    // page_aliases carries the managed-writer trigger (v156); on a brain with
+    // enforcement enabled a write needs the coordinator's per-transaction
+    // source grant. A schema migration runs quiesced, so grant every source
+    // for this transaction only (is_local = true), exactly as the coordinator
+    // would, or the upgrade stops here.
     idempotent: true,
     sql: `
+      SELECT set_config('gbrain.write_sources',
+        (SELECT COALESCE(jsonb_agg(DISTINCT sid), '[]'::jsonb)::text
+           FROM (SELECT id AS sid FROM sources UNION SELECT source_id FROM page_aliases) s), true);
       WITH f AS (
         SELECT id, source_id, slug, alias_norm, regexp_replace(replace(alias_norm, 'ё', 'е'), '([\u0400-\u04FF])\u0301+', '\\1', 'g') AS k FROM page_aliases
       ), dup AS (

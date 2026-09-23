@@ -62,10 +62,10 @@ src/core/google/google-source.ts	3	early_refusal	Managed mode refuses this legac
 src/core/google/loops-extract.ts	1	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
 src/core/import-file.ts	15	coordinator	Prepared import applies under journal publication and revision CAS; direct managed imports refuse early, and legacy source-path repair follows revision validation inside a savepoint.
 src/core/last-retrieved.ts	1	projection	Derived indexing, retrieval telemetry, or source settings; canonical fields remain guarded by SQL triggers.
-src/core/migrate.ts	13	schema	Schema installation and forward-reference DDL; coordinated activation quiesces canonical writers.
+src/core/migrate.ts	15	schema	Schema installation and forward-reference DDL; coordinated activation quiesces canonical writers. Data migrations on guarded tables (v164 page_aliases re-key) grant every source for their own transaction only, as the coordinator does, so an enforcement-enabled brain still upgrades.
 src/core/minions/handlers/ingest-capture.ts	1	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
 src/core/onboard/checks.ts	2	projection	Derived indexing, retrieval telemetry, or source settings; canonical fields remain guarded by SQL triggers.
-src/core/ops/extraction.ts	2	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
+src/core/ops/extraction.ts	3	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication. Promotion writes the alias rows and the status flip in one transaction, so a refused write rolls back both.
 src/core/ops/links.ts	2	early_refusal	Managed mode refuses this legacy entry point before its canonical filesystem/provider effects.
 src/core/ops/loops.ts	1	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
 src/core/ops/pages.ts	5	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
@@ -120,3 +120,4 @@ src/core/persistence/sync-prepare.ts	3	coordinator	Managed imports and deletes v
 src/commands/enrich.ts	0	early_refusal	Managed batch synthesis refuses before providers until its resume cursor retains prepared writes; legacy synthesis still carries a coherent revision and exposes pending request IDs.
 src/core/persistence/source-lifecycle.ts	6	coordinator	Native affected roots precede topology, source, principal and receipt guards; every shared-root generation and old queued intent changes together.
 src/core/persistence/topology-recovery.ts	2	coordinator	Verified directory-swap recovery checks source incarnation, current logical manifest and physical identity before topology commitment; permanent receipt IDs survive deletion.
+src/core/sync-twins.ts	1	engine_guard	Old-slug twin retirement soft-deletes the twin and redirects its slug in one transaction through withCompanyBrainSource; the canonical table trigger refuses it without coordinator capability, the transaction rolls back, the refusal is logged and the twin stays live.
