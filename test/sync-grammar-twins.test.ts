@@ -7,6 +7,10 @@
  * merely shares a stale source_path with another page is NOT a twin when some
  * file still derives to its slug — e.g. after a cheap rename, whose live row
  * keeps the old path (#3583).
+ *
+ * Both cases run with the source at the repo root and in a subfolder: a
+ * source in a subfolder slugs from its own folder (#4342 source-root), so the
+ * file-slug index must derive slugs from that folder too.
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync, realpathSync } from 'fs';
@@ -23,13 +27,15 @@ import { SLUG_GRAMMAR_VERSION } from '../src/core/cjk.ts';
 const SRC = 'twins-src';
 let engine: PGLiteEngine;
 let repo: string;
+let base = '';
 
 const git = (cmd: string) => execSync(`git ${cmd}`, { cwd: repo, stdio: 'pipe' });
+const at = (rel: string) => (base ? `${base}/${rel}` : rel);
 function write(rel: string, body: string) {
-  mkdirSync(join(repo, rel, '..'), { recursive: true });
-  writeFileSync(join(repo, rel), `---\ntype: concept\ntitle: ${body}\n---\n\n${body}\n`);
+  mkdirSync(join(repo, at(rel), '..'), { recursive: true });
+  writeFileSync(join(repo, at(rel)),`---\ntype: concept\ntitle: ${body}\n---\n\n${body}\n`);
 }
-const sync = (full: boolean) => performSync(engine, { repoPath: repo, full, sourceId: SRC, noPull: true, noEmbed: true });
+const sync = (full: boolean) => performSync(engine, { repoPath: join(repo, base), full, sourceId: SRC, noPull: true, noEmbed: true });
 async function page(slug: string) {
   const [row] = await engine.executeRaw<{ slug: string; source_path: string | null; deleted: boolean; body: string }>(
     `SELECT slug, source_path, deleted_at IS NOT NULL AS deleted, compiled_truth AS body FROM pages WHERE source_id = $1 AND slug = $2`,
@@ -58,16 +64,20 @@ beforeEach(async () => {
   git('init');
   git('config user.email "t@t"');
   git('config user.name "t"');
+  // Something outside the subfolder, so the subfolder is a real sub-scope.
+  writeFileSync(join(repo, 'README.txt'), 'x');
 }, 30_000);
 afterEach(() => { if (repo) rmSync(repo, { recursive: true, force: true }); });
 
-describe('full sync retires grammar twins, and only them', () => {
+describe.each([['at the repo root', ''], ['in a subfolder', 'vault']])('full sync retires grammar twins, and only them (source %s)', (_label, folder) => {
+  beforeEach(() => { base = folder; });
+
   test('after a cheap rename and a new file under the old name, the renamed page stays live', async () => {
     write('notes/A.md', 'alpha');
     git('add -A'); git('commit -m a');
     await sync(true);
 
-    git('mv notes/A.md notes/B.md'); git('commit -m rename');
+    git(`mv ${at('notes/A.md')} ${at('notes/B.md')}`); git('commit -m rename');
     await sync(false);
     // #3583: a cheap rename can leave the LIVE row on its OLD path (updateSlug
     // never rewrites source_path). A full sync that re-imports B.md heals it
@@ -80,7 +90,7 @@ describe('full sync retires grammar twins, and only them', () => {
     const home = mkdtempSync(join(tmpdir(), 'gbrain-twins-home-'));
     mkdirSync(join(home, '.gbrain'), { recursive: true });
     writeFileSync(join(home, '.gbrain', 'import-checkpoint.json'), JSON.stringify({
-      schema_version: 1, owner: 'gbrain', kind: 'import', dir: realpathSync(repo),
+      schema_version: 1, owner: 'gbrain', kind: 'import', dir: realpathSync(join(repo, base)),
       completedPaths: [join('notes', 'B.md')], timestamp: new Date().toISOString(), slug_grammar: SLUG_GRAMMAR_VERSION,
     }));
     try {

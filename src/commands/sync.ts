@@ -816,7 +816,9 @@ function trackedSlugIndex(
   const listing = gitRawOutput(gitContextRoot, ['ls-files', '--cached', '--others', '--exclude-standard', '-z']);
   for (const rel of listing.split('\u0000')) {
     if (!rel) continue;
-    const slug = resolveSlugForPath(rel);
+    // The slug derives from the path in the caller's mode: under #4342
+    // source-root a page slugs from its source folder, not the git root.
+    const slug = resolveSlugForPath(pathKey(rel));
     addSlug(slug);
     // Fallback-regime candidates are every non-code file whose path derives
     // no slug. NOT just `.md`/`.mdx`: importFromFile has no extension gate —
@@ -4431,7 +4433,14 @@ async function performFullSync(
         }
       }
     }
-    await retireSupersededTwins(engine, sid, plan.superseded, slog, () => trackedSlugIndex(gitContextRoot));
+    // Slugs in the index derive from the same base as the reconcile's paths
+    // (slugRoot ?? syncScopeRoot); a git-root-relative slug never matches a
+    // source-root page, and the liveness check would spare nothing.
+    const slugBasePrefix = gitRelativePath(gitContextRoot, slugRoot ?? syncScopeRoot);
+    const slugBasePath = (rel: string): string =>
+      slugBasePrefix !== '' && rel.startsWith(slugBasePrefix + '/') ? rel.slice(slugBasePrefix.length + 1) : rel;
+    await retireSupersededTwins(engine, sid, plan.superseded, slog,
+      () => trackedSlugIndex(gitContextRoot, undefined, slugBasePath));
   }
 
   // #3479 blocker 2 — the post-gate sweep above ran BEFORE this reconcile,
