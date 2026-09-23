@@ -58,7 +58,7 @@ beforeEach(async () => {
   git('init');
   git('config user.email "t@t"');
   git('config user.name "t"');
-});
+}, 30_000);
 afterEach(() => { if (repo) rmSync(repo, { recursive: true, force: true }); });
 
 describe('full sync retires grammar twins, and only them', () => {

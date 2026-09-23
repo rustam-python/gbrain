@@ -138,8 +138,15 @@ d('extraction quarantine lane (live Postgres)', () => {
     await engine.executeRaw(
       `INSERT INTO page_aliases (source_id, alias_norm, slug) VALUES ('default', 'петр иванов', 'people/fold-0')`,
     );
-    await engine.runMigration(migration.version, migration.sql);
-    await engine.runMigration(migration.version, migration.sql);
+    // Run it with managed-writer enforcement enabled, as on an operator-activated
+    // brain: the page_aliases trigger must not stop the upgrade.
+    await engine.executeRaw(`UPDATE persistence_brain SET enabled = true WHERE singleton = 1`);
+    try {
+      await engine.transaction((tx) => tx.runMigration(migration.version, migration.sql));
+      await engine.transaction((tx) => tx.runMigration(migration.version, migration.sql));
+    } finally {
+      await engine.executeRaw(`UPDATE persistence_brain SET enabled = false WHERE singleton = 1`);
+    }
     const got = await engine.executeRaw<{ alias_norm: string }>(
       `SELECT alias_norm FROM page_aliases WHERE slug LIKE 'people/fold-%' ORDER BY slug`,
     );
