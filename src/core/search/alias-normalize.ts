@@ -30,7 +30,7 @@ export function normalizeAlias(raw: string): string {
     .toLowerCase()
     // ADR-0001: slugs keep ё; aliases merge ё with е, and drop a Cyrillic
     // stress mark (U+0301 left combining after NFKC), so spelling variants of
-    // one Russian name share a key. й is NOT folded. Migration v165 applies
+    // one Russian name share a key. й is NOT folded. Migration v166 applies
     // the same two folds to stored rows; test/cyrillic-slug-grammar.test.ts
     // pins the SQL and this function to the same keys.
     .replace(CYRILLIC_YO_RE, 'е')
