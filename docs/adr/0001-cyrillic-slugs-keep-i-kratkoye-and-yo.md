@@ -96,7 +96,7 @@ any such name produced an empty resolve key and all of them collided on it.
 
 ### Upgrading an existing Brain
 
-Alias rows re-key automatically: migration v165 (`page_aliases_cyrillic_fold`)
+Alias rows re-key automatically: migration v166 (`page_aliases_cyrillic_fold`)
 applies the same `ё` → `е` and stress-mark folds to stored `alias_norm` values,
 so stored and queried keys agree without a manual `gbrain reindex --aliases`.
 
