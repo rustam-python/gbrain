@@ -23,7 +23,7 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
-import { SLUG_NON_WORD_RUN_RE, foldSlugText } from '../cjk.ts';
+import { SLUG_NON_WORD_RUN_RE, SLUG_WORD_CHARS, foldSlugText } from '../cjk.ts';
 import { foldNonDecomposingLatin } from '../latin-fold.ts';
 import { isUndefinedTableError } from '../utils.ts';
 import { privatePagesFilterFragment } from '../search/private-visibility.ts';
@@ -627,14 +627,16 @@ async function tryPrefixExpansion(
   return null;
 }
 
+// Slug shape: the word chars slugify keeps (SLUG_WORD_CHARS — every script,
+// ADR-0001) plus `/`, `_`, `-`. Built from the shared grammar so a slug
+// slugify produces always takes the exact-page branch.
+const SLUG_SHAPE_RE = new RegExp(`^[${SLUG_WORD_CHARS}/_-]+$`, 'u');
+
 export function looksLikeSlug(s: string): boolean {
-  // Slug shape: lowercase Unicode letters/numbers plus the path and slug
-  // separators. Slugs are not ASCII-only: a non-Latin entity page such as
-  // `people/<hangul-name>` must take the exact-match path before fuzzy
-  // matching. Anything with whitespace or uppercase letters still fails.
+  // Anything with whitespace or capital letters is a display name, not a slug.
   if (/\s/.test(s)) return false;
   if (s !== s.toLowerCase()) return false;
-  return /^[\p{L}\p{N}/_-]+$/u.test(s);
+  return SLUG_SHAPE_RE.test(s);
 }
 
 async function tryExactSlug(
