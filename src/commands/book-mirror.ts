@@ -51,6 +51,7 @@ import type { MinionJobInput, SubagentHandlerData } from '../core/minions/types.
 import { operations } from '../core/operations.ts';
 import { loadConfig } from '../core/config.ts';
 import { getCliOptions } from '../core/cli-options.ts';
+import { CASED_WORD_CHARS } from '../core/cjk.ts';
 
 const COST_PER_CHAPTER_OPUS = 0.30;     // rough; depends on chapter length
 const COST_PER_CHAPTER_SONNET = 0.06;
@@ -132,7 +133,8 @@ REQUIRED
                             The skill (skills/book-mirror/SKILL.md) handles EPUB
                             and PDF extraction; this CLI takes pre-extracted
                             chapter text as its input contract.
-  --slug <slug>             Brain page slug (kebab-case, no leading slash).
+  --slug <slug>             Brain page slug (kebab-case in any script, no
+                            leading slash).
                             Output lands at media/books/<slug>-personalized.md.
 
 OPTIONAL
@@ -380,6 +382,14 @@ export async function prepareBookMirrorPublication(engine: BrainEngine, slug: st
   };
 }
 
+// Kebab-case in any script and case: letters and digits joined by hyphens,
+// no leading hyphen.
+const BOOK_SLUG_RE = new RegExp(`^[${CASED_WORD_CHARS}][${CASED_WORD_CHARS}-]*$`, 'u');
+
+export function validateBookSlug(slug: string): boolean {
+  return BOOK_SLUG_RE.test(slug);
+}
+
 export async function runBookMirrorCmd(engine: BrainEngine, args: string[]): Promise<void> {
   const flags = parseFlags(args);
 
@@ -391,8 +401,8 @@ export async function runBookMirrorCmd(engine: BrainEngine, args: string[]): Pro
     console.error('gbrain book-mirror: --slug is required. Run with --help.');
     process.exit(2);
   }
-  if (!/^[a-z0-9][a-z0-9-]*$/i.test(flags.slug)) {
-    console.error(`gbrain book-mirror: invalid --slug "${flags.slug}". Use kebab-case (a-z, 0-9, hyphens).`);
+  if (!validateBookSlug(flags.slug)) {
+    console.error(`gbrain book-mirror: invalid --slug "${flags.slug}". Use kebab-case (letters and digits of any script, hyphens).`);
     process.exit(2);
   }
   if (flags.contextFile && !fs.existsSync(flags.contextFile)) {
