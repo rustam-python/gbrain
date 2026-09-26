@@ -164,7 +164,7 @@ detail on demand.)
 | bulk-command progress wiring | `docs/progress-events.md` |
 | eval methodology / metrics | `docs/eval/` |
 | brains vs sources / topology | `docs/architecture/brains-and-sources.md`, `topologies.md` |
-| Cyrillic slugs | `docs/adr/0001-cyrillic-slugs-keep-i-kratkoye-and-yo.md`, `CONTEXT.md` |
+| Cyrillic slugs | `CONTEXT.md` + ADR 0001 in `docs/adr/` |
 | google connector (Gmail/Calendar/Contacts, OAuth) / credential vault | `docs/guides/google-connect.md` + the `creds/*` + `google/*` entries in `KEY_FILES.md` |
 | open loops / `gbrain waiting` / commitment extraction | `docs/guides/open-loops.md` + the `loops*` entries in `KEY_FILES.md` |
 | skill routing | `skills/RESOLVER.md` |
@@ -380,11 +380,10 @@ four numeric segments are required first. Historical 3-segment versions
 DRIFT_STALE_PKG / DRIFT_UNEXPECTED, and refuses to proceed on
 DRIFT_UNEXPECTED. This is why the two must move together.
 
-**The CI version-gate** rejects pushes where `VERSION` and
-`package.json` disagree, OR where `VERSION` is not strictly greater
-than master's VERSION. If a queue collision claims your version on
-master before yours lands, /ship's queue-aware allocator (Step 12)
-will detect drift and re-bump on the next run.
+**Auto-renumber when needed; never ask.** Use `/ship`'s queue-aware allocator,
+update all version stamps and the PR title, then report the number. This overrides
+its ALREADY_BUMPED rebump prompt, not scope, merge or deployment approvals.
+CI rejects mismatched `VERSION`/`package.json` or versions not newer than master.
 
 ### Version consistency and conflict recovery
 
