@@ -4,6 +4,7 @@ import { execFileSync } from 'child_process';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path';
 import { cpus, totalmem } from 'os';
 import type { BrainEngine } from '../core/engine.ts';
+import type { TwinCheck } from '../core/sync-twins.ts';
 import { importFile, importImageFile, isImageFilePath } from '../core/import-file.ts';
 import { currentCompanyBrainSync, getCompanyBrainProfile, importCompanyBrainFile } from '../core/company-brain/profile.ts';
 import { loadConfig, gbrainPath } from '../core/config.ts';
@@ -206,6 +207,8 @@ export async function runImport(
      * `wiki/page1` consistently across full and incremental sync.
      */
     slugRoot?: string;
+    /** Full sync: tells each file's import which duplicates are old-slug twins it retires (#6). */
+    isRetiredTwin?: TwinCheck;
   } = {},
 ): Promise<RunImportResult> {
   const inheritedSignal = currentSourceFilesystemSignal();
@@ -640,7 +643,7 @@ export async function runImport(
         ? await importManagedFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack, signal, slugRoot: opts.slugRoot })
         : isImageFilePath(relativePath) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
         ? await importImageFile(eng, filePath, importRelPath, { noEmbed, sourceId })
-        : await importFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack });
+        : await importFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack, isRetiredTwin: opts.isRetiredTwin });
       // An import that landed while cancellation arrived is still complete.
       // Account for it before stopping, so resume never loses a successful path.
       noteTypeWarning((result as { type_warning?: Parameters<typeof noteTypeWarning>[0] }).type_warning);

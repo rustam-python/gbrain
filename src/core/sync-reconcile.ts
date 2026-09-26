@@ -23,7 +23,7 @@ export const MASS_RECONCILE_MIN_PAGES = 20;
  * Without this, on Windows every file-backed page looks stale and the reconcile
  * wrongly deletes the whole source (#2828).
  */
-function normalizeReconcilePath(p: string): string {
+export function normalizeReconcilePath(p: string): string {
   return p.replace(/\\/g, '/');
 }
 
