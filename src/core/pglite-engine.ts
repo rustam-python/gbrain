@@ -1206,7 +1206,7 @@ export class PGLiteEngine implements BrainEngine {
    */
   async findDuplicatePage(
     sourceId: string,
-    opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string },
+    opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string; excludeSlugs?: string[] },
   ): Promise<{ slug: string; id: number } | null> {
     return pagesImpl.findDuplicatePage(scopedRead(this.engineSql), sourceId, opts);
   }

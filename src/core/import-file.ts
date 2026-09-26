@@ -30,6 +30,7 @@ import { embedMultimodal, currentEmbeddingSignature } from './embedding.ts';
 import { embedBatchKeepingUsable, embedBatchWithBackoff } from './embed-retry.ts';
 import { isEmbeddingZeroNormError, type EmbeddingZeroNormError } from './ai/embedding-guard.ts';
 import { slugifyPath, slugifyCodePath, isCodeFilePath, hasMalformedPathSegment } from './sync.ts';
+import type { TwinCheck } from './sync-twins.ts';
 import type { ChunkInput, Page, PageInput, PageType } from './types.ts';
 import type { PageSnapshot } from './page-state/types.ts';
 import { computeEffectiveDate, fallbackCreatedAt, isValidTimeZone } from './effective-date.ts';
@@ -244,6 +245,8 @@ export async function importFromContent(
      * fallback). MCP `put_page` callers leave undefined (no file).
      */
     sourcePath?: string;
+    /** Full sync only: content-hash duplicates this run retires as old-slug twins are not duplicates (#6). */
+    isRetiredTwin?: TwinCheck;
     /**
      * Absolute directory `sourcePath` is relative to. importFromFile sets it
      * so the identity dedup can tell a moved file (its recorded path is gone)
@@ -687,6 +690,7 @@ export async function importFromContent(
   const identity = opts.forceRechunk ? { kind: 'none' as const } : await decideImportIdentity(engine, {
     sourceId: sourceId ?? 'default', slug, hash, frontmatterId: fmIdStr, sourcePath: opts.sourcePath, sourceRoot: opts.sourceRoot,
     body: { title: parsed.title, compiled_truth: parsed.compiled_truth, timeline: parsed.timeline || '' },
+    isRetiredTwin: opts.isRetiredTwin,
   });
   if (identity.kind === 'move' && !existing && !opts.prepare
     && await maintenanceTransaction(engine, tx => tx.updateSlug(identity.dupSlug, slug, { sourceId: sourceId ?? 'default' })) > 0) {
@@ -1104,6 +1108,7 @@ export async function importFromFile(
     inferFrontmatter?: boolean;
     sourceId?: string;
     forceRechunk?: boolean;
+    isRetiredTwin?: TwinCheck;
     /**
      * v0.39 T1.5: active schema pack threaded through to importFromContent so
      * `parseMarkdown` uses pack-driven type inference. Load ONCE per command;

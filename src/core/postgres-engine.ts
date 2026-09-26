@@ -724,7 +724,7 @@ export class PostgresEngine implements BrainEngine {
    */
   async findDuplicatePage(
     sourceId: string,
-    opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string },
+    opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string; excludeSlugs?: string[] },
   ): Promise<{ slug: string; id: number } | null> {
     return this.withScopedReadTransaction(undefined, sourceId, tx => pagesImpl.findDuplicatePage(scopedRead(this.engineSqlOn(tx)), sourceId, opts));
   }

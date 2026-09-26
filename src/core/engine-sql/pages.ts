@@ -40,16 +40,18 @@ export type RereadPage = (slug: string, sourceId: string) => Promise<Page | null
 export async function findDuplicatePage(
   exec: ScopedRead,
   sourceId: string,
-  opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string },
+  opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string; excludeSlugs?: string[] },
 ): Promise<{ slug: string; id: number } | null> {
     const fmId = opts.frontmatterId ?? null;
     const excludeSlug = opts.excludeSlug ?? null;
+    const excludeSlugs = opts.excludeSlugs ?? [];
       const { rows } = await exec.run<{ id: number | string; slug: string }>(sqlFragment`
         SELECT id, slug FROM pages
         WHERE source_id = ${sourceId}
           AND deleted_at IS NULL
           AND (content_hash = ${opts.hash} OR (frontmatter->>'id' = ${fmId} AND ${fmId}::text IS NOT NULL))
           AND (${excludeSlug}::text IS NULL OR slug <> ${excludeSlug})
+          AND NOT (slug = ANY(${excludeSlugs}::text[]))
         ORDER BY (frontmatter->>'id' IS NOT DISTINCT FROM ${fmId}::text) DESC, id
         LIMIT 1
       `);

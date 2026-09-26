@@ -24,7 +24,7 @@ import {
   RENAME_SENTINEL_PREFIX,
   resolveSlugForPath,
 } from '../../core/sync.ts';
-import { retireSupersededTwins } from '../../core/sync-twins.ts';
+import { retireSupersededTwins, twinCheckForFullSync } from '../../core/sync-twins.ts';
 import { trackedSlugIndex } from './rename-reconcile.ts';
 import { CHUNKER_VERSION } from '../../core/chunkers/code.ts';
 import { autoConcurrency } from '../../core/sync-concurrency.ts';
@@ -90,6 +90,8 @@ export async function performFullSync(
   const fullConcurrency = autoConcurrency(engine, FULL_SYNC_LARGE_MARKER, opts.concurrency);
   slog(`Running full import of ${syncScopeRoot}${fullConcurrency > 1 ? ` (${fullConcurrency} workers)` : ''}...`);
   const { runImport, ImportAbortError } = await import('../import.ts');
+  // #6: the import looks past the old-slug twins retireSupersededTwins retires below, by the same rules.
+  const twinSlugIndex = () => trackedSlugIndex(gitContextRoot, undefined, gitPathUnder(gitContextRoot, slugRoot ?? syncScopeRoot));
   const importArgs = [syncScopeRoot];
   if (opts.noEmbed) importArgs.push('--no-embed');
   if (opts.includeGitignored) importArgs.push('--include-gitignored');
@@ -114,6 +116,7 @@ export async function performFullSync(
       includeHidden: opts.includeHidden,
       includeGitignored: opts.includeGitignored,
       slugRoot,
+      isRetiredTwin: opts.sourceId && !company ? twinCheckForFullSync(resolveSlugForPath, twinSlugIndex) : undefined,
       // issue #1939: performFullSync owns the failure ledger + bookmark via the
       // shared gate below; don't let runImport double-record or write its own.
       managedBookmark: true,
@@ -193,7 +196,7 @@ export async function performFullSync(
     );
   }
 
-  const reconciledDeletes = await reconcileFullSyncDeletes(engine, opts, { company, gitContextRoot, syncScopeRoot, slugRoot });
+  const reconciledDeletes = await reconcileFullSyncDeletes(engine, opts, { company, gitContextRoot, syncScopeRoot, slugRoot, twinSlugIndex });
 
   // #3479 blocker 2 — the post-gate sweep above ran BEFORE this reconcile,
   // so a `<rename:…>` sentinel whose stale row the reconcile just removed
@@ -355,9 +358,11 @@ async function reportBlockedFullSync(
 async function reconcileFullSyncDeletes(
   engine: BrainEngine,
   opts: SyncOpts,
-  input: { company: ReturnType<typeof currentCompanyBrainSync>; gitContextRoot: string; syncScopeRoot: string; slugRoot: string | undefined },
+  input: { company: ReturnType<typeof currentCompanyBrainSync>; gitContextRoot: string; syncScopeRoot: string; slugRoot: string | undefined; twinSlugIndex?: () => ReturnType<typeof trackedSlugIndex> },
 ): Promise<number> {
   const { company, gitContextRoot, syncScopeRoot, slugRoot } = input;
+  // #6: reuse the import's already-built index when this is the same full sync.
+  const twinSlugIndex = input.twinSlugIndex ?? (() => trackedSlugIndex(gitContextRoot, undefined, gitPathUnder(gitContextRoot, slugRoot ?? syncScopeRoot)));
   // #1970 (F-A): runImport is import-only — it never purges pages whose backing
   // file was deleted since the last sync. A full re-import is authoritative for
   // the whole tree, so reconcile deletes here too (this is what makes the
@@ -527,7 +532,7 @@ async function reconcileFullSyncDeletes(
         }
       }
     }
-    await retireSupersededTwins(engine, sid, plan.superseded, slog, () => trackedSlugIndex(gitContextRoot, undefined, gitPathUnder(gitContextRoot, slugRoot ?? syncScopeRoot)));
+    await retireSupersededTwins(engine, sid, plan.superseded, slog, twinSlugIndex);
   }
   return reconciledDeletes;
 }

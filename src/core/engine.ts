@@ -831,11 +831,13 @@ export interface BrainEngine {
    * `excludeSlug` removes the caller's own row, so a page never matches
    * itself. A `frontmatter.id` match ranks ahead of a bare `content_hash`
    * match, so a page that shares the external id is never hidden behind an
-   * unrelated page that happens to share text.
+   * unrelated page that happens to share text. `excludeSlugs` skips pages
+   * the caller already ruled out for a different reason (e.g. old-slug
+   * twins, #6).
    */
   findDuplicatePage?(
     sourceId: string,
-    opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string },
+    opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string; excludeSlugs?: string[] },
   ): Promise<{ slug: string; id: number } | null>;
   /**
    * Hard-delete a page row. Cascades to content_chunks, page_links,
