@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { retireSupersededTwins } from '../src/core/sync-twins.ts';
+import { retireSupersededTwins, twinCheckForFullSync } from '../src/core/sync-twins.ts';
 
 /**
  * Retiring an old-slug twin is two writes — soft-delete the twin, redirect its
@@ -88,5 +88,41 @@ describe('retiring an old-slug twin', () => {
     expect(await retireSupersededTwins(engine, SRC, [TWIN], () => {}, noFiles)).toBe(1);
     expect(await live(TWIN.slug)).toBe(false);
     expect(await redirect(TWIN.slug)).toBe('wiki/manual');
+  });
+});
+
+describe('the import-time twin check a full sync hands the import (#6)', () => {
+  const slugOf = (p: string) => p.replace(/\.md$/, '').toLowerCase();
+  const files = (...slugs: string[]) => () => ({ slugs: new Set(slugs), complete: true });
+  const dup = { slug: 'wiki/елка', source_path: 'wiki/Ёлка.md' };
+  const imported = { slug: 'wiki/ёлка', sourcePath: 'wiki/Ёлка.md' };
+
+  test('a same-path page no file derives to is a twin, whatever the path separator', () => {
+    expect(twinCheckForFullSync(slugOf, files('wiki/ёлка'))(dup, imported)).toBe(true);
+    expect(twinCheckForFullSync(slugOf, files('wiki/ёлка'))(dup, { ...imported, sourcePath: 'wiki\\Ёлка.md' })).toBe(true);
+  });
+
+  test('a page some file still derives to is live, not a twin, even with the same path (#3583)', () => {
+    expect(twinCheckForFullSync(slugOf, files('wiki/ёлка', 'wiki/елка'))(dup, imported)).toBe(false);
+  });
+
+  test('a different path, a missing path, or a slug the path does not produce is not a twin', () => {
+    const check = twinCheckForFullSync(slugOf, files('wiki/ёлка'));
+    expect(check({ ...dup, source_path: 'wiki/other.md' }, imported)).toBe(false);
+    expect(check({ ...dup, source_path: null }, imported)).toBe(false);
+    expect(check(dup, { ...imported, slug: 'wiki/frontmatter-slug' })).toBe(false);
+  });
+
+  test('an incomplete or failing file index finds no twins', () => {
+    expect(twinCheckForFullSync(slugOf, () => ({ slugs: new Set(), complete: false }))(dup, imported)).toBe(false);
+    expect(twinCheckForFullSync(slugOf, () => { throw new Error('git failed'); })(dup, imported)).toBe(false);
+  });
+
+  test('the file index is built once, on first use', () => {
+    let builds = 0;
+    const check = twinCheckForFullSync(slugOf, () => { builds++; return { slugs: new Set<string>(), complete: true }; });
+    expect(builds).toBe(0);
+    check(dup, imported); check(dup, imported);
+    expect(builds).toBe(1);
   });
 });

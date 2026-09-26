@@ -25,6 +25,7 @@ import { embedMultimodal, currentEmbeddingSignature } from './embedding.ts';
 // precedent as embed-stale.ts.
 import { embedBatchWithBackoff } from './embed-retry.ts';
 import { slugifyPath, slugifyCodePath, isCodeFilePath, hasMalformedPathSegment } from './sync.ts';
+import type { TwinCheck } from './sync-twins.ts';
 import type { ChunkInput, PageInput, PageType } from './types.ts';
 import { computeEffectiveDate } from './effective-date.ts';
 import { MARKDOWN_CHUNKER_VERSION } from './chunkers/recursive.ts';
@@ -229,6 +230,8 @@ export async function importFromContent(
      * fallback). MCP `put_page` callers leave undefined (no file).
      */
     sourcePath?: string;
+    /** Full sync only: content-hash duplicates this run retires as old-slug twins are not duplicates (#6). */
+    isRetiredTwin?: TwinCheck;
     /**
      * v0.32.7 CJK wave (codex post-merge F1): bypass the
      * `existing.content_hash === hash` short-circuit and ALWAYS re-chunk +
@@ -717,20 +720,29 @@ export async function importFromContent(
   const fmIdStr = typeof fmId === 'string' && fmId.length > 0 ? fmId : null;
   if (!opts.forceRechunk && engine.findDuplicatePage) {
     let dup: { slug: string; id: number } | null = null;
-    try {
-      dup = await engine.findDuplicatePage(sourceId ?? 'default', {
-        hash,
-        frontmatterId: fmIdStr,
-      });
-    } catch (err) {
-      throw new Error(
-        `[import] dedup pre-check failed for ${opts.sourcePath ?? slug}: ` +
-        `${(err as Error).message}. Re-run import after DB recovery.`
-      );
-    }
-    if (dup && dup.slug !== slug) {
+    let dupPage: Awaited<ReturnType<BrainEngine['getPage']>> = null;
+    // An old-slug twin this full sync retires is not a duplicate: look past it (#6).
+    const twins: string[] = [];
+    for (;;) {
+      try {
+        dup = await engine.findDuplicatePage(sourceId ?? 'default', {
+          hash,
+          frontmatterId: fmIdStr,
+          excludeSlugs: twins,
+        });
+      } catch (err) {
+        throw new Error(
+          `[import] dedup pre-check failed for ${opts.sourcePath ?? slug}: ` +
+          `${(err as Error).message}. Re-run import after DB recovery.`
+        );
+      }
+      if (!dup || dup.slug === slug || twins.includes(dup.slug)) break;
       // Look up the duplicate page so we can compare frontmatter.id.
-      const dupPage = await engine.getPage(dup.slug, { sourceId: sourceId ?? 'default' });
+      dupPage = await engine.getPage(dup.slug, { sourceId: sourceId ?? 'default' });
+      if (!dupPage || !opts.sourcePath || !opts.isRetiredTwin?.(dupPage, { slug, sourcePath: opts.sourcePath })) break;
+      twins.push(dup.slug);
+    }
+    if (dup && dup.slug !== slug && !twins.includes(dup.slug)) {
       const dupFmId = (dupPage?.frontmatter as Record<string, unknown> | undefined)?.id;
       const dupFmIdStr = typeof dupFmId === 'string' && dupFmId.length > 0 ? dupFmId : null;
       const sameExternalId = fmIdStr !== null && dupFmIdStr === fmIdStr;
@@ -1154,6 +1166,7 @@ export async function importFromFile(
     inferFrontmatter?: boolean;
     sourceId?: string;
     forceRechunk?: boolean;
+    isRetiredTwin?: TwinCheck;
     /**
      * v0.39 T1.5: active schema pack threaded through to importFromContent so
      * `parseMarkdown` uses pack-driven type inference. Load ONCE per command;

@@ -815,11 +815,12 @@ export interface BrainEngine {
    * compile without changes. Callers must defensively check
    * `engine.findDuplicatePage?.(...)` and fall through on undefined.
    * `deleted_at IS NULL` is deliberate — a soft-deleted page should NOT
-   * block a legitimate re-import under a new slug.
+   * block a legitimate re-import under a new slug. `excludeSlugs` skips
+   * pages the caller already ruled out (e.g. old-slug twins, #6).
    */
   findDuplicatePage?(
     sourceId: string,
-    opts: { hash: string; frontmatterId?: string | null },
+    opts: { hash: string; frontmatterId?: string | null; excludeSlugs?: string[] },
   ): Promise<{ slug: string; id: number } | null>;
   /**
    * Hard-delete a page row. Cascades to content_chunks, page_links,

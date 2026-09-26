@@ -1721,16 +1721,17 @@ export class PGLiteEngine implements BrainEngine {
    */
   async findDuplicatePage(
     sourceId: string,
-    opts: { hash: string; frontmatterId?: string | null },
+    opts: { hash: string; frontmatterId?: string | null; excludeSlugs?: string[] },
   ): Promise<{ slug: string; id: number } | null> {
     const fmId = opts.frontmatterId ?? null;
     const sql = `SELECT id, slug FROM pages
        WHERE source_id = $1
          AND deleted_at IS NULL
          AND (content_hash = $2 OR (frontmatter->>'id' = $3 AND $3 IS NOT NULL))
+         AND NOT (slug = ANY($4::text[]))
        ORDER BY id
        LIMIT 1`;
-    const { rows } = await this.db.query(sql, [sourceId, opts.hash, fmId]);
+    const { rows } = await this.db.query(sql, [sourceId, opts.hash, fmId, opts.excludeSlugs ?? []]);
     if (rows.length === 0) return null;
     const r = rows[0] as { id: number | string; slug: string };
     return { slug: r.slug, id: Number(r.id) };

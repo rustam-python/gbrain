@@ -21,7 +21,37 @@
 import type { BrainEngine } from './engine.ts';
 import { withCompanyBrainSource } from './company-brain/profile.ts';
 import { insertAliasRow } from './schema-pack/page-to-alias.ts';
-import type { SupersededTwin } from './sync-reconcile.ts';
+import { normalizeReconcilePath, type SupersededTwin } from './sync-reconcile.ts';
+
+/** A page the import found by content hash, and the file the import is writing. */
+export type TwinCheck = (
+  dup: { slug: string; source_path?: string | null },
+  imported: { slug: string; sourcePath: string },
+) => boolean;
+
+/**
+ * Tell the import which content-hash duplicates are old-slug twins that this
+ * full sync retires (#6), so it neither warns "Indexing both" nor treats the
+ * twin as a duplicate. Same rules as planReconcileDeletes `superseded` plus
+ * retireSupersededTwins: the duplicate shares the file's source_path, the
+ * import writes the path's current-grammar slug, and no file derives to the
+ * duplicate's slug (complete index only). The index is built on first use.
+ */
+export function twinCheckForFullSync(
+  expectedSlug: (sourcePath: string) => string,
+  fileSlugs: () => { slugs: ReadonlySet<string>; complete: boolean },
+): TwinCheck {
+  let live: { slugs: ReadonlySet<string>; complete: boolean } | null | undefined;
+  return (dup, imported) => {
+    const path = normalizeReconcilePath(imported.sourcePath);
+    if (dup.source_path == null || normalizeReconcilePath(dup.source_path) !== path) return false;
+    if (expectedSlug(path) !== imported.slug) return false;
+    if (live === undefined) {
+      try { live = fileSlugs(); } catch { live = null; }
+    }
+    return !!live?.complete && !live.slugs.has(dup.slug);
+  };
+}
 
 export async function retireSupersededTwins(
   engine: BrainEngine,

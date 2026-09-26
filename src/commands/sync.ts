@@ -5,7 +5,7 @@ import { readSourceFileSync, hasSourceFilesystemLock, withSourceFilesystemLock, 
 import { currentJobSignal } from '../core/minions/submission-authority.ts';
 import { existsSync, readFileSync, writeFileSync, statSync, lstatSync, realpathSync } from 'fs';
 import { currentCompanyBrainSync, getCompanyBrainProfile, importCompanyBrainFile, softDeleteSyncPages } from '../core/company-brain/profile.ts';
-import { retireSupersededTwins } from '../core/sync-twins.ts';
+import { retireSupersededTwins, twinCheckForFullSync } from '../core/sync-twins.ts';
 import { join, relative, resolve as pathResolve } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
 import { DELETE_BATCH_SIZE } from '../core/engine-constants.ts';
@@ -4125,6 +4125,8 @@ async function performFullSync(
   serr(`[gbrain phase] sync.fullsync.import start strategy=${opts.strategy ?? 'markdown'}`);
   opts.onProgress?.({ phase: 'full_import' });
   let result: import('./import.ts').RunImportResult;
+  // #6: the import looks past the old-slug twins retireSupersededTwins retires below, by the same rules.
+  const twinSlugIndex = () => trackedSlugIndex(gitContextRoot, undefined, gitPathUnder(gitContextRoot, slugRoot ?? syncScopeRoot));
   try {
     result = await runImport(engine, importArgs, {
       signal: opts.signal,
@@ -4135,6 +4137,7 @@ async function performFullSync(
       includeHidden: opts.includeHidden,
       includeGitignored: opts.includeGitignored,
       slugRoot,
+      isRetiredTwin: opts.sourceId && !company ? twinCheckForFullSync(resolveSlugForPath, twinSlugIndex) : undefined,
       // issue #1939: performFullSync owns the failure ledger + bookmark via the
       // shared gate below; don't let runImport double-record or write its own.
       managedBookmark: true,
@@ -4426,7 +4429,7 @@ async function performFullSync(
         }
       }
     }
-    await retireSupersededTwins(engine, sid, plan.superseded, slog, () => trackedSlugIndex(gitContextRoot, undefined, gitPathUnder(gitContextRoot, slugRoot ?? syncScopeRoot)));
+    await retireSupersededTwins(engine, sid, plan.superseded, slog, twinSlugIndex);
   }
 
   // #3479 blocker 2 — the post-gate sweep above ran BEFORE this reconcile,

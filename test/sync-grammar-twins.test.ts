@@ -43,6 +43,21 @@ async function page(slug: string) {
   );
   return row;
 }
+/** Runs `fn` and returns everything it wrote to stderr. */
+async function stderrOf(fn: () => Promise<unknown>): Promise<string> {
+  const out: string[] = [];
+  const origWrite = process.stderr.write.bind(process.stderr);
+  (process.stderr as unknown as { write: typeof origWrite }).write = (chunk: unknown, ...rest: unknown[]): boolean => {
+    out.push(String(chunk));
+    return origWrite(chunk as string, ...(rest as []));
+  };
+  try {
+    await fn();
+  } finally {
+    (process.stderr as unknown as { write: typeof origWrite }).write = origWrite;
+  }
+  return out.join('');
+}
 async function redirect(slug: string) {
   const [row] = await engine.executeRaw<{ canonical_slug: string }>(
     `SELECT canonical_slug FROM slug_aliases WHERE source_id = $1 AND alias_slug = $2`, [SRC, slug],
@@ -118,5 +133,43 @@ describe.each([['at the repo root', ''], ['in a subfolder', 'vault']])('full syn
     expect(await page('wiki/ёлка')).toMatchObject({ deleted: false });
     expect(await page('wiki/елка')).toMatchObject({ deleted: true });
     expect(await redirect('wiki/елка')).toBe('wiki/ёлка');
+  }, 60_000);
+
+  test('re-keying a twin that shares the file content prints no "shares content_hash" warning', async () => {
+    write('wiki/Ёлка.md', 'tree');
+    git('add -A'); git('commit -m tree');
+    await sync(true);
+    // What the old grammar left behind, byte for byte: same content_hash, same source_path.
+    await engine.executeRaw(`UPDATE pages SET slug = 'wiki/елка' WHERE source_id = $1 AND slug = 'wiki/ёлка'`, [SRC]);
+
+    expect(await stderrOf(() => sync(true))).not.toContain('shares content_hash');
+    expect(await page('wiki/ёлка')).toMatchObject({ deleted: false });
+    expect(await page('wiki/елка')).toMatchObject({ deleted: true });
+  }, 60_000);
+
+  test('two different files with the same content still print the "shares content_hash" warning', async () => {
+    write('wiki/first.md', 'same text');
+    write('wiki/second.md', 'same text');
+    git('add -A'); git('commit -m same');
+
+    expect(await stderrOf(() => sync(true))).toContain('shares content_hash');
+    expect(await page('wiki/first')).toMatchObject({ deleted: false });
+    expect(await page('wiki/second')).toMatchObject({ deleted: false });
+  }, 60_000);
+
+  test('a different file that shares the content still warns when the twin is the older duplicate', async () => {
+    write('wiki/Ёлка.md', 'tree');
+    git('add -A'); git('commit -m tree');
+    await sync(true);
+    write('wiki/other.md', 'tree');
+    git('add -A'); git('commit -m other');
+    await sync(true);
+    // The twin keeps the lowest id, so it is the first duplicate the import finds.
+    await engine.executeRaw(`UPDATE pages SET slug = 'wiki/елка' WHERE source_id = $1 AND slug = 'wiki/ёлка'`, [SRC]);
+
+    expect(await stderrOf(() => sync(true))).toContain('shares content_hash with wiki/other');
+    expect(await page('wiki/ёлка')).toMatchObject({ deleted: false });
+    expect(await page('wiki/other')).toMatchObject({ deleted: false });
+    expect(await page('wiki/елка')).toMatchObject({ deleted: true });
   }, 60_000);
 });

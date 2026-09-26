@@ -689,9 +689,10 @@ export class PostgresEngine implements BrainEngine {
    */
   async findDuplicatePage(
     sourceId: string,
-    opts: { hash: string; frontmatterId?: string | null },
+    opts: { hash: string; frontmatterId?: string | null; excludeSlugs?: string[] },
   ): Promise<{ slug: string; id: number } | null> {
     const fmId = opts.frontmatterId ?? null;
+    const excluded = opts.excludeSlugs ?? [];
     // RLS scope binding: sourceId is positional here.
     return await this.withScopedReadTransaction(undefined, sourceId, async (tx) => {
       const rows = await tx`
@@ -699,6 +700,7 @@ export class PostgresEngine implements BrainEngine {
         WHERE source_id = ${sourceId}
           AND deleted_at IS NULL
           AND (content_hash = ${opts.hash} OR (frontmatter->>'id' = ${fmId} AND ${fmId}::text IS NOT NULL))
+          AND NOT (slug = ANY(${excluded}::text[]))
         ORDER BY id
         LIMIT 1
       `;
