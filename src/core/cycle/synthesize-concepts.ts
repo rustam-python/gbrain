@@ -46,6 +46,7 @@ import { derivedWriteThrough } from './derived-write-through.ts';
 import {
   addManagedProvenanceLinks, CONCEPT_DEFERRAL_CODES, CONCEPT_HOLD_CODES, publishClassicConcept, publishManagedConcept, stripFenceSections,
 } from './concept-publication.ts';
+import { sourceLanguageRule } from './source-language.ts';
 
 const DEFAULT_BUDGET_USD = 1.5;
 // Miss policy for the shared resolver (`priceFor`: operator overrides, the
@@ -148,8 +149,10 @@ const SYNTH_PROMPT = `You write a 1-paragraph executive summary of a concept
 based on multiple atom-shaped insights that reference it.
 
 Output ONLY the summary paragraph (3-5 sentences). No headers, no JSON,
-no preamble. Write in plain English, present-tense voice. Synthesize what
-the atoms collectively SAY about the concept; don't enumerate the atoms.`;
+no preamble. Write in present-tense voice. Synthesize what the atoms
+collectively SAY about the concept; don't enumerate the atoms.
+
+${sourceLanguageRule('the atoms')}`;
 
 export async function runPhaseSynthesizeConcepts(
   engine: BrainEngine,
