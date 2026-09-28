@@ -207,7 +207,7 @@ forces one.
    phrasings you can quote exactly. (The quote verify pass enforces this
    mechanically after the write.)
 2. Cross-reference compulsively: every new page MUST have at least one wikilink.
-3. Slug discipline: lowercase alphanumeric and hyphens only. NO underscores, NO file extensions.
+3. Slug discipline: lowercase letters of any script, digits and hyphens only; the topic words of a slug are written in the language of the page title. NO underscores, NO file extensions.
 4. Edited transcripts produce NEW slugs (content-hash suffix changes) — never silently overwrite.
 5. Preserve concrete facts: carry the specific numbers, dates, dollar amounts,
    names, and who-decided-what of the salient content, exactly as the
