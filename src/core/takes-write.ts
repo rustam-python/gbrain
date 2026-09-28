@@ -47,6 +47,7 @@ import {
   supersedeRow,
   TAKES_FENCE_BEGIN,
   TAKES_FENCE_END,
+  isValidHolder,
   type ParsedTake,
   type ParseResult,
 } from './takes-fence.ts';
@@ -238,6 +239,15 @@ async function getPageId(engine: BrainEngine, slug: string, sourceId?: string): 
 }
 
 function assertHolderAllowed(holder: string, allowList: HolderAllowList): void {
+  // Grammar first, for every caller: the fence parser flags a malformed holder
+  // and every later write to that page then refuses (fence_unparsed), so one
+  // bad row would lock the whole fence.
+  if (!isValidHolder(holder)) {
+    throw new TakesWriteError(
+      'invalid_input',
+      `holder '${holder}' is malformed (expected: world | brain | people/<slug> | companies/<slug>; slugs are lowercase letters of any script, digits, '.', '_' and '-').`,
+    );
+  }
   if (allowList === null || allowList === undefined) return; // trusted local
   if (!allowList.includes(holder)) {
     throw new TakesWriteError(

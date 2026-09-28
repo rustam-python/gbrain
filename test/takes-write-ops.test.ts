@@ -345,6 +345,38 @@ describe('takes-write guards (invalid_input / row_inactive / md-absent / mcp_res
     expect(fence.takes.length).toBe(0);
   });
 
+  test('holder grammar: a malformed holder is refused before it can poison the fence', async () => {
+    await seedFixture('notes/guards-holder');
+    // Trusted local caller: no allow-list, so only the grammar check can refuse.
+    for (const holder of ['people/Alice-Example', 'world/alice-example', 'users/alice', 'Garry']) {
+      const res = await dispatchToolCall(engine, 'takes_add', {
+        slug: 'notes/guards-holder', claim: 'ok claim', kind: 'take', holder,
+      }, { ...LOCAL });
+      expect(res.isError).toBe(true);
+      expect(parsed(res).error).toBe('invalid_params');
+      expect(parsed(res).message).toContain(holder);
+    }
+    expect(parseTakesFence(pageMd('notes/guards-holder')).takes.length).toBe(0);
+
+    // Lowercase letters of any script are valid, namespaced or bare (legacy).
+    for (const holder of ['people/иван-петров', 'companies/рога-и-копыта', 'иван-петров']) {
+      const res = await dispatchToolCall(engine, 'takes_add', {
+        slug: 'notes/guards-holder', claim: `held by ${holder}`, kind: 'take', holder,
+      }, { ...LOCAL });
+      expect(res.isError ?? false).toBe(false);
+    }
+    const fence = parseTakesFence(pageMd('notes/guards-holder'));
+    expect(fence.warnings).toEqual([]);
+    expect(fence.takes.map(t => t.holder)).toEqual(['people/иван-петров', 'companies/рога-и-копыта', 'иван-петров']);
+
+    // A malformed override holder on supersede is refused the same way.
+    const res = await dispatchToolCall(engine, 'takes_supersede', {
+      slug: 'notes/guards-holder', row_num: 1, claim: 'restated', holder: 'people/Иван-Петров',
+    }, { ...LOCAL });
+    expect(parsed(res).error).toBe('invalid_params');
+    expect(parseTakesFence(pageMd('notes/guards-holder')).takes.length).toBe(3);
+  });
+
   test('row_inactive: update and resolve on a superseded row both refuse, naming the supersession', async () => {
     const add = parsed(await dispatchToolCall(engine, 'takes_add', {
       slug: 'notes/guards-inactive', claim: 'Original claim', kind: 'take', holder: 'world', weight: 0.6,
