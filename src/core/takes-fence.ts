@@ -123,7 +123,7 @@ export const TAKES_FENCE_END   = '<!--- gbrain:takes:end -->';
  * the original PR's `[a-z0-9-]+` would have warned on both).
  *
  * Catches the eval-flagged error modes:
- *   - `Garry`            — uppercase letter (rejected: not in [a-z0-9._-])
+ *   - `Garry`            — uppercase letter (rejected: slug letters are lowercase, any script)
  *   - `people/Garry-Tan` — mixed case in slug (rejected for same reason)
  *   - `world/garry-tan`  — `world` is a literal, no slash variant
  *   - `users/garry`      — only `people/...` and `companies/...` are namespaced
