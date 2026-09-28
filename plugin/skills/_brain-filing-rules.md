@@ -154,7 +154,7 @@ to add a new directory the synthesis subagent may write to:
    pass re-checks every quoted span after the write and repairs or unquotes
    whatever it cannot ground (`dream.synthesize.quote_verify`, default on).
 2. Cross-reference compulsively: every new page MUST link to existing brain content.
-3. Slug discipline: lowercase alphanumeric and hyphens only, slash-separated. NO underscores, NO file extensions.
+3. Slug discipline: lowercase letters of any script, digits and hyphens only, slash-separated; the topic words of a slug are written in the language of the page title. NO underscores, NO file extensions.
 4. Edited transcripts produce NEW slugs (content-hash suffix changes) — never silently overwrite a prior reflection.
 5. Preserve concrete facts: carry the specific numbers, dates, dollar amounts,
    names, and who-decided-what of the salient content you write about, exactly
@@ -194,7 +194,7 @@ examples lives in `docs/takes-vs-facts.md`.
 - `people/<slug>` (individual's stated belief)
 - `companies/<slug>` (institutional fact, no individual claimant)
 
-Slugs use the standard grammar (`[a-z0-9._-]+`). `Garry`, `people/Garry-Tan`,
+Slugs use the standard grammar: lowercase letters of any script, digits, `.`, `_` and `-`. `Garry`, `people/Garry-Tan`,
 and `world/garry-tan` all fail validation.
 
 **Founder-describing-own-company rule.** When a founder describes their own
