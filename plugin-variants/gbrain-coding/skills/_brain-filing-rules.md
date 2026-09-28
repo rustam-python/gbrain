@@ -194,7 +194,7 @@ examples lives in `docs/takes-vs-facts.md`.
 - `people/<slug>` (individual's stated belief)
 - `companies/<slug>` (institutional fact, no individual claimant)
 
-Slugs use the standard grammar (`[a-z0-9._-]+`). `Garry`, `people/Garry-Tan`,
+Slugs use the standard grammar: lowercase letters of any script, digits, `.`, `_` and `-`. `Garry`, `people/Garry-Tan`,
 and `world/garry-tan` all fail validation.
 
 **Founder-describing-own-company rule.** When a founder describes their own
