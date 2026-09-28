@@ -77,7 +77,7 @@ import { throwIfAborted } from '../abort-check.ts';
 export { runSubagentsInline, runDrainRenewalTick };
 import { loadAllowedSlugPrefixes } from './filing-rules.ts';
 export { loadAllowedSlugPrefixes };
-import { discoverTranscripts, DEFAULT_EXCLUDE_PATTERNS, type DiscoveredTranscript } from './transcript-discovery.ts';
+import { discoverTranscripts, loadTranscriptFilters, type DiscoveredTranscript } from './transcript-discovery.ts';
 import { loadStorageConfig, isDbOnly } from '../storage-config.ts';
 import { serializeMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import type { Page, PageType } from '../types.ts';
@@ -1525,7 +1525,6 @@ export async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig>
   // Explicit enabled=false still wins for pausing synthesis without removing corpus config.
   const enabled = enabledRaw === 'false' ? false : (enabledRaw === 'true' || !!corpusDir);
   const meetingTranscriptsDir = await engine.getConfig('dream.synthesize.meeting_transcripts_dir');
-  const excludeStr = await engine.getConfig('dream.synthesize.exclude_patterns');
   // v0.28: resolveModel() unifies CLI flag > new key > deprecated key > models.default > env > fallback
   const { resolveModel, resolveAlias } = await import('../model-config.ts');
   const model = await resolveModel(engine, {
@@ -1578,7 +1577,6 @@ export async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig>
   // getNumberConfig (not `parseInt(str, 10) || N`) so a configured 0 is honored — a bare
   // `|| N` coerces an explicit 0 back to the default (cooldown 0 = "no cooldown").
   const cooldownHours = Math.max(0, await getNumberConfig(engine, 'dream.synthesize.cooldown_hours', 12));
-  const minChars = Math.max(0, await getNumberConfig(engine, 'dream.synthesize.min_chars', 2000));
   const maxPromptTokensStr = await engine.getConfig('dream.synthesize.max_prompt_tokens');
   const maxChunksStr = await engine.getConfig('dream.synthesize.max_chunks_per_transcript');
   const subagentTimeoutMs = await getNumberConfig(
@@ -1610,13 +1608,7 @@ export async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig>
     process.stderr.write(`[dream] dream.synthesize.mode "${modeRaw}" is not 'oneshot' | 'agentic'; using 'oneshot'.\n`);
   }
 
-  let excludePatterns: string[] = [...DEFAULT_EXCLUDE_PATTERNS];
-  if (excludeStr) {
-    try {
-      const parsed = JSON.parse(excludeStr);
-      if (Array.isArray(parsed)) excludePatterns = parsed.filter(p => typeof p === 'string');
-    } catch { /* keep default */ }
-  }
+  const { minChars, excludePatterns } = await loadTranscriptFilters(engine);
 
   // D1: max_prompt_tokens floored at MIN_PROMPT_TOKENS; null → use model lookup.
   let maxPromptTokens: number | null = null;

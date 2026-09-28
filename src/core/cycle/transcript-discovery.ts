@@ -6,7 +6,8 @@
  * Returns a list of file paths + content + content_hash so the caller
  * can key the verdict cache and dispatch one subagent per transcript.
  *
- * No DB; pure filesystem + crypto. Tested with hermetic temp directories.
+ * Discovery itself is pure filesystem + crypto, tested with hermetic temp
+ * directories; loadTranscriptFilters is the one config read.
  */
 
 import { readFileSync, readdirSync, statSync } from 'node:fs';
@@ -32,7 +33,7 @@ export interface DiscoverOpts {
   corpusDir: string;
   /** Optional second source. */
   meetingTranscriptsDir?: string;
-  /** Skip transcripts smaller than this many characters. Default 2000. */
+  /** Skip transcripts smaller than this many characters. Default DEFAULT_MIN_CHARS (2000). */
   minChars?: number;
   /** Word-boundary regex strings. The discoverer auto-wraps bare words. */
   excludePatterns?: string[];
@@ -126,6 +127,34 @@ export function isDreamOutput(content: string, bypass = false): boolean {
  * shipped DIRECTORY_RULE binds a path to one of these.
  */
 export const DEFAULT_EXCLUDE_PATTERNS: readonly string[] = ['medical', 'therapy'];
+
+/** Transcripts shorter than this are skipped unless `dream.synthesize.min_chars` says otherwise. */
+export const DEFAULT_MIN_CHARS = 2000;
+
+/**
+ * The transcript filters every dream phase applies to the shared corpus:
+ * `dream.synthesize.min_chars` (default DEFAULT_MIN_CHARS, floored at 0) and
+ * `dream.synthesize.exclude_patterns` (a JSON array; unset or malformed
+ * keeps DEFAULT_EXCLUDE_PATTERNS). synthesize and extract_atoms both read
+ * them here so the two phases discover one transcript set.
+ */
+export async function loadTranscriptFilters(
+  config: { getConfig(key: string): Promise<string | null> },
+): Promise<{ minChars: number; excludePatterns: string[] }> {
+  const minCharsRaw = await config.getConfig('dream.synthesize.min_chars');
+  const minCharsNum = minCharsRaw === null || minCharsRaw === undefined ? DEFAULT_MIN_CHARS : Number(minCharsRaw);
+  const minChars = Math.max(0, Number.isNaN(minCharsNum) ? DEFAULT_MIN_CHARS : minCharsNum);
+
+  let excludePatterns: string[] = [...DEFAULT_EXCLUDE_PATTERNS];
+  const excludeStr = await config.getConfig('dream.synthesize.exclude_patterns');
+  if (excludeStr) {
+    try {
+      const parsed = JSON.parse(excludeStr);
+      if (Array.isArray(parsed)) excludePatterns = parsed.filter(p => typeof p === 'string');
+    } catch { /* keep default */ }
+  }
+  return { minChars, excludePatterns };
+}
 
 /** One compiled exclude pattern plus the configured string it came from. */
 interface CompiledExclude {
@@ -265,7 +294,7 @@ function listTextFiles(dir: string): string[] {
  * Returns sorted by filePath so re-runs are deterministic.
  */
 export function discoverTranscripts(opts: DiscoverOpts): DiscoveredTranscript[] {
-  const minChars = opts.minChars ?? 2000;
+  const minChars = opts.minChars ?? DEFAULT_MIN_CHARS;
   const bypass = opts.bypassGuard === true;
   const excludes = compileLabeledExcludePatterns(opts.excludePatterns);
   const tally = new ExcludeTally();
@@ -323,7 +352,7 @@ export function readSingleTranscript(
   filePath: string,
   opts: { minChars?: number; excludePatterns?: string[]; bypassGuard?: boolean } = {},
 ): DiscoveredTranscript | null {
-  const minChars = opts.minChars ?? 2000;
+  const minChars = opts.minChars ?? DEFAULT_MIN_CHARS;
   const bypass = opts.bypassGuard === true;
   const excludes = compileLabeledExcludePatterns(opts.excludePatterns);
   let content: string;
