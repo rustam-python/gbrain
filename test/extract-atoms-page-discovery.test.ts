@@ -401,6 +401,58 @@ describe('v0.41.2.1: runPhaseExtractAtoms — dual-source merge + idempotency', 
     }
   });
 
+  test('transcript discovery honors dream.synthesize.min_chars below the 2000 default', async () => {
+    const corpusDir = mkdtempSync(join(tmpdir(), 'gbrain-extract-atoms-minchars-'));
+    writeFileSync(join(corpusDir, '2026-07-28-short.txt'), 'short transcript '.repeat(60)); // ~1020 chars
+    writeFileSync(join(corpusDir, '2026-07-29-tiny.txt'), 'tiny '.repeat(40)); // 200 chars
+    await engine.setConfig('dream.synthesize.min_chars', '500');
+
+    try {
+      const result = await runPhaseExtractAtoms(engine, {
+        sourceId: 'default',
+        brainDir: '/tmp/default-brain',
+        _pages: [],
+        _loadConfig: () => ({
+          dream: { synthesize: { session_corpus_dir: corpusDir } },
+        } as never),
+        _chat: stubChat('[{"title":"short-item","atom_type":"insight","body":"b"}]'),
+      });
+
+      expect(result.details?.transcripts_total).toBe(1);
+    } finally {
+      await engine.unsetConfig('dream.synthesize.min_chars');
+      rmSync(corpusDir, { recursive: true, force: true });
+    }
+  });
+
+  test('transcript discovery skips transcripts matching dream.synthesize.exclude_patterns', async () => {
+    const corpusDir = mkdtempSync(join(tmpdir(), 'gbrain-extract-atoms-exclude-'));
+    writeFileSync(join(corpusDir, '2026-07-28-kept.txt'), 'kept transcript '.repeat(180));
+    writeFileSync(join(corpusDir, '2026-07-29-private.txt'), 'private zanzibar transcript '.repeat(100));
+    await engine.setConfig('dream.synthesize.exclude_patterns', '["zanzibar"]');
+
+    try {
+      const result = await runPhaseExtractAtoms(engine, {
+        sourceId: 'default',
+        brainDir: '/tmp/default-brain',
+        _pages: [],
+        _loadConfig: () => ({
+          dream: { synthesize: { session_corpus_dir: corpusDir } },
+        } as never),
+        _chat: stubChat('[{"title":"kept-item","atom_type":"insight","body":"b"}]'),
+      });
+
+      expect(result.details?.transcripts_total).toBe(1);
+      const rows = await engine.executeRaw<{ source_path: string | null }>(
+        `SELECT frontmatter->>'source_path' AS source_path FROM pages WHERE type = 'atom'`,
+      );
+      expect(rows).toEqual([{ source_path: join(corpusDir, '2026-07-28-kept.txt') }]);
+    } finally {
+      await engine.unsetConfig('dream.synthesize.exclude_patterns');
+      rmSync(corpusDir, { recursive: true, force: true });
+    }
+  });
+
   test('transcript-side idempotency: re-discovered same-hash transcript skipped (closes pre-existing bug)', async () => {
     const chat = stubChatUnique();
     // First run writes the atom
