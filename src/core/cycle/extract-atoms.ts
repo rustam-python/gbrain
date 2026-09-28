@@ -665,7 +665,7 @@ export async function runPhaseExtractAtoms(
     && opts._transcripts === undefined
   ) {
     try {
-      const { discoverTranscripts } = await import('./transcript-discovery.ts');
+      const { discoverTranscripts, loadTranscriptFilters } = await import('./transcript-discovery.ts');
       const { loadConfigWithEngine } = await import('../config.ts');
       const cfgRaw = opts._loadConfig
         ? await opts._loadConfig()
@@ -680,6 +680,8 @@ export async function runPhaseExtractAtoms(
         const discovered = discoverTranscripts({
           corpusDir,
           meetingTranscriptsDir: meetingDir,
+          // Same filters as synthesize, so both phases see one transcript set.
+          ...(await loadTranscriptFilters(engine)),
         });
         transcripts = discovered.map((d) => ({
           filePath: d.filePath,
