@@ -1,9 +1,10 @@
 import { assertUnmanagedCanonicalWriter } from './persistence/maintenance.ts';
 import { assertImportBase, sameCanonicalImport } from './page-state/import-guard.ts';
 import { stabilizeSafetyAssessments } from './persistence/reconcile-safety.ts';
+import { decideImportIdentity, collidingSlugOwner } from './import-identity.ts';
 import { readSourceFileSync } from './minions/source-filesystem.ts';
 import { readFileSync, statSync, lstatSync } from 'fs';
-import { basename, extname } from 'path';
+import { basename, extname, resolve } from 'path';
 import { createHash } from 'crypto';
 import type { BrainEngine, FileSpec } from './engine.ts';
 import { parseMarkdown } from './markdown.ts';
@@ -27,7 +28,7 @@ import { embedBatchWithBackoff } from './embed-retry.ts';
 import { slugifyPath, slugifyCodePath, isCodeFilePath, hasMalformedPathSegment } from './sync.ts';
 import type { TwinCheck } from './sync-twins.ts';
 import type { ChunkInput, PageInput, PageType } from './types.ts';
-import { computeEffectiveDate } from './effective-date.ts';
+import { computeEffectiveDate, fallbackCreatedAt } from './effective-date.ts';
 import { MARKDOWN_CHUNKER_VERSION } from './chunkers/recursive.ts';
 import { logSlugFallback } from './audit-slug-fallback.ts';
 import { resolveContextualRetrievalMode } from './contextual-retrieval-resolver.ts';
@@ -144,9 +145,11 @@ export interface ImportResult {
    * treated as failures. 'malformed_path' = the FILENAME contains bracket or
    * control characters (never importable; rename the file) — sync counts these
    * in its malformed summary and keeps them OUT of failedFiles / the failure
-   * ledger so they can never gate bookmark advancement.
+   * ledger so they can never gate bookmark advancement. 'slug_collision' =
+   * another live file already owns this slug (see importFromContent); the
+   * skip repeats until one file is renamed.
    */
-  skip_reason?: 'malformed_path';
+  skip_reason?: 'malformed_path' | 'slug_collision';
   /**
    * Advisory (schema.type_warnings): the page's explicit frontmatter `type:`
    * is an alias of a canonical pack type or undeclared in the pack. The type
@@ -154,6 +157,9 @@ export interface ImportResult {
    * distinct type per run.
    */
   type_warning?: { kind: 'alias_of' | 'undeclared'; type: string; canonical?: string; directory?: string };
+  /** True when the text committed but the embedding provider failed; the
+   *  chunks carry NULL vectors until the stale sweep embeds them. */
+  embedding_deferred?: boolean;
 }
 
 export const MAX_FILE_SIZE = 5_000_000; // 5MB
@@ -232,6 +238,14 @@ export async function importFromContent(
     sourcePath?: string;
     /** Full sync only: content-hash duplicates this run retires as old-slug twins are not duplicates (#6). */
     isRetiredTwin?: TwinCheck;
+    /**
+     * Absolute directory `sourcePath` is relative to. importFromFile sets it
+     * so the identity dedup can tell a moved file (its recorded path is gone)
+     * from a second file that shares a frontmatter.id.
+     */
+    sourceRoot?: string;
+    /** The source file's timestamps: the date of a new page that carries no date of its own. */
+    fileTimes?: { birthtime?: Date; mtime?: Date };
     /**
      * v0.32.7 CJK wave (codex post-merge F1): bypass the
      * `existing.content_hash === hash` short-circuit and ALWAYS re-chunk +
@@ -575,6 +589,15 @@ export async function importFromContent(
   const existing = opts.prepare ? existingSnapshot?.page ?? null : await engine.getPage(slug, { sourceId: sourceId ?? 'default', includeDeleted: true });
   if (existing) stabilizeSafetyAssessments(parsed.frontmatter, existing.frontmatter);
 
+  const collisionOwner = collidingSlugOwner(existing, slug, opts.sourceRoot, opts.sourcePath);
+  if (collisionOwner) {
+    process.stderr.write(
+      `[import] slug collision: ${opts.sourcePath} and ${collisionOwner} both map to ${slug} ` +
+      `in source ${sourceId ?? 'default'}; keeping ${collisionOwner}. Rename one file to import both.\n`
+    );
+    return { slug, status: 'skipped', chunks: 0, skip_reason: 'slug_collision' };
+  }
+
   // #2044 / #4548: remote get_page/fetch intentionally strip non-'world'
   // facts rows before an untrusted caller ever sees them. A documented
   // get_page -> edit -> put_page round-trip therefore arrives MISSING rows
@@ -595,9 +618,9 @@ export async function importFromContent(
     parsed.compiled_truth = mergeHiddenFactRowsIntoBody(slug, parsed.compiled_truth, existing.compiled_truth);
     parsed.timeline = mergeHiddenFactRowsIntoBody(slug, parsed.timeline, existing.timeline);
   }
-  const { preserveWithdrawnFenceRows } = await import('./facts/withdrawal.ts');
-  parsed.compiled_truth = await preserveWithdrawnFenceRows(engine, sourceId ?? 'default', parsed.compiled_truth);
-  parsed.timeline = await preserveWithdrawnFenceRows(engine, sourceId ?? 'default', parsed.timeline);
+  const { assertPreparedFactWithdrawals, preserveWithdrawnFenceRows } = await import('./facts/withdrawal.ts');
+  parsed.compiled_truth = await preserveWithdrawnFenceRows(engine, sourceId ?? 'default', parsed.compiled_truth, slug);
+  parsed.timeline = await preserveWithdrawnFenceRows(engine, sourceId ?? 'default', parsed.timeline, slug);
 
   // #1035: absence of an explicit frontmatter `type:` on an EXISTING page
   // means "preserve the stored type", not "re-infer". Pre-fix, a round-trip
@@ -669,7 +692,7 @@ export async function importFromContent(
     if (opts.prepare) {
       const result: ImportResult = { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}) };
       return opts.prepare({ slug, parsedPage, observedRevision: (existing as typeof existing & { knowledge_revision?: string }).knowledge_revision ?? null,
-        noop: true, result, apply: async () => {} });
+        noop: true, result, validate: async () => {}, apply: async () => {} });
     }
     await persistUnchanged();
     return { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}) };
@@ -694,80 +717,46 @@ export async function importFromContent(
     }
   }
 
-  // v0.41.13 (#1309) — identity-based cross-slug dedup pre-check.
-  //
-  // Catches the overlapping-ingest-roots bug class: when a user runs
-  // `gbrain import /vault/Subdir/` then later `gbrain import /vault/`,
-  // the same file is ingested under two different slugs (e.g.
-  // `vault/subdir/note` and `vault/note`). The slug-only check above
-  // misses it because the slugs differ; this check identifies the true
-  // duplicate by content_hash OR external frontmatter.id (granola UUID,
-  // ULID, etc.).
-  //
-  // Posture (codex review):
-  //   - SKIP only when frontmatter.id matches (true external duplicate).
-  //   - WARN-ALWAYS when content_hash matches but identity differs (two
-  //     intentional pages that happen to share text — templates, daily
-  //     logs). User decides whether to investigate.
-  //   - FAIL CLOSED on lookup error: a DB throw means we cannot verify
-  //     uniqueness, so throw rather than silently allow a duplicate.
-  //
-  // Soft-deleted rows are excluded at the engine layer (`deleted_at IS NULL`)
-  // so a tombstoned page doesn't block a legitimate re-import.
-  // Test doubles that don't implement `findDuplicatePage` fall through
-  // via the `?.` shape — no failure mode for fake engines.
+  // Identity dedup (#1309): move, skip a true duplicate, or index both.
+  // See decideImportIdentity for the posture.
   const fmId = (parsed.frontmatter as Record<string, unknown> | undefined)?.id;
   const fmIdStr = typeof fmId === 'string' && fmId.length > 0 ? fmId : null;
-  if (!opts.forceRechunk && engine.findDuplicatePage) {
-    let dup: { slug: string; id: number } | null = null;
-    let dupPage: Awaited<ReturnType<BrainEngine['getPage']>> = null;
-    // An old-slug twin this full sync retires is not a duplicate: look past it (#6).
-    const twins: string[] = [];
-    for (;;) {
-      try {
-        dup = await engine.findDuplicatePage(sourceId ?? 'default', {
-          hash,
-          frontmatterId: fmIdStr,
-          excludeSlugs: twins,
-        });
-      } catch (err) {
-        throw new Error(
-          `[import] dedup pre-check failed for ${opts.sourcePath ?? slug}: ` +
-          `${(err as Error).message}. Re-run import after DB recovery.`
-        );
-      }
-      if (!dup || dup.slug === slug || twins.includes(dup.slug)) break;
-      // Look up the duplicate page so we can compare frontmatter.id.
-      dupPage = await engine.getPage(dup.slug, { sourceId: sourceId ?? 'default' });
-      if (!dupPage || !opts.sourcePath || !opts.isRetiredTwin?.(dupPage, { slug, sourcePath: opts.sourcePath })) break;
-      twins.push(dup.slug);
+  const identity = opts.forceRechunk ? { kind: 'none' as const } : await decideImportIdentity(engine, {
+    sourceId: sourceId ?? 'default', slug, hash, frontmatterId: fmIdStr, sourcePath: opts.sourcePath, sourceRoot: opts.sourceRoot,
+    isRetiredTwin: opts.isRetiredTwin,
+    body: { title: parsed.title, compiled_truth: parsed.compiled_truth, timeline: parsed.timeline || '' },
+  });
+  if (identity.kind === 'move' && !existing && !opts.prepare
+    && await engine.updateSlug(identity.dupSlug, slug, { sourceId: sourceId ?? 'default' }) > 0) {
+    process.stderr.write(
+      `[import] ${opts.sourcePath} carries frontmatter.id=${fmIdStr} from moved file ${identity.dupSourcePath}; ` +
+      `renamed ${identity.dupSlug} -> ${slug} in source ${sourceId ?? 'default'}.\n`
+    );
+    return importFromContent(engine, slug, content, opts);
+  }
+  if (identity.kind === 'duplicate') {
+    if (opts.prepare) {
+      const result: ImportResult = { slug: identity.dupSlug, status: 'skipped', chunks: 0, parsedPage };
+      return opts.prepare({ slug: identity.dupSlug, parsedPage, observedRevision: (existing as (typeof existing & { knowledge_revision?: string }) | null)?.knowledge_revision ?? null,
+        noop: true, result, validate: async () => {}, apply: async () => {} });
     }
-    if (dup && dup.slug !== slug && !twins.includes(dup.slug)) {
-      const dupFmId = (dupPage?.frontmatter as Record<string, unknown> | undefined)?.id;
-      const dupFmIdStr = typeof dupFmId === 'string' && dupFmId.length > 0 ? dupFmId : null;
-      const sameExternalId = fmIdStr !== null && dupFmIdStr === fmIdStr;
-      if (sameExternalId) {
-        if (opts.prepare) {
-          const result: ImportResult = { slug: dup.slug, status: 'skipped', chunks: 0, parsedPage };
-          return opts.prepare({ slug: dup.slug, parsedPage, observedRevision: (existing as (typeof existing & { knowledge_revision?: string }) | null)?.knowledge_revision ?? null,
-            noop: true, result, apply: async () => {} });
-        }
-        // True duplicate (same external ID). Skip + log to stderr.
-        process.stderr.write(
-          `[import] skipping ${opts.sourcePath ?? slug}: identical to ${dup.slug} ` +
-          `(frontmatter.id=${fmIdStr}) in source ${sourceId ?? 'default'}. ` +
-          `Pass --force-rechunk to override.\n`
-        );
-        return { slug: dup.slug, status: 'skipped', chunks: 0, parsedPage };
-      }
-      // Same content_hash, different (or missing) frontmatter.id.
-      // Surface a warning but proceed with the insert — they may be
-      // legitimate independent pages that happen to share text.
-      process.stderr.write(
-        `[import] WARNING: ${opts.sourcePath ?? slug} shares content_hash with ${dup.slug} ` +
-        `(${hash.slice(0, 8)}) but has different frontmatter.id. Indexing both.\n`
-      );
-    }
+    process.stderr.write(
+      `[import] skipping ${opts.sourcePath ?? slug}: identical to ${identity.dupSlug} ` +
+      `(frontmatter.id=${fmIdStr}) in source ${sourceId ?? 'default'}. ` +
+      `Pass --force-rechunk to override.\n`
+    );
+    return { slug: identity.dupSlug, status: 'skipped', chunks: 0, parsedPage };
+  }
+  if (identity.kind === 'shared_id') {
+    process.stderr.write(
+      `[import] WARNING: ${opts.sourcePath ?? slug} shares frontmatter.id=${fmIdStr} with ${identity.dupSlug} ` +
+      `but its content differs. Indexing both.\n`
+    );
+  } else if (identity.kind === 'shared_hash') {
+    process.stderr.write(
+      `[import] WARNING: ${opts.sourcePath ?? slug} shares content_hash with ${identity.dupSlug} ` +
+      `(${hash.slice(0, 8)}) but not its frontmatter.id. Indexing both.\n`
+    );
   }
 
   // Preserve the importer projection (including fenced code and zero-chunk
@@ -856,7 +845,23 @@ export async function importFromContent(
       chunks[i].token_count = Math.ceil(wrappedTexts[i].length / 4);
     }
   };
-  if (!opts.onPostCommitEmbedding) await embedChunks();
+  // An embedding outage never blocks the text write: the page and its chunks
+  // commit with NULL vectors and no embedding signature, and the stale sweep
+  // (`gbrain embed --stale`, sync's embed pass, the cycle) embeds them once
+  // the provider recovers.
+  let embeddingDeferred = false;
+  if (!opts.onPostCommitEmbedding) {
+    try {
+      await embedChunks();
+    } catch (err) {
+      embeddingDeferred = true;
+      for (const c of chunks) { c.embedding = undefined; c.token_count = undefined; }
+      process.stderr.write(
+        `[import] ${slug}: embedding failed (${err instanceof Error ? err.message : String(err)}); ` +
+        `text saved, chunks queued for \`gbrain embed --stale\`.\n`
+      );
+    }
+  }
 
   // v0.40.3.0: corpus_generation hash for D27 P1-5 cache invalidation.
   // Record the selected wrapper generation for inline or deferred embedding;
@@ -882,13 +887,14 @@ export async function importFromContent(
   let persistedProjection: ProjectionSnapshot | null = null;
   const applyPrepared = async (tx: BrainEngine) => {
     await assertImportBase(tx, slug, txOpts.sourceId, existing);
+    await assertPreparedFactWithdrawals(tx, txOpts.sourceId, parsed.compiled_truth, parsed.timeline || '', slug);
     if (existing) await tx.createVersion(slug, txOpts);
 
     // v0.29.1 — compute effective_date from frontmatter precedence chain.
     // Filename comes from importFromFile path (basename) or the slug tail
-    // (put_page MCP op fallback). updatedAt/createdAt use the existing
-    // page's timestamps when present; otherwise NOW() (the row about to
-    // be created). The result drives the recency boost and since/until
+    // (put_page MCP op fallback). An undated page falls back to a stable
+    // anchor (fallbackCreatedAt): its stored fallback date, else its file's
+    // timestamp, else now — never the latest write. The result drives the recency boost and since/until
     // filters when callers opt in; nothing in the default search path
     // consults it.
     const filenameForChain = opts.filename ?? slug.split('/').pop() ?? slug;
@@ -898,7 +904,7 @@ export async function importFromContent(
       frontmatter: parsed.frontmatter,
       filename: filenameForChain,
       updatedAt: existing?.updated_at ?? nowDate,
-      createdAt: existing?.created_at ?? nowDate,
+      createdAt: fallbackCreatedAt({ existing, fileTimes: opts.fileTimes, now: nowDate }),
     });
 
     await tx.putPage(slug, {
@@ -973,7 +979,7 @@ export async function importFromContent(
       // embedded (not --no-embed), so a later model/dims swap is detectable
       // as stale via embed --stale. The deferred/backfill + per-slug embed
       // paths stamp too; this covers the inline import/sync path.
-      if (!opts.noEmbed && !opts.onPostCommitEmbedding) {
+      if (!opts.noEmbed && !opts.onPostCommitEmbedding && !embeddingDeferred) {
         // D9: signature is null when the gateway is unconfigured — skip the
         // stamp (a wrong signature is worse than none).
         const importSig = currentEmbeddingSignature();
@@ -1042,6 +1048,7 @@ export async function importFromContent(
     slug, parsedPage, observedRevision: (existing as (typeof existing & { knowledge_revision?: string }) | null)?.knowledge_revision ?? null,
     noop: false, result: { slug, status: 'imported', chunks: chunks.length, parsedPage,
       ...(pageQuarantined ? { quarantined: true } : {}), ...(pageFlagged ? { flagged: true, flag_reason: pageFlagReason } : {}) },
+    validate: tx => assertPreparedFactWithdrawals(tx, txOpts.sourceId, parsed.compiled_truth, parsed.timeline || '', slug),
     apply: applyPrepared,
   });
   await engine.transaction(applyPrepared).catch(async (err: unknown) => {
@@ -1084,6 +1091,7 @@ export async function importFromContent(
     ...(pageQuarantined ? { quarantined: true } : {}),
     ...(pageFlagged ? { flagged: true, flag_reason: pageFlagReason } : {}),
     ...(typeWarning ? { type_warning: typeWarning } : {}),
+    ...(embeddingDeferred ? { embedding_deferred: true } : {}),
   };
 }
 
@@ -1337,6 +1345,9 @@ export async function importFromFile(
     ...opts,
     filename: fileBasename,
     sourcePath: relativePath,
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- walks up from the caller's own file path by the depth of its own relative path to recover the import root; import-identity confines every probe under that root
+    sourceRoot: resolve(filePath, ...relativePath.split(/[\\/]/).map(() => '..')),
+    fileTimes: { birthtime: stat.birthtime, mtime: stat.mtime },
     // The disk file IS the source of truth: a file the user emptied is a
     // deliberate clear, so it passes putPage's empty-overwrite guard.
     allowEmptyOverwrite: true,
@@ -1421,7 +1432,7 @@ export async function importCodeFile(
   if (!opts.force && existing?.content_hash === hash && !existing.deleted_at && existing.text_projection_revision === existing.knowledge_revision) {
     if (opts.prepare) {
       const result: ImportResult = { slug, status: 'skipped', chunks: 0 };
-      return opts.prepare({ slug, parsedPage, observedRevision: existing.knowledge_revision ?? null, noop: true, result, apply: async () => {} });
+      return opts.prepare({ slug, parsedPage, observedRevision: existing.knowledge_revision ?? null, noop: true, result, validate: async () => {}, apply: async () => {} });
     }
     await engine.transaction(tx => assertImportBase(tx, slug, sourceId ?? 'default', existing));
     return { slug, status: 'skipped', chunks: 0 };
@@ -1433,7 +1444,7 @@ export async function importCodeFile(
     const result: ImportResult = { slug, status: 'imported', chunks: projection.chunks.length };
     const apply = (tx: BrainEngine) => installPageProjection(tx, snapshot, projection.chunks,
       { seal: true, preserveEmbeddings: true, code: projection.code });
-    if (opts.prepare) return opts.prepare({ slug, parsedPage, observedRevision: snapshot.snapshot.revision, noop: false, result, apply });
+    if (opts.prepare) return opts.prepare({ slug, parsedPage, observedRevision: snapshot.snapshot.revision, noop: false, result, validate: async () => {}, apply });
     await engine.transaction(apply);
     return result;
   }
@@ -1472,6 +1483,7 @@ export async function importCodeFile(
   }
 
   // Embed only the new/changed chunks.
+  let codeEmbeddingFailed = false;
   if (!opts.noEmbed && needsEmbedIndexes.length > 0) {
     try {
       const textsToEmbed = needsEmbedIndexes.map((i) => chunks[i]!.chunk_text);
@@ -1482,6 +1494,7 @@ export async function importCodeFile(
         chunks[i]!.token_count = Math.ceil(chunks[i]!.chunk_text.length / 4);
       }
     } catch (e: unknown) {
+      codeEmbeddingFailed = true;
       console.warn(`[gbrain] embedding failed for code file ${slug}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
@@ -1524,7 +1537,7 @@ export async function importCodeFile(
       // carrying old-model vectors). Mixed pages stay unstamped rather than
       // falsely marked current; `reindex --code --force` / `embed --stale`
       // handle the swap for those.
-      if (!opts.noEmbed && needsEmbedIndexes.length === chunks.length) {
+      if (!opts.noEmbed && !codeEmbeddingFailed && needsEmbedIndexes.length === chunks.length) {
         // D9: no stamp without a gateway (wrong signature is worse than none).
         const codeSig = currentEmbeddingSignature();
         if (codeSig) {
@@ -1541,7 +1554,7 @@ export async function importCodeFile(
   };
   if (opts.prepare) {
     const result: ImportResult = { slug, status: 'imported', chunks: chunks.length };
-    return opts.prepare({ slug, parsedPage, observedRevision: existing?.knowledge_revision ?? null, noop: false, result, apply });
+    return opts.prepare({ slug, parsedPage, observedRevision: existing?.knowledge_revision ?? null, noop: false, result, validate: async () => {}, apply });
   }
   await engine.transaction(apply);
 
@@ -2071,12 +2084,21 @@ export async function importImageFile(
       return { slug: imageSlug, status: 'skipped', chunks: 0,
         error: 'Image OCR contains protected sections. Remove that content from the source image and reimport the changed image.' };
     }
-    // An unchanged legacy image still needs its full OCR/visual index rebuilt.
-    const sealed = await engine.executeRaw(`SELECT id FROM pages p WHERE p.source_id = $1 AND p.slug = $2 AND ${safeChunksFilter('p')}`,
+    // An unchanged legacy image still needs its full OCR/visual index rebuilt,
+    // and so does an image whose earlier import lacked the visual vector or
+    // OCR text this run would build (--no-embed, OCR budget skip, provider
+    // error). Legacy rows without `ocr_status` count as OCR'd when they hold
+    // OCR text.
+    const sealed = await engine.executeRaw<{ has_visual: boolean }>(
+      `SELECT EXISTS (SELECT 1 FROM content_chunks c WHERE c.page_id = p.id AND c.embedding_image IS NOT NULL) AS has_visual
+         FROM pages p WHERE p.source_id = $1 AND p.slug = $2 AND ${safeChunksFilter('p')}`,
       [sourceOpts.sourceId, imageSlug]);
-    if (sealed.length && !existing.deleted_at && existing.text_projection_revision === existing.knowledge_revision) {
+    const ocrWanted = !opts.noEmbed && process.env.GBRAIN_EMBEDDING_IMAGE_OCR === 'true';
+    const ocrDone = (existing.frontmatter as Record<string, unknown>)?.ocr_status === 'done' || existing.compiled_truth.trim() !== '';
+    const indexComplete = !!sealed[0] && (opts.noEmbed || sealed[0].has_visual) && (!ocrWanted || ocrDone);
+    if (indexComplete && !existing.deleted_at && existing.text_projection_revision === existing.knowledge_revision) {
       if (opts.prepare) return opts.prepare({ slug: imageSlug, observedRevision: existing.knowledge_revision ?? null, noop: true,
-        result: { slug: imageSlug, status: 'skipped', chunks: 0 }, apply: async () => {} });
+        result: { slug: imageSlug, status: 'skipped', chunks: 0 }, validate: async () => {}, apply: async () => {} });
       await engine.transaction(tx => assertImportBase(tx, imageSlug, sourceOpts.sourceId, existing));
       return { slug: imageSlug, status: 'skipped', chunks: 0 };
     }
@@ -2136,6 +2158,7 @@ export async function importImageFile(
     mime_type: decoded.mime,
     bytes: buf.byteLength,
     ...exif,
+    ...(ocr.successful ? { ocr_status: 'done' } : {}),
   };
 
   // Single chunk per image. chunk_text holds OCR text or filename so
@@ -2170,7 +2193,7 @@ export async function importImageFile(
       timeline: '',
       frontmatter,
       content_hash: hash,
-      ...(opts.prepare ? { source_path: relativePath } : {}),
+      source_path: relativePath,
     },
     // The image bytes are the source of truth and the body is OCR-derived:
     // a changed image whose OCR yields nothing legitimately blanks the body.
@@ -2203,7 +2226,7 @@ export async function importImageFile(
   };
 
   if (opts.prepare) return opts.prepare({ slug: imageSlug, observedRevision: existing?.knowledge_revision ?? null, noop: false,
-    result: { slug: imageSlug, status: 'imported', chunks: 1 }, apply: tx => applyImportTransaction(tx, spec) });
+    result: { slug: imageSlug, status: 'imported', chunks: 1 }, validate: async () => {}, apply: tx => applyImportTransaction(tx, spec) });
   await withImportTransaction(engine, spec);
 
   return { slug: imageSlug, status: 'imported', chunks: 1 };

@@ -9,7 +9,7 @@ import { PAGE_STATE_SCHEMA_SQL, PAGE_VERSION_DELETION_SCHEMA_SQL } from './page-
 import type { BrainEngine } from './engine.ts';
 import { slugifyPath } from './sync.ts';
 import { getFtsLanguage } from './fts-language.ts';
-import { hnswMaxDimsForType } from './vector-index.ts';
+import { hnswMaxDimsForType, readExistingEmbeddingShape } from './vector-index.ts';
 // runMigrations executes while an initialized engine is live. Keep its helper
 // modules in the static graph rather than importing them from async handlers.
 import {
@@ -20,7 +20,7 @@ import { repairTimelineDedupIndex, repairLegacyTimelineSourceRows } from './time
 import { repairPagesUpsertArbiter } from './pages-upsert-arbiter.ts';
 import { repairLinkSourceCheck, LINK_SOURCE_GATE_MIGRATION_VERSION } from './link-source-check-repair.ts';
 import { GRANT_COLUMNS_SQL, GRANT_AUDIT_SCHEMA_SQL, GRANT_SPEND_COLUMNS_SQL } from './grants/schema.ts';
-import { FACT_WITHDRAWAL_SCHEMA_SQL, FACT_WITHDRAWAL_BACKFILL_SQL } from './facts/withdrawal-schema.ts';
+import { FACT_WITHDRAWAL_SCHEMA_SQL, FACT_WITHDRAWAL_BACKFILL_SQL, FACT_WITHDRAWAL_SUBJECT_SQL } from './facts/withdrawal-schema.ts';
 import { repairLegacyClientGrants } from './grants/migration.ts';
 import { PROJECTION_STATISTICS_SQL, verifyProjectionStatistics } from './search/projection-statistics.ts';
 import { SHARED_SKILLS_SCHEMA_SQL } from './shared-skills/schema-all.ts';
@@ -2374,14 +2374,15 @@ export const MIGRATIONS: Migration[] = [
         useHalfvec = true;
       }
 
-      const columnType = useHalfvec ? 'halfvec' : 'vector';
+      const existingShape = await readExistingEmbeddingShape(engine, 'facts');
+      const columnType = existingShape?.type ?? (useHalfvec ? 'halfvec' : 'vector');
       const vecType = columnType.toUpperCase();
       // HNSW operator class must match the column type:
       //   VECTOR(n)  → vector_cosine_ops
       //   HALFVEC(n) → halfvec_cosine_ops
-      const opclass = useHalfvec ? 'halfvec_cosine_ops' : 'vector_cosine_ops';
+      const opclass = columnType === 'halfvec' ? 'halfvec_cosine_ops' : 'vector_cosine_ops';
       const hnswMaxDims = hnswMaxDimsForType(columnType);
-      const factsEmbeddingIndexSql = embeddingDim <= hnswMaxDims
+      const factsEmbeddingIndexSql = (existingShape?.dimensions ?? embeddingDim) <= hnswMaxDims
         ? `CREATE INDEX IF NOT EXISTS idx_facts_embedding_hnsw
           ON facts USING hnsw (embedding ${opclass})
           WHERE embedding IS NOT NULL AND expired_at IS NULL;`
@@ -2974,11 +2975,12 @@ export const MIGRATIONS: Migration[] = [
         useHalfvec = true;
       }
 
-      const columnType = useHalfvec ? 'halfvec' : 'vector';
+      const existingShape = await readExistingEmbeddingShape(engine, 'query_cache');
+      const columnType = existingShape?.type ?? (useHalfvec ? 'halfvec' : 'vector');
       const vecType = columnType.toUpperCase();
-      const opclass = useHalfvec ? 'halfvec_cosine_ops' : 'vector_cosine_ops';
+      const opclass = columnType === 'halfvec' ? 'halfvec_cosine_ops' : 'vector_cosine_ops';
       const hnswMaxDims = hnswMaxDimsForType(columnType);
-      const queryCacheEmbeddingIndexSql = embeddingDim <= hnswMaxDims
+      const queryCacheEmbeddingIndexSql = (existingShape?.dimensions ?? embeddingDim) <= hnswMaxDims
         ? `CREATE INDEX IF NOT EXISTS idx_query_cache_embedding_hnsw
           ON query_cache USING hnsw (embedding ${opclass})
           WHERE embedding IS NOT NULL;`
@@ -6661,7 +6663,53 @@ CREATE TRIGGER minion_queue_protocol BEFORE INSERT OR UPDATE ON minion_jobs
     },
   },
   {
-    version: 166,
+    version: 166, name: 'fact_embedding_identity', idempotent: true,
+    sql: `ALTER TABLE facts ADD COLUMN IF NOT EXISTS embedding_model TEXT;
+      ALTER TABLE facts ADD COLUMN IF NOT EXISTS embedded_text_hash TEXT;
+      ${MANAGED_WRITER_GUARD_SQL}`,
+  },
+  {
+    // A legacy DB-only row can name a fence row as its successor. The fence
+    // reconcile deletes and reinserts that row, so a NO ACTION reference made
+    // the page fail to reconcile on every cycle. The superseded row stays
+    // expired; only the pointer to the replaced row clears.
+    version: 167,
+    name: 'facts_superseded_by_set_null',
+    idempotent: true,
+    sql: `
+      ALTER TABLE facts DROP CONSTRAINT IF EXISTS facts_superseded_by_fkey;
+      ALTER TABLE facts ADD CONSTRAINT facts_superseded_by_fkey
+        FOREIGN KEY (superseded_by) REFERENCES facts(id) ON DELETE SET NULL NOT VALID;
+      ALTER TABLE facts VALIDATE CONSTRAINT facts_superseded_by_fkey;
+    `,
+  },
+  {
+    // The only record that a transcript was synthesized was its completed
+    // subagent job row, which `jobs prune` deletes after 30 days; the next
+    // cycle then paid to synthesize it again. Prune archives the keys here.
+    version: 168,
+    name: 'dream_synthesis_completions',
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS dream_synthesis_completions (
+        source_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        completed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (source_id, idempotency_key)
+      );
+    `,
+  },
+  {
+    // A withdrawal keyed only on the claim text expired and blocked that claim
+    // for every entity in the source. New withdrawals carry the forgotten
+    // row's subject; existing rows keep the source-wide '*' subject.
+    version: 169,
+    name: 'fact_withdrawal_subject',
+    idempotent: true,
+    sql: FACT_WITHDRAWAL_SUBJECT_SQL,
+  },
+  {
+    version: 170,
     name: 'page_aliases_cyrillic_fold',
     // normalizeAlias now folds ё → е and drops a Cyrillic stress mark (U+0301)
     // after lowercasing (ADR-0001), on both the write and the read side. Rows
@@ -6676,13 +6724,17 @@ CREATE TRIGGER minion_queue_protocol BEFORE INSERT OR UPDATE ON minion_jobs
     // source grant. A schema migration runs quiesced, so grant every source
     // for this transaction only (is_local = true), exactly as the coordinator
     // would, or the upgrade stops here.
-    // Fork note: this migration shipped in the fork as v165 before upstream
-    // claimed v165 (index_database_only_pending_writes). A brain stamped at
-    // the fork's v165 skips upstream's v165, so re-create that index here;
-    // IF NOT EXISTS keeps it a no-op everywhere else.
+    // Fork note: this migration shipped in the fork as v165, then v166, before
+    // upstream claimed v165 (index_database_only_pending_writes) and v166
+    // (fact_embedding_identity). A brain stamped at the fork's v165 or v166
+    // skips upstream's copy of those, so re-create both here; every statement
+    // is IF NOT EXISTS / idempotent, so it is a no-op everywhere else.
     idempotent: true,
     sql: `
       ${PERSISTENCE_DATABASE_PENDING_INDEX_SQL};
+      ALTER TABLE facts ADD COLUMN IF NOT EXISTS embedding_model TEXT;
+      ALTER TABLE facts ADD COLUMN IF NOT EXISTS embedded_text_hash TEXT;
+      ${MANAGED_WRITER_GUARD_SQL};
       SELECT set_config('gbrain.write_sources',
         (SELECT COALESCE(jsonb_agg(DISTINCT sid), '[]'::jsonb)::text
            FROM (SELECT id AS sid FROM sources UNION SELECT source_id FROM page_aliases) s), true);
