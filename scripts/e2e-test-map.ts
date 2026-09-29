@@ -15,6 +15,22 @@
 // No brace expansion, no ?, no [ ].
 
 export const E2E_TEST_MAP: Record<string, string[]> = {
+  // SkillOpt orchestrator, outcome/resume, models plan + strict mode, spend ledger.
+  "src/core/skillopt/**": [
+    "test/e2e/skillopt-loop.serial.test.ts",
+    "test/e2e/skillopt-pglite.serial.test.ts",
+    "test/e2e/skillopt-outcome.serial.test.ts",
+    "test/e2e/skillopt-models-strict.serial.test.ts",
+    "test/e2e/skillopt-models-used.serial.test.ts",
+    "test/e2e/dream-cycle-phase-order-pglite.test.ts",
+  ],
+  "src/commands/skillopt.ts": [
+    "test/e2e/skillopt-loop.serial.test.ts",
+    "test/e2e/skillopt-pglite.serial.test.ts",
+    "test/e2e/skillopt-outcome.serial.test.ts",
+    "test/e2e/skillopt-models-strict.serial.test.ts",
+    "test/e2e/skillopt-models-used.serial.test.ts",
+  ],
   "src/core/company-brain/receipts.ts": ["test/e2e/company-brain-receipts.test.ts"],
   "src/core/company-brain/receipt-schema.ts": ["test/e2e/company-brain-receipts.test.ts"],
   "src/core/minions/errors.ts": ["test/e2e/subagent-gateway-path.test.ts", "test/e2e/delegated-http-worker.test.ts", "test/e2e/subagent-crash-replay-multi-provider.test.ts"],
@@ -143,6 +159,8 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   ],
   // Any minions queue/worker/handler change exercises all minion E2E.
   "src/core/minions/**": [
+    "test/e2e/worker-readiness-cli.test.ts",
+    "test/e2e/worker-configuration-release.test.ts",
     "test/e2e/delegated-grants-withdrawal.test.ts",
     "test/e2e/delegated-http-worker.test.ts",
     "test/e2e/minions-concurrency.test.ts",
@@ -205,6 +223,7 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   "src/core/pool-budget.ts": ["test/e2e/persistence-runtime-matrix.test.ts"],
   "src/core/connection-manager.ts": ["test/e2e/persistence-runtime-matrix.test.ts", "test/e2e/pgbouncer-teardown.test.ts"],
   "src/core/postgres-engine.ts": [
+    "test/e2e/postgres-driver-install.test.ts",
     "test/e2e/unsupported-embedding-identity-postgres.test.ts",
     "test/e2e/fixture-reset-postgres.test.ts",
     "test/e2e/persistence-chaos.test.ts",
@@ -343,7 +362,7 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   ],
   // Autopilot linux install/uninstall lifecycle (PATH-shimmed crontab +
   // systemctl; the ubuntu CI runner's only behavioral pin on those arms).
-  "src/commands/autopilot.ts": ["test/e2e/autopilot-linux-lifecycle.serial.test.ts"],
+  "src/commands/autopilot.ts": ["test/e2e/autopilot-linux-lifecycle.serial.test.ts", "test/e2e/worker-readiness-cli.test.ts"],
   "src/commands/doctor.ts": ["test/e2e/doctor-progress.test.ts"],
   // Doctor check modules peeled from doctor.ts feed the same e2e surface.
   "src/commands/doctor/**": ["test/e2e/doctor-progress.test.ts"],
