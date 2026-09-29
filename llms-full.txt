@@ -1784,12 +1784,23 @@ unset) and tears down. Use `bun run ci:local:diff` for the
 diff-aware subset during fast iteration on a focused branch. Requires Docker
 (Docker Desktop / OrbStack / Colima) and `gitleaks` (`brew install gitleaks`).
 
+Fastest path, with a Ubicloud token (`UBICLOUD_API_KEY` or
+`UBICLOUD_API_TOKEN`): `bun run ci:ubicloud` runs the same gate across ten
+ephemeral VMs in about five minutes, uncommitted edits included
+(`ci:ubicloud:diff` for the diff-aware subset). See "Ubicloud fan-out" in
+[`docs/TESTING.md`](./docs/TESTING.md).
+
 Manual path: `bun test` plus the E2E lifecycle described in `./CLAUDE.md` (spin
 up the test Postgres container, run `bun run test:e2e`, tear it down).
 
 Ship via the `/ship` skill, not by hand. The full release + contributor process
 (CHANGELOG voice, version-locations sync, PR conventions, community-PR-wave) lives in
 [`./docs/RELEASING.md`](./docs/RELEASING.md); read it before shipping.
+
+**Always use PATCH without asking**, including the initial release choice;
+override `/ship`'s MINOR/MAJOR prompts. Auto-allocate past collisions, sync all
+version stamps and the PR title, then report the number. This changes numbering
+only: scope, merge, deployment, paid-work and validation approvals still apply.
 
 ## Privacy
 
@@ -2190,9 +2201,10 @@ four numeric segments are required first. Historical 3-segment versions
 DRIFT_STALE_PKG / DRIFT_UNEXPECTED, and refuses to proceed on
 DRIFT_UNEXPECTED. This is why the two must move together.
 
-**Auto-renumber when needed; never ask.** Use `/ship`'s queue-aware allocator,
-update all version stamps and the PR title, then report the number. This overrides
-its ALREADY_BUMPED rebump prompt, not scope, merge or deployment approvals.
+**Always use PATCH without asking**, including the initial release choice;
+override `/ship`'s MINOR/MAJOR prompts. Auto-allocate past collisions, sync all
+version stamps and the PR title, then report the number. This changes numbering
+only: scope, merge, deployment, paid-work and validation approvals still apply.
 CI rejects mismatched `VERSION`/`package.json` or versions not newer than master.
 
 ### Version consistency and conflict recovery
@@ -3189,7 +3201,7 @@ I'm Garry Tan, President and CEO of Y Combinator. I built GBrain to run my own A
 Alongside keyword and semantic retrieval, GBrain offers two optional ways to use your stored knowledge:
 
 - **A synthesis layer that gives you the actual answer.** Synthesized, well-cited prose across people, companies, deals, and ideas. Not "here are 10 chunks that mention your query"; an actual answer with citations and an explicit note on what the brain doesn't know yet. The gap analysis is the part that changes how you use the brain.
-- **A typed knowledge graph.** Trusted local page writes extract supported references without LLM calls when auto-linking is enabled. Remote `put_page` does not extract graph edges inline: stdio has best-effort startup/idle sweeps; HTTP needs explicit maintenance or authorized `add_link` calls. Ask "who works at acme-example?" to use stored relationships. A 240-page Opus-generated rich-prose BrainBench run reported **P@5 49.1%, R@5 97.9%**, with **+31.4 points P@5** over its graph-disabled variant. These are scoped benchmark results, not a guarantee for every corpus. Scorecards: [gbrain-evals](https://github.com/garrytan/gbrain-evals).
+- **A typed knowledge graph.** Trusted local page writes extract supported references without LLM calls when auto-linking is enabled. Remote `put_page` does not extract graph edges inline: stdio has best-effort startup/idle sweeps; HTTP needs explicit maintenance or authorized `add_link` calls. Ask "who works at acme-example?" to use stored relationships. On BrainBench relationship questions a graph adapter scored **P@5 0.3421, R@5 0.9791** vs 0.1917 / 0.6874 plain hybrid ([2026-09-09 refresh](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-09-09-retrieval-refresh.md)): whole systems, not a graph-only lift or a general guarantee.
 
 The point of building a 150K-page brain is to use it as a strategic moat. To never lose context. To query what's in your own head without re-reading it. The brain layer is what makes the moat usable. The 24/7 dream cycle is what keeps it sharp. Both run on your hardware, your DB, your keys.
 
@@ -4982,9 +4994,13 @@ per-transcript synthesis subagents. The dials:
   gate, so a reconcile sweep never cancels rescued jobs. Telemetry:
   `details.triage.rescue_checked` / `rescue_fired`.
 - `dream.synthesize.quote_verify` (default on) — the mechanical post-write
-  quote verify/repair pass on newly-created dream pages (paraphrased "quotes"
-  are repaired to verbatim transcript slices or unquoted; never invented).
-  The off switch is the incident escape hatch; telemetry lands in
+  claim check on every page a synthesis child wrote. Paraphrased quotes are
+  repaired to verbatim transcript slices; a sentence whose quote grounds
+  nowhere, spans two speakers, is attributed to the wrong speaker, or states a
+  number or date the transcript lacks is moved out of the page body into
+  frontmatter `unverified_claims`, so search, recall and think never see it.
+  Pages that already existed are checked only on the sentences this run
+  added. The off switch is the incident escape hatch; telemetry lands in
   `details.synthesis.quote_verify`.
 - `dream.synthesize.max_turns` (default 16) — synthesis turn budget for
   agentic children and oneshot fallbacks (the default oneshot path — see
@@ -5070,9 +5086,11 @@ Three more fields answer "what did that cost and did it land":
 - `children_zero_pages` — children that completed but wrote no page. A number
   that climbs here means the model is producing valid-but-empty output, which
   a green phase status alone would hide.
-- `quote_verify` — what the post-write quote pass touched: spans checked,
-  repaired, and stripped, pages skipped as pre-existing, unbalanced paragraphs,
-  and the warn-only ungrounded numeric/date claim count.
+- `quote_verify` — what the post-write claim check touched: quotes checked
+  and repaired, sentences quarantined (with counts per reason:
+  `quote_not_in_source`, `quote_crosses_speakers`, `speaker_mismatch`,
+  `number_not_in_source`), pre-existing pages checked by diff, and unbalanced
+  paragraphs.
 
 Per-call spend also lands in the `chat_usage_log` ledger with a phase tag:
 the orchestrator's own calls under `phase:synthesize`, each drained child
@@ -6127,6 +6145,29 @@ No server, no tunnel, no token needed. Works on both PGLite and Postgres engines
 [MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md)) instead of the full catalog;
 `--surface starter` sits between (~27 ops: the verbs plus the daily-driver set);
 omit the flag (default `full`) for every operation.
+
+#### Stdio source binding
+
+Do not inherit `GBRAIN_SOURCE=__all__` from a trusted CLI session into a
+stdio MCP server. It does not grant all-source access: the server keeps a
+fail-closed scope, so searches can return healthy empty results even when
+the trusted CLI finds pages. Startup stderr warns about this binding before
+the MCP handshake; it does not inspect or reveal private pages.
+
+In the MCP host's server environment, set `GBRAIN_SOURCE` to the intended
+registered source id, or remove it to use normal source resolution and its
+configured federation rules. Inspect registered ids with `gbrain sources list`
+on the brain host, then restart the MCP server and check a known world-visible
+page in the intended source. Removing the variable is not unrestricted access:
+dotfiles and other source-resolution settings still apply. No memory writes or
+index repair are needed to correct this environment binding.
+
+This differs from the per-call `source_id: "__all__"` argument, which searches
+only the caller's granted sources. MCP callers also exclude private pages by
+default; a private-only miss is not evidence of a broken index. For a concrete
+source binding that still misses a known visible page, retain the version,
+engine, schema pack, effective source/grants, and retrieval metadata for a
+sanitized reproduction rather than broadening permissions.
 
 ### Tailscale (recommended): `gbrain mcp expose`
 
