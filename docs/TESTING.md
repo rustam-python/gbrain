@@ -91,7 +91,7 @@ Search reliability has real-planner and transport regressions in
 `test/e2e/vector-candidate-safety-postgres.test.ts`,
 `test/e2e/search-query-contract-postgres.test.ts`,
 `test/e2e/projection-statistics-postgres.test.ts`, and
-`test/e2e/search-readiness-http.test.ts`. The statistics tests include owner,
+`test/search-readiness-http.test.ts`. The statistics tests include owner,
 restricted-reader and FORCE-RLS roles; the candidate tests distinguish natural
 plans from forced-HNSW controls and prove server cancellation of exact fallback.
 `test/e2e/projection-recovery-parity.test.ts` runs the shared Markdown/code
@@ -159,6 +159,38 @@ can reduce maintenance while keeping both engine arms. Making one crash lane
 authoritative or collecting LCOV in a named owner requires a separate ownership
 change; nightly sharding alone makes neither change.
 
+The 2026-09-29 test audit's lane reports, inventories and mutation-probe logs
+are committed under [docs/test-audit/2026-09-29/](test-audit/2026-09-29/README.md);
+cite them for the surviving-owner and probe evidence behind a consolidation.
+
+Recorded ownership changes:
+
+- `test/e2e/reconcile-crash.test.ts` and `test/e2e/reconcile-crash-unactivated.test.ts`:
+  the PR owner is `persistence-validation.yml`, called from `test.yml` on every
+  PR on both supported Bun versions against pg16. Its "Require all
+  reconciliation crash boundaries" step runs both files by name and uploads the
+  crash manifests, unchanged. Both files are in `E2E_EXCLUSIONS`
+  (`PERSISTENCE_VALIDATION_OWNED` in `scripts/e2e-matrix.ts`), so PR
+  `selected-e2e` no longer runs them a second time; `scripts/select-e2e.ts`
+  prints `excluded: <file> (owned by persistence-validation.yml)` on stderr when
+  a mapped source changes. The nightly full-corpus E2E run and the local gates
+  (`ci:local`, `ci:ubicloud`, their `:diff` forms) still run them. Run them
+  locally with the same command the workflow uses, with `DATABASE_URL`
+  exported for the test database from "E2E test DB lifecycle":
+
+  ```bash
+  GBRAIN_TEST_ALLOW_DATABASE_URL=1 \
+  GBRAIN_TEST_RECONCILE_CRASH_MANIFEST_DIR=.context/reconcile-crashes \
+    bun --no-env-file test --timeout=180000 \
+    test/e2e/reconcile-crash.test.ts test/e2e/reconcile-crash-unactivated.test.ts
+  ```
+
+- Attendance parity (`test/attendance-retrieval.test.ts`,
+  `test/attendance-repair.test.ts`, `test/extract-timeline-attendance.test.ts`):
+  the unit lane owns the PGLite arm; the `test/e2e/*-postgres.test.ts` wrappers
+  load the scenarios through `registerPostgresTests`, so E2E runs only the
+  PostgreSQL arm.
+
 Name the profile when reporting “all tests.” The local fast loop, `test:full`,
 `ci:local`, required PR checks and nightly `fullCorpus` are not interchangeable
 supersets. Native matrices, sustained persistence validation, browser tests and
@@ -166,6 +198,69 @@ optional recipe/eval commands have separate responsibilities. A faster nightly
 E2E schedule does not shorten a PR critical path dominated by persistence.
 Report matched executed timings separately from dry-run partition estimates,
 including setup, queueing and retries; never count skip-only output as coverage.
+
+### Authoring gate
+
+Before adding a test, answer four questions in the PR description or the test
+header:
+
+1. What observable behavior or contract does it protect?
+2. What credible regression makes it fail?
+3. Why does existing coverage not already catch it?
+4. Does it need a production seam that no production caller needs?
+
+A regression test must fail when its fix is reverted; prove it with
+`scripts/check-test-discriminates.sh` (see CONTRIBUTING.md). If question 1 has
+no answer, or the answer to question 3 names an existing owner at the same
+boundary, do not add the test.
+
+Good: a test that runs `gbrain remote ping` against a fake MCP server returning
+`{ status: 'failed' }` and asserts exit code 1 with the failure reason in the
+JSON output. It protects a user-visible contract, fails if the poll loop reads
+the wrong field, and needs no seam.
+
+Bad: a test that reads `src/commands/remote.ts` and asserts it contains
+`job.status`. It passes when the loop is broken in a way that keeps the token,
+fails on a harmless rename, and duplicates the behavioral test above.
+
+### Retiring a test
+
+Delete or merge a test only with evidence, recorded in the PR body:
+
+1. Name the contract the test claims to protect and classify the evidence case
+   below.
+2. Probe it: make a behavior-breaking edit to the production code (or, for a
+   vacuous assertion, show that such an edit passes), run the test and the
+   surviving owner, then revert. Behavior-preserving edits that fail the test
+   are useful extra evidence of implementation coupling.
+3. Confirm the surviving owner executes (executed-test counts, not skip output)
+   at the same or a more frequent cadence, with an equal or stronger failure
+   gate, per "Coverage responsibilities before consolidation" above.
+4. Remove the deleted file's entries from `scripts/ubicloud/weights.json`,
+   `scripts/test-weights.json`, `scripts/serial-weights.json` and
+   `scripts/e2e-weights.json`, grep `scripts/`, `.github/`,
+   `scripts/e2e-test-map.ts` and `test/fixtures/e2e-unmapped-baseline.txt` for
+   the path, and regenerate `scripts/structural-suites.tsv`
+   (`bun scripts/classify-tests.ts`).
+
+Evidence cases:
+
+- **Retained contract:** the contract still matters. Evidence is a surviving
+  owner at the same boundary plus an executed mutation that fails it.
+- **Intentionally abandoned contract:** the behavior is being removed or was
+  never shipped. Evidence is the approved disposition plus reachability proof
+  (no production caller) and a check that no user-facing promise (docs, skills,
+  `--help`, CHANGELOG) still describes it.
+- **Vacuous assertion:** the test asserts nothing about product behavior (a
+  constant compared to itself, a copied function, a `typeof` probe that
+  typecheck already enforces). Evidence is a demonstration that a
+  behavior-breaking edit leaves it passing, or that it imports no product code.
+
+Evidence template:
+
+| Deleted test | Probe edit | Result | Surviving owner | Owner result |
+|---|---|---|---|---|
+| `test/x.test.ts` › "name" | `src/y.ts`: what changed | deleted test passes (blind) | `test/z.test.ts` › "name" | fails (N of M) |
 
 ### Test command tiers
 
@@ -179,7 +274,7 @@ Test command tiers, each with a clear scope:
 
 | Command | What it runs | Wallclock | When to use |
 |---|---|---|---|
-| `bun run test` | Parallel unit-test fast loop. Sharded fan-out via `scripts/run-unit-parallel.sh` (default 4 shards — CPU-detected, clamped to a max of 8; 4 limits local PGLite WASM-init contention; GitHub CI uses 10 unit shards), then a serial pass over `*.serial.test.ts`. Excludes `*.slow.test.ts` and `test/e2e/*`. No pre-checks, no typecheck. Builds/refreshes the PGLite schema snapshot BEFORE the shard fan-out and exports `GBRAIN_PGLITE_SNAPSHOT` so PGLite-booting files restore a baked schema instead of replaying every migration (~3.5x per booting file; see "PGLite schema snapshot" below). Opt out: `GBRAIN_NO_SNAPSHOT=1`. Memory-safe by default: total concurrency (shards × intra-shard width) is capped to available memory at `GBRAIN_TEST_MEM_PER_FILE_MB` (default 1536 — a PGLite WASM instance) per concurrent slot, shedding INTRA-SHARD width first and shards only after it (bun's `--max-concurrency` bounds only `test.concurrent` tests — 1 file in the corpus — so intra width is nearly free to shed, while every dropped shard removes a whole bun process of real fan-out; shedding shards first would collapse a 16GB box to a serial 1×4 run, measured 3.25× slower than 4×1 on the same machine). Two phantom-failure classes are automatically re-run serially (the rescue pass): failures carrying the WASM out-of-memory signature, and shards killed externally (SIGTERM/SIGKILL well before the shard timeout — sibling workspaces' process cleanup, memory jetsam). On machines without coreutils `timeout`, the fallback watchdog drops a `.watchdog` sentinel before TERMing a shard at the cap so the WEDGED/EXIT-HANG classifier stays reachable there (a bare rc=143 would otherwise read as a plain failure). Phantoms pass serially and the run goes green with an `oom_rescued` note; real failures fail again serially and stay red. Knobs: `GBRAIN_TEST_NO_MEM_ADAPT=1`, `GBRAIN_TEST_NO_OOM_FALLBACK=1`, `GBRAIN_TEST_MAX_CONCURRENCY` (intra-shard, default 4), `GBRAIN_TEST_SHARD_TIMEOUT` / `GBRAIN_TEST_SHARD_KILL_AFTER`, plus `--shards N` / `--max-concurrency N` / `--dry-run` script args. | a few minutes on a Mac dev box | Inner edit loop. Default. |
+| `bun run test` | Parallel unit-test fast loop. Sharded fan-out via `scripts/run-unit-parallel.sh` (default 4 shards — CPU-detected, clamped to a max of 8; 4 limits local PGLite WASM-init contention; GitHub CI uses 8 unit shards), then a serial pass over `*.serial.test.ts`. Excludes `*.slow.test.ts` and `test/e2e/*`. No pre-checks, no typecheck. Builds/refreshes the PGLite schema snapshot BEFORE the shard fan-out and exports `GBRAIN_PGLITE_SNAPSHOT` so PGLite-booting files restore a baked schema instead of replaying every migration (~3.5x per booting file; see "PGLite schema snapshot" below). Opt out: `GBRAIN_NO_SNAPSHOT=1`. Memory-safe by default: total concurrency (shards × intra-shard width) is capped to available memory at `GBRAIN_TEST_MEM_PER_FILE_MB` (default 1536 — a PGLite WASM instance) per concurrent slot, shedding INTRA-SHARD width first and shards only after it (bun's `--max-concurrency` bounds only `test.concurrent` tests — 1 file in the corpus — so intra width is nearly free to shed, while every dropped shard removes a whole bun process of real fan-out; shedding shards first would collapse a 16GB box to a serial 1×4 run, measured 3.25× slower than 4×1 on the same machine). Two phantom-failure classes are automatically re-run serially (the rescue pass): failures carrying the WASM out-of-memory signature, and shards killed externally (SIGTERM/SIGKILL well before the shard timeout — sibling workspaces' process cleanup, memory jetsam). On machines without coreutils `timeout`, the fallback watchdog drops a `.watchdog` sentinel before TERMing a shard at the cap so the WEDGED/EXIT-HANG classifier stays reachable there (a bare rc=143 would otherwise read as a plain failure). Phantoms pass serially and the run goes green with an `oom_rescued` note; real failures fail again serially and stay red. Knobs: `GBRAIN_TEST_NO_MEM_ADAPT=1`, `GBRAIN_TEST_NO_OOM_FALLBACK=1`, `GBRAIN_TEST_MAX_CONCURRENCY` (intra-shard, default 4), `GBRAIN_TEST_SHARD_TIMEOUT` / `GBRAIN_TEST_SHARD_KILL_AFTER`, plus `--shards N` / `--max-concurrency N` / `--dry-run` script args. | a few minutes on a Mac dev box | Inner edit loop. Default. |
 | `bun run verify` | CI's authoritative pre-test gate set, fanned out by `scripts/run-verify-parallel.sh` through a bounded worker pool (default `detect_cpus`; override `GBRAIN_VERIFY_MAX_PARALLEL`) with the heavy checks ordered first (typecheck, the two compile-embed checks, admin build, fuzz bundles, guard self-tests, the PGLite-booting chronicle eval check, whole-tree greps). The battery includes the deterministic `check:eval-chronicle` eval gate; `check:eval-canary` is deliberately NOT in the battery (its test-file twin `test/eval-canary.test.ts` spawns the identical runner in the unit matrix, and CI's verify job and matrix always run together — the package script stays for on-demand runs, so `verify`-only local callers should know the canary rides the unit lane instead). The `CHECKS` array in that script is the single source of truth — CI literally calls `bun run verify` in a dedicated job. | ~50s (pool-bounded; longest check dominates) | Before pushing; before `/ship`. |
 | `bun run test:full` | `verify && bun run test && bun run test:slow && [smart e2e]`. Smart e2e runs only when `DATABASE_URL` is set and propagates its failure; otherwise it prints a skip notice to stderr. Use `ci:local` to provision the databases and require PgBouncer execution. | ~3-5min depending on slow + e2e | Pre-merge sanity, before opening a PR. |
 | `bun run ci:local` | Independent host gitleaks scans, then frozen dependencies, guards/typecheck, the complete serial and slow lanes, and four unit/E2E shards inside Docker. Each E2E shard has its own pgvector database; selected PgBouncer tests must execute against the transaction-mode pooler. Unit, serial, and slow lanes have database URL overrides unset. Any failed stage fails the command. Complete shard logs survive container teardown under `.context/ci-local-shards/`. `ci:local:diff` narrows E2E selection; `--no-shard` runs unit/E2E sequentially. Doc-only diffs still require successful gitleaks scans. | Depends on the full corpus | Full local gate before shipping. |
@@ -259,8 +354,15 @@ when any item fails, an item never produces a result, or no VM becomes ready.
 An item whose SSH batch dies without a result is retried once on any slot, and a
 VM with three such infrastructure errors is retired.
 
-Defaults are ten `standard-16` VMs in `eu-central-h1` with 8 slots each, one
-per two vCPUs (`--vms`, `--size`, `--slots`, `--location`). `--lanes` runs a
+Defaults are four `standard-16` VMs (64 vCPUs) in `eu-central-h1` with 8 slots
+each, one per two vCPUs (`--vms`, `--size`, `--slots`, `--location`). The
+Ubicloud project's vCPU quota (256) is shared with pull-request CI, so the
+default leaves room for about two concurrent PR runs; the former default of
+ten VMs took 160 vCPUs and queued PR jobs for up to 28 minutes. A VM that the
+quota refuses fails to provision and the run continues on the VMs that did
+start, so a busy project shrinks the fleet instead of failing. Pass `--vms 10`
+only when the quota is idle. Slow-lane items run `test/export-scale.slow.test.ts`
+at the pull-request scale (`GBRAIN_TEST_EXPORT_SCALE_PAGES=10001`). `--lanes` runs a
 subset, `--keep` leaves the VMs up for debugging, and `--diff` follows
 `ci:local:diff` (a doc-only diff runs gitleaks alone). The corpus is roughly
 8,000 seconds of test compute at that density, so 80 slots finish everything
@@ -335,7 +437,7 @@ covers PGLite/Postgres page/fact/config parity. Output redaction uses
 Managed writer fixtures use isolated PGLite and guarded disposable Postgres:
 `test/e2e/fact-vector-repair-parity.test.ts`,
 `test/e2e/fact-embedding-backfill-parity.test.ts`, and
-`test/e2e/fact-backfill-resident.test.ts` cover preserved vectors, bounded
+`test/fact-backfill-resident.test.ts` cover preserved vectors, bounded
 NULL-only fact backfill, selected-config refusal and owner-held PGLite IPC;
 `test/ai/google-embed-batch-items.test.ts` pins 100-item provider batches.
 `test/persistence-embedding-effects.test.ts`,
@@ -361,8 +463,11 @@ the CI runner image supplies `setpriv`.
 `test/managed-maintenance.test.ts` and
 `test/helpers/maintenance-restart.ts` cover local synthesize/patterns/
 consolidation, restart replay, retired takes and semantic snapshots;
-`test/managed-unsupported-preflight.serial.test.ts` checks unsupported bulk
-lanes refuse before spend. These use synthetic provider/API transports, not
+`test/managed-unsupported-preflight.serial.test.ts` checks that the managed
+facts-family bulk lanes refuse an unaccepted writer before spend, and
+`test/managed-facts-writers.test.ts` proves each of them (fence reconcile,
+phantom redirect, fence writes, loops extraction, bulk conversation facts)
+publishes through the coordinator on PGLite and Postgres. These use synthetic provider/API transports, not
 paid model calls or production connectors. PGLite dream/job CLI with an active
 owner is **not** proven delegated by the live fact-backfill IPC test.
 
@@ -560,9 +665,52 @@ snapshot. The slow runner and direct BrainBench test invocation prepare the
 default profile automatically. `GBRAIN_NO_SNAPSHOT=1` clears both paths and
 survives test preloads.
 
+### PGLite checkpoint harness (outside PR CI)
+
+`scripts/pglite-checkpoint-harness/supervisor.ts` reproduces the large-store
+PGLite freeze. It spawns `worker.ts`, which imports 40 KB pages through
+`PGLiteEngine.transaction()` into one long-lived store. It then watches that
+process from outside: CPU from `/proc`, committed pages from the worker's
+progress file, and WAL and checkpoint activity from the data directory. A
+worker that burns CPU with no committed page and no checkpoint progress for
+`--stall-sec` is reported as wedged. A completed run also asserts that WAL
+since the last redo point never exceeded the guard threshold plus the largest
+single transaction. `--shared-buffers` and `--max-wal-size` scale the store
+down with `ALTER SYSTEM`, so a small machine reaches the same trigger in
+minutes:
+
+```bash
+bun scripts/pglite-checkpoint-harness/supervisor.ts --dir /tmp/h --fresh --pages 3000 --stall-sec 600 --timeout-sec 1800
+bun scripts/pglite-checkpoint-harness/supervisor.ts --dir /tmp/h --fresh --pages 1500 \
+  --shared-buffers 16MB --max-wal-size 160MB --stall-sec 120 --expect-wedge   # baseline check
+```
+
+`--min-store-gb <n>` also fails a completed run whose data directory is
+smaller than `n` GiB; the result reports the store size with and without WAL.
+On macOS the supervisor samples worker CPU with `ps` instead of `/proc`.
+
+### macOS 26 validation (`macos-validation`)
+
+`.github/workflows/macos-validation.yml` runs on a GitHub-hosted `macos-26`
+runner nightly, on manual dispatch, and on pull requests that carry the
+`macos-validation` label. It uses no secrets and has a 90-minute cap. It checks
+the device-identity re-stamp (#5604) on real APFS (the step first asserts an
+APFS volume with a non-zero birth time and inode; the device-number change
+itself stays simulated because a runner never reboots), runs the checkpoint
+harness above on a store of at least 2 GiB with the WAL-bound assertion
+(#5449), and verifies the latest published signed `darwin-arm64` release
+binary with `codesign --verify --strict` and `--version` against its release
+tag (#5286). Maintainers with triage or write access apply the label; an
+outside contributor whose change touches macOS-specific persistence, locking
+or release code asks for it in the pull request. Scheduled and dispatched runs
+use the default branch's workflow file, so the label is the way to get this
+evidence for a change before it merges. `test.yml`'s security matrix,
+`release.yml`'s darwin build and `native-locks.yml`'s darwin cells pin
+`macos-26` / `macos-26-intel` rather than `macos-latest`.
+
 ### Keeping CI partitions balanced
 
-Required CI runs ten weighted unit workers, four serial workers with bounded
+Required CI runs eight weighted unit workers, four serial workers with bounded
 per-file pools, and up to four selected E2E workers. E2E selection and exclusions
 run once before setup; the resulting file lists are frozen and executed against
 separate Postgres services. An explicit empty selection launches no tests;
@@ -629,7 +777,7 @@ per-file rules. They do not cache passing results. Candidate scanner failures
 fail the guard, and matching files retain the same allowlists and diagnostics.
 
 `scripts/guards-manifest.tsv` is THE single registry of `scripts/check-*`
-guards (currently 48), each classified `scanner` (greps/parses repo sources —
+guards (currently 56), each classified `scanner` (greps/parses repo sources —
 must eventually carry fixtures), `buildfresh`, or `repostate` (build/freshness
 guards are exempt-with-reason, not fixture-tested).
 `scripts/guard-self-test.sh` (`bun run check:guard-self-test`, wired into
@@ -641,10 +789,45 @@ trees under `test/fixtures/guards/<guard>/{bad,good}/` via the
 build. A guard whose pattern rots into a permanently-green no-op fails CI
 instead of masquerading as coverage.
 
+### Placeholder assertions
+
+`scripts/check-test-placeholders.mjs` (`bun run check:test-placeholders`, in
+`bun run verify`) parses every `test/**/*.test.ts` file outside
+`test/fixtures/` with the TypeScript compiler API and fails on the no-op forms
+`expect(true)` with no matcher, `expect(true).toBe(true)`,
+`expect(true).toBeTruthy()` and `expect(1).toBe(1)`. Text inside strings and
+template literals is ignored, and `expect(true).toBe(false)` fail sentinels
+are allowed. Remaining sites (type-only contracts enforced by typecheck,
+skip-arm markers, gates that fail by throwing) sit in a reasoned allowlist in
+the script, keyed by file, test name and exact count; a site above its count
+fails as new, and an entry whose file, test or count shrank fails as stale.
+This is a hygiene check for one pattern, not a detector of low-value tests in
+general; the authoring gate above owns that.
+
+### Source reads in tests
+
+`test/test-reads-source-smell.test.ts` finds test code that reads `src/` text:
+`readFileSync`, `readFile` (including `fs.promises.readFile`) and `Bun.file`
+calls whose arguments name a `src/` literal, a `'src'` path segment, or a
+constant holding such a path. Each read site needs a tagged marker on its line
+or within the three lines above:
+
+```ts
+// test-reads-source-ok[structural]: <why a source read is the right tool>
+```
+
+The category is one of `prompt-byte`, `trust-boundary`, `generated-artifact`,
+`structural` or `raw-bytes`, and every marker must carry one. Files that
+predate the rule are ratcheted by their exact count of unjustified read sites,
+so a new untagged read in such a file fails and a count that drops must be
+lowered. The ratchet counts read sites only: a new assertion over an existing
+source binding is not detected and remains the authoring gate's job. Rerun with
+`bun test test/test-reads-source-smell.test.ts`.
+
 ### Registry-walking ratchets
 
 Structural suites that walk a registry so the NEXT gap of a known class
-cannot ship silently. All allowlists below are shrink-only.
+cannot ship silently. All allowlists below are shrink-only unless noted.
 
 - `test/operations-coverage-ledger.test.ts` — every op in
   `src/core/operations.ts` maps to a covering test file in a checked-in
@@ -668,9 +851,30 @@ cannot ship silently. All allowlists below are shrink-only.
   test corpus for references, so a never-called engine method can't ship.
 - `scripts/check-orphan-modules.mjs` (verify battery, guard-manifest
   registered with bad/good fixtures) — transitive import walk from the
-  cli/mcp/engine entrypoints; a src module reachable from no entrypoint
-  fails unless in the 4-entry reasoned allowlist, and the
-  test-only-reachable tier has a shrink-only ceiling.
+  cli/mcp/engine entrypoints; see [Orphan-module guard](#orphan-module-guard).
+
+#### Orphan-module guard
+
+`bun run check:orphan-modules` walks static, dynamic and `require` relative
+imports from the runtime entrypoints (CLI, MCP server, plugin engines, admin,
+package `exports`). Every `src/` module it cannot reach needs a disposition:
+
+- Imported by nothing, not even tests: fails as `hard-orphan` unless it has a
+  reasoned `ALLOWLIST` entry (shrink-only).
+- Imported only by tests (or scripts): fails as `unpermitted-test-only`
+  unless it is named in `PERMITTED_TEST_ONLY` with a `reason`. The set may
+  grow only with a reason in a reviewer-visible edit; modules reached from
+  `scripts/**` use reason `script-reachable`, which the guard verifies.
+- A permitted entry whose module was deleted, wired into a runtime
+  entrypoint, dropped by every test, or tagged `script-reachable` without a
+  `scripts/**` importer fails as `stale-permitted-entry`. Remove or correct
+  the record; never restore code to satisfy the list.
+
+Each failure prints the rule, the module, the tests that import it, the
+reason, the remedy, the rerun command and this anchor. Fixture mode
+(`GBRAIN_GUARD_ROOT`) reads the permitted set from
+`<root>/permitted-test-only.json`; `test/scripts/check-orphan-modules.test.ts`
+proves every rule fails on a bad tree.
 
 The takes-bootstrap graduation instrument (`evals/takes-bootstrap/`: 123-case
 corpus, scorer, live harness + $0 replay) is CI-guarded keyless by
@@ -705,7 +909,7 @@ there even though they pass on Linux and macOS.
 
 ### CI vs local: intentionally divergent file sets
 
-- **CI matrix** (`.github/workflows/test.yml`) runs `scripts/test-shard.sh` across 10 matrix shards partitioned by weight-aware LPT bin-packing (`scripts/sharding.ts`; files with no mined weight fall back to the p75 file weight so a new unweighted file can't silently unbalance a shard) and INCLUDES `*.slow.test.ts` (the four dedicated slow files — longmemeval, entity-resolve-perf, entity-card-perf, brainbench-e2e — run as dedicated jobs alongside the matrix) plus `evals/**/*.test.ts` (keyless-allowlist-gated — `test/scripts/evals-collection.test.ts`). Each shard's bun process is bounded by `--max-concurrency` (`GBRAIN_TEST_MAX_CONCURRENCY`, default 4). Every bun-test job — matrix shards, serial-tests, verify, the slow/eval jobs — activates the PGLite schema snapshot (built in-runner via `scripts/lib/test-env.sh`; the BrainBench gate uses the separate default-profile snapshot for its in-memory PGLite; the ~42MB tar is also cached across jobs via actions/cache, with the runner's own hash check staying authoritative). CI EXCLUDES `*.serial.test.ts` from the shards and runs them across four `serial-tests` workers via `bun run test:serial` — one bun process per file preserves the `mock.module` quarantine; the pool runs those processes concurrently. `bun run verify` gets its own job too, as does the BrainBench memory-conformance gate (`brainbench` job → `scripts/ci-brainbench-gate.sh`, hermetic in-memory PGLite, ~15s), which compares HEAD's fresh run against master's committed baseline (`evals/brainbench/baselines/main.json`) — the `test-status` aggregate checks its result explicitly. E2E (`.github/workflows/e2e.yml`) always runs its applicable execution lanes, with the jsonb-parity job in front of tier2 as the token-spend gate, and aggregates through `e2e-status`. Scheduled runs also require the full-corpus lanes, including each slow suite excluded from the coverage shards (longmemeval, entity-resolve-perf, and brainbench-e2e). Both aggregates reject failures, cancellations, and unexpected skips. Dependency caches and validated PGLite snapshots remain; successful test results are never reused. CI is the ground truth for "did everything pass."
+- **CI matrix** (`.github/workflows/test.yml`) runs `scripts/test-shard.sh` across 8 matrix shards partitioned by weight-aware LPT bin-packing (`scripts/sharding.ts`; files with no mined weight fall back to the p75 file weight so a new unweighted file can't silently unbalance a shard) and INCLUDES `*.slow.test.ts` (the dedicated slow files — longmemeval, entity-resolve-perf, entity-card-perf, export-scale, brainbench-e2e — run as dedicated jobs alongside the matrix, and `reconcile-crash.slow.test.ts` runs only in the persistence-validation reconciliation job) plus `evals/**/*.test.ts` (keyless-allowlist-gated — `test/scripts/evals-collection.test.ts`). Each shard's bun process is bounded by `--max-concurrency` (`GBRAIN_TEST_MAX_CONCURRENCY`, default 4). Every bun-test job — matrix shards, serial-tests, verify, the slow/eval jobs — activates the PGLite schema snapshot (built in-runner via `scripts/lib/test-env.sh`; the BrainBench gate uses the separate default-profile snapshot for its in-memory PGLite; the ~42MB tar is also cached across jobs via actions/cache, with the runner's own hash check staying authoritative). CI EXCLUDES `*.serial.test.ts` from the shards and runs them across four `serial-tests` workers via `bun run test:serial` — one bun process per file preserves the `mock.module` quarantine; the pool runs those processes concurrently. `bun run verify` gets its own job too, as does the BrainBench memory-conformance gate (`brainbench` job → `scripts/ci-brainbench-gate.sh`, hermetic in-memory PGLite, ~15s), which compares HEAD's fresh run against master's committed baseline (`evals/brainbench/baselines/main.json`) — the `test-status` aggregate checks its result explicitly. E2E (`.github/workflows/e2e.yml`) always runs its applicable execution lanes, with the jsonb-parity job in front of tier2 as the token-spend gate, and aggregates through `e2e-status`. Scheduled runs also require the full-corpus lanes, including each slow suite excluded from the coverage shards (longmemeval, entity-resolve-perf, entity-card-perf, brainbench-e2e, export-scale and reconcile-crash). Both aggregates reject failures, cancellations, and unexpected skips. Dependency caches and validated PGLite snapshots remain; successful test results are never reused. CI is the ground truth for "did everything pass."
 - **Local fast loop** (`scripts/run-unit-shard.sh` via the parallel wrapper) uses the same weighted partitioner as CI and EXCLUDES `*.slow.test.ts` AND `*.serial.test.ts`. Each shard runs its complete ordered selection with a fresh Bun process per file, without adding workers. Later groups still run after failures; missing summaries or file-completion evidence fail the shard. Local trades coverage for inner-loop speed; CI catches what local skips.
 
 This divergence is intentional. Don't try to make them equal — the two scripts deliberately solve different problems. The regression test at `test/scripts/run-unit-shard.test.ts` pins what the local fast loop should and shouldn't include, and that no unit-lane file spawning the CLI through `test/helpers/cli-spawn.ts` hand-pins a per-test timeout below the bunfig default (an explicit `test(name, fn, N)` ceiling overrides bun's `--timeout`, so `GBRAIN_TEST_TIMEOUT_MULTIPLIER` never reaches it — inherit the default instead; cli-spawn's own kill timer still reaps a hung child); `test/scripts/run-unit-parallel.test.ts` pins the wrapper's memory-adaptive concurrency, and the OOM/external-kill serial rescue pass, and operator-interrupt teardown (a Ctrl-C / SIGTERM to the wrapper while shards are live TERMs then KILLs every shard descendant, so a cancelled run cannot leave gtimeout/bun alive until the shard cap).
@@ -746,8 +950,8 @@ non-`GBRAIN_`-prefixed so the hermetic env scrub keeps them.
 
 **Two corpora.**
 
-- **PR corpus** (`prCorpus`) — the 17 coverage-collecting lanes in
-  `.github/workflows/test.yml`: the 10 matrix shards, four `serial-tests` partitions, and the
+- **PR corpus** (`prCorpus`) — the 15 coverage-collecting lanes in
+  `.github/workflows/test.yml`: the 8 matrix shards, four `serial-tests` partitions, and the
   three dedicated slow jobs (`slow-eval-longmemeval`,
   `slow-entity-resolve-perf`, `slow-brainbench-e2e`). Deterministic (runs identically on every PR); this
   is the corpus the gates run against.
@@ -902,7 +1106,7 @@ Four escalating tools; reach for the cheapest one that answers the question:
 | Question | Tool | Example |
 |---|---|---|
 | Does the TTY/non-TTY branch logic pick right? | Inject `isTTY` into the pure function — no subprocess | `test/init-provider-picker.test.ts`, `test/jobs-watch-mode.test.ts` |
-| Does the real CLI behave right when stdin is NOT a terminal? | Spawn the CLI with piped/ignored stdio | `test/cli-stdin-hang.test.ts` (fast loop); `test/e2e/init-fresh-pglite.test.ts` (manual `test:e2e` lane — see the TODOS e2e CI-lane entry) |
+| Does the real CLI behave right when stdin is NOT a terminal? | Spawn the CLI with piped/ignored stdio | `test/cli-stdin-hang.test.ts` (fast loop); `test/init-fresh-pglite.slow.test.ts` (slow lane) |
 | Does the real CLI render menus and read typed input under a REAL terminal? | `launchTty` from `test/helpers/tty-harness.ts` in a `*.serial.test.ts` file | `test/init-picker-pty.serial.test.ts` |
 | How does the install FEEL (stalls, copy, silence windows)? | `scripts/dx-explore.ts` — instrument, not a test; nothing asserts | transcripts under `.context/dx-runs/` (see `docs/guides/bootstrap.md`) |
 
@@ -925,6 +1129,17 @@ Any change under `skills/` must regenerate it: `bun run scripts/generate-skills-
 `scripts/check-skills-manifest-fresh.sh` (`bun run check:skills-manifest`, wired into
 `bun run verify`) regenerates to a tmp file and diffs, failing CI on drift; at runtime
 `gbrain doctor` reports the same drift as a warn-only `skills_manifest_integrity` check.
+
+### Docs CLI truth check
+
+`test/docs-cli-commands.test.ts` checks every `gbrain <verb>` in code fences and
+inline code across README, docs and skills against the registered verbs. In
+`docs/guides/`, `docs/migrations/` and `skills/` it also runs each invocation's
+flags through the CLI's own validator, via `test/helpers/cli-command-surface.ts`.
+When a hit is stale, fix the doc. When the example documents an older release,
+put `<!-- gbrain-cli: historical -->` on the line above its code fence, or on the
+line with the inline code. The test's `ALLOWLIST` is a last resort: it only
+shrinks, every entry needs a reason, and stale entries fail.
 
 ### Test-isolation lint and helpers
 
@@ -992,7 +1207,7 @@ await withEnv({ GBRAIN_HOME: undefined }, fn);
 await withEnv({ A: '1', B: '2', C: undefined }, fn);
 ```
 
-`withEnv` saves the prior value of every key it touches and restores via try/finally — including when the callback throws. **It is cross-test safe but NOT intra-file concurrent-safe.** `process.env` is process-global; two `test.concurrent()` calls in the same file both touching the same key will race. Files using `withEnv` stay outside the `test.concurrent()` codemod's eligibility filter.
+`withEnv` saves the prior value of every key it touches and restores via try/finally — including when the callback throws. An absent `TZ` is restored as the zone that was in effect, because Bun keeps the last explicitly set zone when `TZ` is deleted; a `TZ` override therefore never leaks into later files in the same process. **It is cross-test safe but NOT intra-file concurrent-safe.** `process.env` is process-global; two `test.concurrent()` calls in the same file both touching the same key will race. Files using `withEnv` stay outside the `test.concurrent()` codemod's eligibility filter.
 
 #### Speed + environment helpers (`test/helpers/`)
 
@@ -1092,7 +1307,7 @@ deliberate (live embed/parity tests skip-gate on them). The routing-only
 `thin-client` fixtures still strip provider state in every child, set both
 `HOME` and `GBRAIN_HOME` to their temporary brain, and pass Bun
 `--no-env-file` (including provisioned shell commands). They exercise routing
-without spending provider tokens even inside the keyed nightly lane.
+without spending provider tokens even when a lane carries keys.
 Fixture-specific environment overrides apply last; unrelated credentials are
 preserved rather than removed with a broad key-name pattern.
 
@@ -1189,10 +1404,8 @@ Unit tests and what they cover:
 - `test/dry-fix.test.ts` — auto-fix: three shape-aware expander pure-function tests; five guards (working-tree-dirty, no-git-backup, inside-code-fence, already-delegated within 40 lines, ambiguous-multi-match, block-is-callout).
 - `test/doctor-fix.test.ts` — `gbrain doctor --fix` CLI integration: dry-run preview, apply path, JSON output shape.
 - `test/backoff.test.ts` — load-aware throttling, concurrency limits, active hours.
-- `test/fail-improve.test.ts` — deterministic/LLM cascade, JSONL logging, test generation, rotation.
 - `test/transcription.test.ts` — provider detection, format validation, API key errors.
 - `test/enrichment-service.test.ts` — entity slugification, extraction, tier escalation.
-- `test/data-research.test.ts` — recipe validation, MRR/ARR extraction, dedup, tracker parsing, HTML stripping.
 - `test/minions.test.ts` — Minions job queue: CRUD, state machine, backoff, stall detection, dependencies, worker lifecycle, lock management, claim mechanics, depth/child-cap, timeouts, cascade kill, idempotency, `child_done` inbox, attachments, removeOnComplete/Fail, `max_stalled` clamp/default/plumbing coverage.
 - `test/minion-queue-renewlock-signal.test.ts` — `renewLock` forwards its optional AbortSignal to `executeRawDirect` (stub-engine capture); legacy 3-arg calls unchanged; token-fence miss returns false.
 - `test/cycle-drain-renewal.test.ts` — `runDrainRenewalTick` (cycle drain): per-call signal aborted on timeout (slot released), onLost once on a lost fence, throws swallowed, hung renewal resolves at the deadline. Plus two structural source-text pins on `inline-drain.ts` (the shape guard only covers `worker.ts`): the renewal must not go back to a raw `setInterval(() => queue.renewLock(...))`, and the handler invocation must stay wrapped in `withChatPhase('job:<name>')` so a drained child's gateway spend is attributed to the child rather than absorbed by an enclosing `phase:` tag.
@@ -1311,6 +1524,48 @@ Unit tests and what they cover:
 - `test/conversation-facts-pricing-wiring.test.ts` — `pricing.overrides` reaches every conversation-facts entry point: the strict config registry accepts the key, and direct extraction, the cycle backfill, and `transcripts --facts` all price through the operator override.
 - `test/cycle/extract-atoms-model-config-fail-soft.test.ts` — a throwing `getConfig` during extract_atoms model resolution falls back to the tier default instead of rejecting the phase.
 
+### Lane-move pilot (2026-09)
+
+The 20 heaviest PGLite-only files in `test/e2e/` (by `scripts/e2e-weights.json`)
+moved out of the sequential Postgres runner into the lanes that run on every PR.
+Each met the move criterion: it constructs PGLite (or spawns a PGLite CLI)
+directly, imports nothing from `test/e2e/helpers.ts`, has no
+`DATABASE_URL`/`hasDatabase` gate, and its header confirmed no Postgres use.
+`sync-delegation-under-serve.serial` and `dream-synthesize-pglite` stayed in
+`test/e2e/` because named `e2e.yml` jobs run them. Assertions are unchanged;
+executed-test counts match the E2E runs. A file becomes serial when it mutates
+process-global state and slow when it takes about 30 s or more. The remaining
+PGLite-only E2E files are a TODOS.md item decided from the pilot measurement.
+
+Source files whose only E2E owner moved (`src/commands/claw-test.ts`,
+`src/core/claw-test/**`, `src/core/brain-resolver.ts`, `src/commands/mounts.ts`,
+`src/commands/connect.ts`, `src/core/connect-probe.ts`,
+`src/commands/embed-facts-delegate.ts`) no longer have an `E2E_TEST_MAP` row,
+so a change to them selects all E2E (fail-closed); their owners run in every PR.
+
+| Former path | New path | Lane | Command | Lane reason |
+|---|---|---|---|---|
+| `test/e2e/claw-test.test.ts` | `test/claw-test.slow.test.ts` | slow | `bash scripts/run-slow-tests.sh test/claw-test.slow.test.ts` | over 30 s (harness subprocess runs) |
+| `test/e2e/init-fresh-pglite.test.ts` | `test/init-fresh-pglite.slow.test.ts` | slow | `bash scripts/run-slow-tests.sh test/init-fresh-pglite.slow.test.ts` | over 30 s (CLI subprocesses) |
+| `test/e2e/mounts-routing-pglite.test.ts` | `test/mounts-routing-pglite.slow.test.ts` | slow | `bash scripts/run-slow-tests.sh test/mounts-routing-pglite.slow.test.ts` | about 30 s (two persistent PGLite brains, CLI spawns) |
+| `test/e2e/qm-provisioning.test.ts` | `test/qm-provisioning.test.ts` | unit | `bun test test/qm-provisioning.test.ts` | no process-global state, under 30 s |
+| `test/e2e/minions-field-report-repro.test.ts` | `test/minions-field-report-repro.test.ts` | unit | `bun test test/minions-field-report-repro.test.ts` | no process-global state, under 30 s |
+| `test/e2e/fresh-install-pglite.test.ts` | `test/fresh-install-pglite.serial.test.ts` | serial | `bash scripts/run-serial-tests.sh test/fresh-install-pglite.serial.test.ts` | mutates `process.env` and `console` |
+| `test/e2e/remote-privacy-journeys.test.ts` | `test/remote-privacy-journeys.serial.test.ts` | serial | `bash scripts/run-serial-tests.sh test/remote-privacy-journeys.serial.test.ts` | constructs PGLite outside `beforeAll` (isolation rule R3) |
+| `test/e2e/serve-stdio-roundtrip.test.ts` | `test/serve-stdio-roundtrip.test.ts` | unit | `bun test test/serve-stdio-roundtrip.test.ts` | no process-global state, under 30 s |
+| `test/e2e/serve-http-surface-ceiling.test.ts` | `test/serve-http-surface-ceiling.test.ts` | unit | `bun test test/serve-http-surface-ceiling.test.ts` | no process-global state, under 30 s |
+| `test/e2e/skillpack-flow.test.ts` | `test/skillpack-flow.test.ts` | unit | `bun test test/skillpack-flow.test.ts` | no process-global state, under 30 s |
+| `test/e2e/v0_28_5-fix-wave.test.ts` | `test/v0_28_5-fix-wave.serial.test.ts` | serial | `bash scripts/run-serial-tests.sh test/v0_28_5-fix-wave.serial.test.ts` | mutates `process.env` |
+| `test/e2e/backfill-perf-pglite.test.ts` | `test/backfill-perf-pglite.test.ts` | unit | `bun test test/backfill-perf-pglite.test.ts` | no process-global state, under 30 s |
+| `test/e2e/connect-bearer.test.ts` | `test/connect-bearer.test.ts` | unit | `bun test test/connect-bearer.test.ts` | no process-global state, under 30 s |
+| `test/e2e/bootstrap-hook-under-serve.serial.test.ts` | `test/bootstrap-hook-under-serve.serial.test.ts` | serial | `bash scripts/run-serial-tests.sh test/bootstrap-hook-under-serve.serial.test.ts` | mutates `process.env`; already a serial file |
+| `test/e2e/upgrade-bun-link-arc.serial.test.ts` | `test/upgrade-bun-link-arc.serial.test.ts` | serial | `bash scripts/run-serial-tests.sh test/upgrade-bun-link-arc.serial.test.ts` | mutates `process.argv`; already a serial file |
+| `test/e2e/dream-synthesize-chunking.test.ts` | `test/dream-synthesize-chunking.serial.test.ts` | serial | `bash scripts/run-serial-tests.sh test/dream-synthesize-chunking.serial.test.ts` | mutates `process.env` |
+| `test/e2e/search-readiness-http.test.ts` | `test/search-readiness-http.test.ts` | unit | `bun test test/search-readiness-http.test.ts` | no process-global state, under 30 s |
+| `test/e2e/transcripts-ingest-pglite.test.ts` | `test/transcripts-ingest-pglite.test.ts` | unit | `bun test test/transcripts-ingest-pglite.test.ts` | no process-global state, under 30 s |
+| `test/e2e/bootstrap-harness-lifecycle.serial.test.ts` | `test/bootstrap-harness-lifecycle.serial.test.ts` | serial | `bash scripts/run-serial-tests.sh test/bootstrap-harness-lifecycle.serial.test.ts` | mutates `console`; already a serial file |
+| `test/e2e/fact-backfill-resident.test.ts` | `test/fact-backfill-resident.test.ts` | unit | `bun test test/fact-backfill-resident.test.ts` | no process-global state, under 30 s |
+
 ### E2E test inventory
 
 E2E tests live in `test/e2e/` and run against real Postgres+pgvector (require `DATABASE_URL`), except where noted as PGLite in-memory (no `DATABASE_URL` needed). One file outside the directory also rides the e2e lane: `test/phantom-redirect-engine-parity.test.ts` (Postgres arm; see the file taxonomy above).
@@ -1353,9 +1608,9 @@ E2E tests live in `test/e2e/` and run against real Postgres+pgvector (require `D
 - `test/e2e/source-isolation-pglite.test.ts` — PGLite in-memory regression suite pinning the source-isolation seal at two layers. Engine layer: `searchKeyword` / `searchVector` / `searchKeywordChunks` / `listPages` / `getPage` / `traverseGraph` / `traversePaths` apply `sourceId` (scalar fast path) and `sourceIds` (array path) correctly across both engines. Op-handler layer: routes through `sourceScopeOpts(ctx)` so a `read+write`-scoped OAuth client bound to `--source dept-x` cannot see rows from neighboring sources via `search`, `query`, `list_pages`, `get_page`, or `find_experts`. Covers both `ctx.sourceId` (single-source clients) and `ctx.auth.allowedSources` (federated_read clients) precedence; federated array wins over scalar wins over nothing. No `DATABASE_URL` needed.
 - `test/e2e/think-source-isolation-pglite.test.ts` — PGLite in-memory suite pinning the `think` gather stage's source scope: seeds three sources with cross-source links and embedded takes, then asserts `runGather` under a federated `sourceIds` grant (and under a scalar `sourceId`) keeps every stream — hybrid retrieval, takes keyword + vector (`searchTakes`/`searchTakesVector`), and the `traversePaths` graph walk — inside the grant while still reaching authorized neighboring sources. No `DATABASE_URL` needed.
 - `test/e2e/skill-brain-first.test.ts` — doctor reports `skill_brain_first` check with structured issues; `--fix --dry-run` previews insertion without writing; `--fix` applies the canonical Convention callout idempotently; `brain_first: exempt` frontmatter resolves the warn; `brain_first_typo` surfaces a paste-ready hint; audit JSONL records `detected` / `resolved` / `fixed` transitions; stable brain emits 0 audit lines/run.
-- Journey suites (each claimed by an `scripts/e2e-test-map.ts` row; DATABASE_URL-gated unless noted): `migrate-engine-pglite-to-postgres.test.ts` (whole-brain `runMigrateEngine` transfer incl. the child-process failure arm — config not flipped), `takes-write-ops-postgres.test.ts` (takes op layer + `withPageLock` serialization), `propose-takes-jsonb-postgres.test.ts` + `calibration-profile-write.test.ts` (JSONB bind shape on real Postgres), `engine-parity-cjk.test.ts` (cross-engine CJK keyword parity on an identical corpus — both engines route `hasCJK()` queries through the shared ILIKE builder in `src/core/search/cjk-keyword-sql.ts`; top-slug agreement, chunk-grain parity, mixed-query AND semantics, nonexistent-term strictness), `code-edges-read-parity.test.ts` / `ontology-merge-parity.test.ts` / `chronicle-event-projection-parity.test.ts` / `health-parity-postgres.test.ts` (read-path + getHealth parity), `sync-sigkill-resume-postgres.test.ts` (real SIGKILL mid-sync; DB-polled checkpoint, stranded-lock reclaim, exactly-once resume), `serve-http-source-grant.test.ts` (legacy no-grant federated widening vs granted confinement over real `/mcp`), `mounts-routing-pglite.test.ts` (hermetic mount-routing tiers, no DATABASE_URL), `serve-http-surface-ceiling.test.ts` (hermetic 7-verb `--surface verbs` ceiling; the FORCE_SURFACE env is narrow-only), `autopilot-linux-lifecycle.serial.test.ts` + `upgrade-bun-link-arc.serial.test.ts` (PATH-shimmed crontab/systemctl and bun-link upgrade arcs, hermetic), and the thin-client daily-driver verb extension inside `thin-client.test.ts`.
+- Journey suites (each claimed by an `scripts/e2e-test-map.ts` row; DATABASE_URL-gated unless noted): `migrate-engine-pglite-to-postgres.test.ts` (whole-brain `runMigrateEngine` transfer incl. the child-process failure arm — config not flipped), `takes-write-ops-postgres.test.ts` (takes op layer + `withPageLock` serialization), `propose-takes-jsonb-postgres.test.ts` + `calibration-profile-write.test.ts` (JSONB bind shape on real Postgres), `engine-parity-cjk.test.ts` (cross-engine CJK keyword parity on an identical corpus — both engines route `hasCJK()` queries through the shared ILIKE builder in `src/core/search/cjk-keyword-sql.ts`; top-slug agreement, chunk-grain parity, mixed-query AND semantics, nonexistent-term strictness), `code-edges-read-parity.test.ts` / `ontology-merge-parity.test.ts` / `chronicle-event-projection-parity.test.ts` / `health-parity-postgres.test.ts` (read-path + getHealth parity), `sync-sigkill-resume-postgres.test.ts` (real SIGKILL mid-sync; DB-polled checkpoint, stranded-lock reclaim, exactly-once resume), `serve-http-source-grant.test.ts` (legacy no-grant federated widening vs granted confinement over real `/mcp`), `autopilot-linux-lifecycle.serial.test.ts` (PATH-shimmed crontab/systemctl arc, hermetic), and the thin-client daily-driver verb extension inside `thin-client.test.ts`.
 - Tier 2 (`test/e2e/skills.test.ts`) requires OpenClaw + API keys, runs nightly in CI.
-- `test/e2e/claw-test.test.ts` also covers live mode token-free via shim agents (`OPENCLAW_BIN=<sh script>`): the success-oracle break path (a do-nothing agent FAILS), the E0 child-friction merge surviving tempdir cleanup, and the upgrade staging + schema-version probe.
+- `test/claw-test.slow.test.ts` (slow lane since the lane-move pilot) also covers live mode token-free via shim agents (`OPENCLAW_BIN=<sh script>`): the success-oracle break path (a do-nothing agent FAILS), the E0 child-friction merge surviving tempdir cleanup, and the upgrade staging + schema-version probe.
 - If `.env.testing` doesn't exist in this directory, check sibling worktrees: `find ../ -maxdepth 2 -name .env.testing -print -quit` and copy it here if found.
 - **Run E2E tests without asking permission.** When you want to verify behavior, there's a relevant E2E test, or you're shipping anything covered by an E2E suite — spin up the test DB, run the tests, tear down. Don't ask, don't propose it, don't defer. The lifecycle is short (~2-30s startup, sub-minute tests, instant teardown) and the gate value is high. Skipping with "DATABASE_URL unset" is silent regression, not caution.
 
@@ -1375,6 +1630,18 @@ When asked to "run all E2E tests" or "run tests", that means ALL tiers:
 - Tier 1: `bun run test:e2e` (mechanical, sync, upgrade — no API keys needed)
 - Tier 2: `test/e2e/skills.test.ts` (requires OpenAI + Anthropic + openclaw CLI)
 - Always spin up the test DB, source zshrc, run everything, tear down.
+
+Key-gated live files that no CI job has keys for are left out of the
+`scripts/run-e2e.sh` default glob, so the nightly full corpus and the local
+gates stop counting their skips as discovered coverage. Naming a file on the
+command line still runs it (the runner keeps provider keys):
+
+| File | Required key | Command |
+|---|---|---|
+| `test/e2e/openrouter-anthropic-subagent-replay.live.test.ts` | `OPENROUTER_API_KEY` | `OPENROUTER_API_KEY=... bash scripts/run-e2e.sh test/e2e/openrouter-anthropic-subagent-replay.live.test.ts` |
+| `test/e2e/openrouter-deepseek-subagent-replay.live.test.ts` | `OPENROUTER_API_KEY` | `OPENROUTER_API_KEY=... bash scripts/run-e2e.sh test/e2e/openrouter-deepseek-subagent-replay.live.test.ts` |
+| `test/e2e/voyage-rerank-live.test.ts` | `VOYAGE_API_KEY` | `VOYAGE_API_KEY=... bash scripts/run-e2e.sh test/e2e/voyage-rerank-live.test.ts` |
+| `test/e2e/voyage-multimodal.test.ts` | `VOYAGE_API_KEY` | `VOYAGE_API_KEY=... bash scripts/run-e2e.sh test/e2e/voyage-multimodal.test.ts` |
 
 ### E2E test DB lifecycle (ALWAYS follow this)
 

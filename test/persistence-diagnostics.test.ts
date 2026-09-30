@@ -78,6 +78,7 @@ test('fresh and upgraded engines agree on the database-only pending index', asyn
     expect(fresh.indexdef).toContain('source_incarnation, sequence');
     expect(fresh.indexdef).toContain('worktree_id IS NULL');
     await engine.executeRaw('DROP INDEX persistence_requests_database_pending');
+    await engine.executeRaw('DROP INDEX persistence_effects_parked');
     if (engine.kind === 'postgres') {
       const held = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
       const holding = engine.transaction(async tx => {
@@ -100,6 +101,8 @@ test('fresh and upgraded engines agree on the database-only pending index', asyn
     const [upgraded] = await engine.executeRaw<{ indexdef: string }>(
       "SELECT indexdef FROM pg_indexes WHERE indexname='persistence_requests_database_pending'");
     expect(upgraded.indexdef).toBe(fresh.indexdef);
+    const [parked] = await engine.executeRaw<{ indexdef: string }>("SELECT indexdef FROM pg_indexes WHERE indexname='persistence_effects_parked'");
+    expect(parked.indexdef).toContain('parked');
     expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
   }
 }, 15000);

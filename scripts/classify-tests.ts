@@ -77,7 +77,8 @@ function windowAt(lines: string[], i: number, span = 4): string {
 
 function isRepoAnchored(win: string): boolean {
   if (TMP_ANCHORS.test(win)) return false;
-  return REPO_ANCHORS.some((r) => r.test(win));
+  const code = win.replace(/\bimport\s*\(\s*(['"`])[^'"`]*\1\s*\)/g, '');
+  return REPO_ANCHORS.some((r) => r.test(code));
 }
 
 export function classifyFile(relPath: string, content: string): FileResult {
@@ -202,7 +203,7 @@ export function generate(): { tsv: string; suites: number; cases: number; files:
   const rows: SuiteRow[] = [];
   const unknown: string[] = [];
   for (const f of listTestFiles(testDir)) {
-    const rel = relative(REPO_ROOT, f);
+    const rel = relative(REPO_ROOT, f).replaceAll('\\', '/');
     const res = classifyFile(rel, readFileSync(f, 'utf-8'));
     rows.push(...res.rows);
     if (res.unknown) unknown.push(rel);

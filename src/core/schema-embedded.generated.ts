@@ -138,6 +138,10 @@ CREATE TABLE IF NOT EXISTS pages (
   -- path). Powers \`gbrain extract --stale\` + the \`links_extraction_lag\` doctor
   -- check. NULL = never extracted.
   links_extracted_at    TIMESTAMPTZ,
+  -- #5254 (migration v177): 'unbound_source' marks a page written database-only
+  -- while its filesystem source had no canonical owner. Writes and sync after
+  -- binding keep it database-only. NULL for every other page.
+  database_only_reason  TEXT,
   -- v0.40.3.0 contextual retrieval (renumbered from v81 to v90 on master
   -- merge). contextual_retrieval_mode is what tier the page was last embedded
   -- under (NULL = pre-v90 = treated as 'none' for drift detection).
@@ -312,6 +316,8 @@ CREATE TABLE IF NOT EXISTS content_chunks (
   -- #4246 (v133): md5(chunk_text) at embed time. NULL = no embedding or
   -- pre-v133 row (grandfathered by invalidateContentDriftEmbeddings).
   embedded_text_hash    TEXT,
+  -- #5553 (v171): embedding-input provenance written with the vector.
+  embedding_input_hash  TEXT,
   created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
   -- v0.19.0: code chunk metadata. Nullable — markdown chunks leave these NULL.
   -- Powers \`query --lang\`, \`code-def <symbol>\`, and \`code-refs <symbol>\`.
@@ -515,6 +521,8 @@ CREATE TABLE IF NOT EXISTS tags (
   id      SERIAL PRIMARY KEY,
   page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
   tag     TEXT    NOT NULL,
+  -- 'frontmatter' (import-owned, deleted when it leaves the frontmatter), 'added', or NULL (legacy).
+  tag_source TEXT,
   UNIQUE(page_id, tag)
 );
 

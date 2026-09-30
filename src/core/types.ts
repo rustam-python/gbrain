@@ -760,6 +760,8 @@ export interface ChunkInput {
    */
   chunk_source: 'compiled_truth' | 'timeline' | 'fenced_code' | 'image_asset';
   embedding?: Float32Array;
+  /** #5553: embedding-input provenance (see embedding-input-hash.ts); written only with `embedding`. */
+  embedding_input_hash?: string;
   model?: string;
   token_count?: number;
   /**
@@ -1159,6 +1161,12 @@ export interface SearchOpts extends PageReadPolicy {
    */
   exclude_slug_prefixes?: string[];
   /**
+   * Resolved source-boost map (prefix → factor) for the ranking arms. Set by
+   * hybridSearch from the brain's `search.source_boosts` config; engines
+   * fall back to `resolveBoostMap()` (defaults + env) when absent.
+   */
+  source_boosts?: Record<string, number>;
+  /**
    * Opt-back-in list — subtracts entries from the resolved hard-exclude set.
    * E.g. `include_slug_prefixes: ['test/']` lets a query see test/ pages even
    * though they're hard-excluded by default.
@@ -1295,9 +1303,9 @@ export interface SearchOpts extends PageReadPolicy {
   /**
    * #4352 — page-level `visibility: private` enforcement for untrusted
    * callers. When true, both engines' search paths (keyword, titles,
-   * keyword-chunks, vector) add
-   * `COALESCE(p.frontmatter->>'visibility','world') <> 'private'` to the
-   * visibility clause. Callers resolve trust + the config gate via
+   * keyword-chunks, vector) add `privatePagesFilterFragment` to the
+   * visibility clause (absent visibility is world, except on derived atoms
+   * and synthesized concepts, where it is private). Callers resolve trust + the config gate via
    * `resolveExcludePrivatePages` (search/private-visibility.ts):
    * ctx.remote !== false → true unless the operator opted out. Omitted /
    * false = pre-fix behavior (trusted local reads see everything).
@@ -1837,6 +1845,8 @@ export const DEGRADED_STAGES = [
   'expansion_partial',
   'rescore_skipped',
   'vector_arm_failed',
+  'keyword_arm_failed',
+  'title_arm_failed',
   'budget_dropped_all',
   'budget_truncated',
   'keyword_zero',

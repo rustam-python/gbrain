@@ -74,7 +74,7 @@ Hybrid search applies a source-factor CASE expression at the SQL layer (lives in
 
 `archive/` is deliberately NOT hard-excluded: it holds high-signal historical content users expect to find, so it is demoted (`0.5x` in `DEFAULT_SOURCE_BOOSTS`), not hidden. The demote is a prior applied in the outer SQL re-rank; the cross-encoder reranker (balanced/tokenmax modes) can still PROMOTE an archive page that survives the demote into the rerank candidate window — it is not an unconditional suppression. `gbrain doctor`'s `hidden_by_search_policy` check reports how many chunked pages remain hidden by the surviving exclude prefixes.
 
-The boost map is configurable via the `GBRAIN_SOURCE_BOOST` env var. Hard exclusions are separate: the exclusion set is defaults ∪ `GBRAIN_SEARCH_EXCLUDE` (env, comma-separated prefixes) ∪ per-call `SearchOpts.exclude_slug_prefixes`. Temporal queries (`detail: 'high'`) bypass the boost so chat pages re-surface for time-sensitive lookups.
+The defaults fit one vault layout, so each brain can carry its own map: `gbrain config set search.source_boosts "wiki/:1.3,daily/:1.0"` overrides or extends the defaults per prefix, and a `none` entry (`"none,wiki/:1.3"`) drops them entirely. The `GBRAIN_SOURCE_BOOST` env var (same format) wins over the brain config for one process. Hard exclusions are separate: the exclusion set is defaults ∪ `GBRAIN_SEARCH_EXCLUDE` (env, comma-separated prefixes) ∪ per-call `SearchOpts.exclude_slug_prefixes`. Temporal queries (`detail: 'high'`) bypass the boost so chat pages re-surface for time-sensitive lookups.
 
 ## Named-thing retrieval (per-page pool + title + alias + evidence)
 
@@ -384,7 +384,7 @@ gbrain eval export > before.ndjson
 gbrain eval replay --against before.ndjson
 
 # A/B retrieval strategies on a labeled fixture
-gbrain eval --qrels labels.tsv --config balanced.json
+gbrain eval --qrels qrels.json --config-a baseline.json --config-b balanced.json
 ```
 
 The current measured LongMemEval result (95.53% session-level `recall_all@5` on the release default path, 449/470, and 93.40% with the reranker off, 439/470; cleaned S split, 470 scored questions, k=5, measured 2026-09-06 by the in-repo harness), its per-type table, every arm of the ranker wave and the judged answer-accuracy row live in [`docs/eval-bench.md`](../eval-bench.md#public-benchmarks-longmemeval).
@@ -417,20 +417,30 @@ incompleteness notices to stderr. MCP carries them in `_meta.retrieval`.
 The upgraded resident `gbrain serve` drains queued Markdown and code rebuilds
 without provider calls. Code repair can also run through the current owner:
 `gbrain reindex-code --force --no-embed`. Rebuilds preserve only exact,
-provenance-compatible vectors; remaining NULL vectors still need an explicitly
+provenance-compatible vectors: each vector records the embedding input it was
+built from (`content_chunks.embedding_input_hash`: column, model, dimensions,
+wrapping tier and wrapped text), and a rebuild keeps it only when the current
+page would produce the same input, so an unchanged contextual page keeps its
+vectors and a synopsis-mode body edit nulls every synopsis-tier chunk. Vectors
+written before that record existed are kept on non-contextual pages and nulled
+once on contextual ones. Remaining NULL vectors still need an explicitly
 authorized `gbrain embed --stale` run. A text-ready index is not a promise that
 every page has a vector. Diagnostics do not disclose private or foreign-source
 pending pages and never start repair themselves.
 
 Markdown chunk creation applies the strict protected-body sanitizer before
-splitting text. For remote reads, all existing chunks are withheld until a
-successful rebuild records the current chunker version. Public pages require
-this rebuild too; trusted local chunk reads remain available. Body or chunk changes
-invalidate that record until the next successful rebuild. While pages are withheld,
-remote `search` / `query` report `degraded: [safe_index_pending]` (the MCP
-empty-result block names it) instead of a clean miss, and `gbrain doctor` counts
-the withheld pages and points at the `gbrain reindex --markdown` fix. Direct page reads
-continue to use current source and visibility policy plus body sanitization.
+splitting text. For remote reads, all existing chunks of every page kind are
+withheld until a successful rebuild records the current chunker version. Public
+pages require this rebuild too; trusted local chunk reads remain available. Body or
+chunk changes invalidate that record until the next successful rebuild. Re-importing
+unchanged content (`gbrain sync --full`, `gbrain import`) re-seals such a page
+without a page write or journal admission. While pages are withheld, remote
+`search` / `query` report `degraded: [safe_index_pending]` on empty and partial
+results alike (the MCP empty-result block names it) instead of a clean or complete
+answer, and `gbrain doctor` counts the withheld markdown and code pages and points
+at `gbrain repair safe-chunks`, which re-seals them on any brain, managed included.
+Direct page reads continue to use current source and visibility policy plus body
+sanitization.
 
 Run rebuild commands from a local installation on the brain host; thin clients
 cannot rebuild the host's indexes.
