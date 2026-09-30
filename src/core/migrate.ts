@@ -2,7 +2,7 @@ import { SOURCE_INGESTION_RECEIPTS_SCHEMA_SQL } from './company-brain/receipt-sc
 import { MANAGED_WRITER_GUARD_SQL } from './persistence/writer-guard-schema.ts';
 import { PERSISTENCE_TOPOLOGY_SCHEMA_SQL } from './persistence/topology-schema.ts';
 import { PERSISTENCE_SCHEMA_STATEMENTS, PERSISTENCE_REQUEST_RECOVERY_INDEX_SQL, PERSISTENCE_DATABASE_PENDING_INDEX_SQL } from './persistence/schema.ts';
-import { PERSISTENCE_EFFECT_SCHEMA_SQL } from './persistence/effect-schema.ts';
+import { PERSISTENCE_EFFECT_PARKED_INDEX_SQL, PERSISTENCE_EFFECT_SCHEMA_SQL } from './persistence/effect-schema.ts';
 import { PAGE_PROJECTION_SCHEMA_SQL, PAGE_PROJECTION_ACTIVATION_SQL } from './page-state/projection-schema.ts';
 import { LEASE_TOKEN_SCHEMA_SQL } from './lease-schema.ts';
 import { PAGE_STATE_SCHEMA_SQL, PAGE_VERSION_DELETION_SCHEMA_SQL } from './page-state/schema.ts';
@@ -20,10 +20,11 @@ import { repairTimelineDedupIndex, repairLegacyTimelineSourceRows } from './time
 import { repairPagesUpsertArbiter } from './pages-upsert-arbiter.ts';
 import { repairLinkSourceCheck, LINK_SOURCE_GATE_MIGRATION_VERSION } from './link-source-check-repair.ts';
 import { GRANT_COLUMNS_SQL, GRANT_AUDIT_SCHEMA_SQL, GRANT_SPEND_COLUMNS_SQL } from './grants/schema.ts';
-import { FACT_WITHDRAWAL_SCHEMA_SQL, FACT_WITHDRAWAL_BACKFILL_SQL, FACT_WITHDRAWAL_SUBJECT_SQL } from './facts/withdrawal-schema.ts';
+import { FACT_WITHDRAWAL_SCHEMA_SQL, FACT_WITHDRAWAL_BACKFILL_SQL, FACT_WITHDRAWAL_SUBJECT_SQL, FACT_WITHDRAWAL_NORMALIZED_SQL } from './facts/withdrawal-schema.ts';
 import { repairLegacyClientGrants } from './grants/migration.ts';
 import { PROJECTION_STATISTICS_SQL, verifyProjectionStatistics } from './search/projection-statistics.ts';
 import { SHARED_SKILLS_SCHEMA_SQL } from './shared-skills/schema-all.ts';
+import { migrateConnectorCheckpoints } from './persistence/connector-checkpoint-migration.ts';
 
 /**
  * When true, per-migration explanatory notices (e.g. the v123/v124 "here is
@@ -6709,7 +6710,122 @@ CREATE TRIGGER minion_queue_protocol BEFORE INSERT OR UPDATE ON minion_jobs
     sql: FACT_WITHDRAWAL_SUBJECT_SQL,
   },
   {
-    version: 170,
+    version: 170, name: 'index_parked_persistence_effects', idempotent: true, transaction: false, sql: '',
+    handler: async engine => {
+      if (engine.kind === 'postgres') await dropInvalidConcurrentIndex(engine, 170, 'persistence_effects_parked');
+      await engine.runMigration(170, engine.kind === 'postgres'
+        ? PERSISTENCE_EFFECT_PARKED_INDEX_SQL.replace('CREATE INDEX', 'CREATE INDEX CONCURRENTLY')
+        : PERSISTENCE_EFFECT_PARKED_INDEX_SQL);
+    },
+  },
+  {
+    version: 171,
+    name: 'content_chunks_embedding_input_hash',
+    // #5553: per-chunk embedding-input provenance, written in the same
+    // statement as the vector (src/core/embedding-input-hash.ts). A projection
+    // rebuild keeps a vector only when the stored hash equals the recomputed
+    // one. Same shape as v133 and v166's fact provenance: nullable, no
+    // backfill (a hash cannot be proven for an existing vector), no index
+    // (read only per page during a rebuild; bootstrap-coverage: column-only).
+    // NULL on a contextual page is nulled once and stamped by its re-embed.
+    // Keep in sync with src/schema.sql (regenerate schema-embedded.ts via
+    // build:schema) and src/core/pglite-schema.ts.
+    idempotent: true,
+    sql: `
+      ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS embedding_input_hash TEXT;
+    `,
+  },
+  {
+    version: 172, name: 'pages_safe_chunk_pending_index', idempotent: true, transaction: false, sql: '',
+    // #5050/#5247: the safe_index_pending probe (ops/search.ts) runs on every
+    // remote search and now counts pages of every kind below the safe-chunk
+    // fence, so the markdown-only partial pages_chunker_version_idx no longer
+    // serves it. This partial index holds only unsealed pages (empty on a
+    // sealed brain). The literal 4 is SAFE_FENCE_CHUNKER_VERSION when this
+    // migration shipped; a later fence bump needs its own index.
+    handler: async engine => {
+      if (engine.kind === 'postgres') await dropInvalidConcurrentIndex(engine, 172, 'pages_safe_chunk_pending_idx');
+      await engine.runMigration(172, `CREATE INDEX ${engine.kind === 'postgres' ? 'CONCURRENTLY ' : ''}IF NOT EXISTS pages_safe_chunk_pending_idx
+        ON pages (source_id) WHERE chunker_version < 4`);
+    },
+  },
+  {
+    // Paid-loop breaker (dream-breaker.ts) and its doctor check count dead
+    // subagent submissions by finish time over the last 24 h.
+    version: 173, name: 'minion_jobs_dead_subagent_finished_index', idempotent: true, transaction: false, sql: '',
+    handler: async engine => {
+      if (engine.kind === 'postgres') await dropInvalidConcurrentIndex(engine, 173, 'idx_minion_jobs_dead_subagent_finished');
+      await engine.runMigration(173, `CREATE INDEX ${engine.kind === 'postgres' ? 'CONCURRENTLY ' : ''}IF NOT EXISTS idx_minion_jobs_dead_subagent_finished
+        ON minion_jobs (finished_at) WHERE name = 'subagent' AND status = 'dead'`);
+    },
+  },
+  {
+    // Exact-text fingerprints let a punctuation or casing variant of a
+    // forgotten claim come back on re-extraction (write-path audit B-9).
+    // Fingerprints now fold punctuation; legacy exact rows keep matching.
+    version: 174,
+    name: 'fact_withdrawal_normalized_fingerprint',
+    idempotent: true,
+    sql: FACT_WITHDRAWAL_NORMALIZED_SQL,
+  },
+  {
+    // Frontmatter tags were add-only because a tag row carried no provenance:
+    // removing a tag from frontmatter never removed it. The importer stamps
+    // 'frontmatter' and deletes only those rows; explicit adds stamp 'added'
+    // and legacy rows stay NULL — neither is ever deleted by an import.
+    version: 175,
+    name: 'tags_tag_source',
+    idempotent: true,
+    sql: `ALTER TABLE tags ADD COLUMN IF NOT EXISTS tag_source TEXT;`,
+  },
+  {
+    // #5686: connector checkpoints were keyed on the raw sources.config, which
+    // the cycle stamp rewrites after every run. Re-key each source's newest
+    // committed checkpoint receipt to the stable parsed-config identity, seed
+    // its connector state row (resumed or re-walking once), record the cutoff
+    // that classifies retired-format connector intents, and remove orphan
+    // checkpoint rows. Handler-only, statement-at-a-time, rerun-safe.
+    version: 176, name: 'connector_checkpoint_stable_identity', idempotent: true, sql: '',
+    handler: async engine => { await migrateConnectorCheckpoints(engine); },
+  },
+  {
+    // #5254: a page written database-only while its filesystem source had no
+    // canonical owner (persistence.unbound_write=database_only) is stamped
+    // 'unbound_source', so writes and sync after binding keep it database-only
+    // instead of materializing or overwriting it. Nullable, no backfill (no
+    // earlier binary could write such a page), no index (read per page; the
+    // doctor count scans only non-NULL rows; bootstrap-coverage: column-only).
+    // Keep in sync with src/schema.sql (regenerate schema-embedded.ts via
+    // build:schema) and src/core/pglite-schema.ts.
+    version: 177,
+    name: 'pages_database_only_reason',
+    idempotent: true,
+    sql: `ALTER TABLE pages ADD COLUMN IF NOT EXISTS database_only_reason TEXT;`,
+  },
+  {
+    // Writer-version stamps: each request records the binary version and host
+    // that admitted it and the ones that published it, so doctor's
+    // writer_version advisory can name an older writer still on the brain.
+    // Nullable and never backfilled (a past writer cannot be proven). The
+    // cutoff is the database clock at migration time: only requests admitted
+    // or published after it are expected to carry stamps. persistence_requests
+    // and persistence_brain are migration-created on PGLite and no index
+    // references these columns (bootstrap-coverage: column-only exemptions).
+    version: 178,
+    name: 'persistence_writer_version_stamps',
+    idempotent: true,
+    sql: `
+      ALTER TABLE persistence_requests ADD COLUMN IF NOT EXISTS admitter_version text;
+      ALTER TABLE persistence_requests ADD COLUMN IF NOT EXISTS admitter_host_id uuid;
+      ALTER TABLE persistence_requests ADD COLUMN IF NOT EXISTS consumer_version text;
+      ALTER TABLE persistence_requests ADD COLUMN IF NOT EXISTS consumer_host_id uuid;
+      ALTER TABLE persistence_requests ADD COLUMN IF NOT EXISTS published_at timestamptz;
+      ALTER TABLE persistence_brain ADD COLUMN IF NOT EXISTS writer_version_cutoff timestamptz;
+      UPDATE persistence_brain SET writer_version_cutoff=now() WHERE writer_version_cutoff IS NULL;
+    `,
+  },
+  {
+    version: 179,
     name: 'page_aliases_cyrillic_fold',
     // normalizeAlias now folds ё → е and drops a Cyrillic stress mark (U+0301)
     // after lowercasing (ADR-0001), on both the write and the read side. Rows
@@ -6724,17 +6840,19 @@ CREATE TRIGGER minion_queue_protocol BEFORE INSERT OR UPDATE ON minion_jobs
     // source grant. A schema migration runs quiesced, so grant every source
     // for this transaction only (is_local = true), exactly as the coordinator
     // would, or the upgrade stops here.
-    // Fork note: this migration shipped in the fork as v165, then v166, before
-    // upstream claimed v165 (index_database_only_pending_writes) and v166
-    // (fact_embedding_identity). A brain stamped at the fork's v165 or v166
-    // skips upstream's copy of those, so re-create both here; every statement
-    // is IF NOT EXISTS / idempotent, so it is a no-op everywhere else.
+    // Fork note: this migration shipped in the fork as v165, v166 and then v170,
+    // before upstream claimed v165 (index_database_only_pending_writes), v166
+    // (fact_embedding_identity) and v170 (index_parked_persistence_effects). A
+    // brain stamped at one of the fork's numbers skips upstream's copy of that
+    // number, so re-create all three here; every statement is IF NOT EXISTS,
+    // so it is a no-op everywhere else.
     idempotent: true,
     sql: `
       ${PERSISTENCE_DATABASE_PENDING_INDEX_SQL};
       ALTER TABLE facts ADD COLUMN IF NOT EXISTS embedding_model TEXT;
       ALTER TABLE facts ADD COLUMN IF NOT EXISTS embedded_text_hash TEXT;
       ${MANAGED_WRITER_GUARD_SQL};
+      ${PERSISTENCE_EFFECT_PARKED_INDEX_SQL};
       SELECT set_config('gbrain.write_sources',
         (SELECT COALESCE(jsonb_agg(DISTINCT sid), '[]'::jsonb)::text
            FROM (SELECT id AS sid FROM sources UNION SELECT source_id FROM page_aliases) s), true);

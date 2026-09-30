@@ -75,7 +75,7 @@ import { loadStorageConfig, findDbOnlyCollisions } from '../core/storage-config.
 // time. integrations.ts is side-effect-free at module load (pure recipe I/O
 // helpers), so a static import is safe here.
 import { getConfiguredCollectorOutputs } from './integrations.ts';
-import { printManagedSyncDiagnostic } from './sync-diagnostics.ts';
+import { printManagedSyncDiagnostic, printManagedSyncNotes } from './sync-diagnostics.ts';
 import { getDefaultSourcePath } from '../core/source-resolver.ts';
 // v0.41.32.0: stamp the durable newest-COMMIT timestamp at sync time so the
 // remote staleness path reads a column instead of shelling out to git.
@@ -278,6 +278,8 @@ export interface SyncResult {
    * bookmark advancement; rename the files to import them.
    */
   malformedSkipped?: number;
+  /** Managed sync: files skipped because another origin keeps their slug, and links derived after the checkpoint. */
+  slugCollisions?: import('../core/persistence/sync-discovery.ts').SyncSlugCollision[]; links?: import('../core/persistence/links-maintenance.ts').ManagedLinkExtraction;
   /**
    * Aggregated alias/undeclared explicit-type warnings (schema.type_warnings,
    * default on) — one entry per distinct non-canonical type this run.
@@ -293,6 +295,10 @@ export interface SyncResult {
    * the working tree was imported (detached HEAD or --working-tree).
    */
   uncommitted?: { added: number; modified: number; deleted: number };
+  /** Post-sync link/timeline extraction failure (A15); the affected pages stay stale. */
+  extract_error?: string;
+  /** #5050: full sync re-sealed unchanged pages at the safe-chunk fence (see RunImportResult.resealed). */
+  resealed?: import('./import.ts').RunImportResult['resealed'];
   /**
    * v0.41.13.0 partial-sync fields (only set when status === 'partial').
    *
@@ -347,6 +353,8 @@ export interface SyncOpts {
   skipFailed?: boolean;
   /** Bug 9 — re-attempt unacknowledged failures explicitly (CLI --retry-failed). */
   retryFailed?: boolean;
+  /** Managed connector sources: discard the connector checkpoint and re-walk the window once (CLI --reset-checkpoint). */
+  resetCheckpoint?: boolean;
   /**
    * v0.41.37.0 #1569 — skip loading the active schema pack during sync. When set,
    * `loadActivePack` is not called, so no user-supplied pack page-type regex
@@ -356,6 +364,8 @@ export interface SyncOpts {
    * Threaded through performSync AND syncOneSource so `sync --all` honors it.
    */
   noSchemaPack?: boolean;
+  /** Processing options this caller set; an unfinished managed cursor supplies the rest (unset = all explicit). */
+  explicitProcessing?: Array<'noEmbed' | 'noExtract' | 'noSchemaPack'>;
   /**
    * v0.18.0 Step 5 — sync a specific named source. When set, sync reads
    * local_path + last_commit from the sources table (not the global
@@ -622,8 +632,10 @@ See also:
 // runBreakLock, buildPartialResult) was peeled to src/core/sync-lock.ts
 // (pure move). Re-exported so existing importers keep working.
 export { SyncLockBusyError, runBreakLock } from '../core/sync-lock.ts';
+import { assertResetCheckpointSource } from '../core/persistence/connector-reset.ts';
 
 async function runConnectorSync(engine: BrainEngine, opts: SyncOpts, managed: boolean): Promise<SyncResult | null> {
+  if (opts.resetCheckpoint) await assertResetCheckpointSource(engine, opts.sourceId);
   if (!opts.sourceId && !opts.githubItem) return null;
   const sourceId = opts.sourceId ?? 'default';
   const [source] = await engine.executeRaw<{ local_path: string | null; config: unknown }>(
@@ -3902,6 +3914,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       ` Run 'gbrain extract --stale${opts.sourceId ? ` --source-id ${opts.sourceId}` : ''}' to extract now.`,
     );
   }
+  let extractError: string | undefined;
   if (!opts.noExtract && totalChanges <= 100 && pagesAffected.length > 0) {
     try {
       const { extractLinksForSlugs, extractTimelineForSlugs, stampExtracted, slugsSafeToStamp } = await import('./extract.ts');
@@ -3925,7 +3938,14 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         slugsSafeToStamp(linksResult, timelineResult)
           .map((slug) => ({ slug, source_id: opts.sourceId ?? 'default' })),
       );
-    } catch { /* extraction is best-effort */ }
+      const failed = [...(linksResult.errors ?? []), ...(timelineResult.errors ?? [])];
+      if (failed.length > 0) extractError = `${failed.length} page(s) not extracted, e.g. ${failed[0]!.slug}: ${failed[0]!.error}`;
+    } catch (e) {
+      extractError = e instanceof Error ? e.message : String(e);
+    }
+    // A15: best-effort (the import stands and failed pages stay stale for
+    // `extract --stale`), but never silent.
+    if (extractError) serr(`  Link/timeline extraction failed: ${extractError}. Run 'gbrain extract --stale${opts.sourceId ? ` --source-id ${opts.sourceId}` : ''}' after fixing it.`);
   }
 
   // v0.31.2: facts extraction now routes through the shared
@@ -4034,6 +4054,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     malformedSkipped: malformedSkipped.length,
     ...(typeWarningsEnabled && typeWarnings.length > 0 ? { type_warnings: typeWarnings } : {}),
     ...(uncommittedDrift ? { uncommitted: uncommittedDrift } : {}),
+    ...(extractError ? { extract_error: extractError } : {}),
   };
 }
 
@@ -4475,6 +4496,7 @@ async function performFullSync(
     // topologies (codex re-review; same rationale as the incremental path).
     ...(result.malformedSkipped ? { malformedSkipped: result.malformedSkipped } : {}),
     ...(result.type_warnings ? { type_warnings: result.type_warnings } : {}),
+    ...(result.resealed ? { resealed: result.resealed } : {}),
   };
 }
 
@@ -4596,6 +4618,8 @@ Options:
   --skip-failed        Acknowledge previously-recorded sync failures so
                        the bookmark can advance past unparseable files.
   --retry-failed       Re-attempt previously-failed files; clear on success.
+  --reset-checkpoint   Connector source only: re-walk its window once from an empty
+                       checkpoint; unchanged pages are not admitted again.
   --watch              Re-sync continuously on an interval.
   --interval N         Watch-mode interval in seconds (default 60).
   --no-pull            Skip 'git pull' before the sync (useful for tests).
@@ -4655,8 +4679,10 @@ See also:
   let noEmbed = resolveNoEmbed(args, loadConfig());
   const noExtract = args.includes('--no-extract'); // v0.42.7 #1696
   const skipFailed = args.includes('--skip-failed');
-  const retryFailed = args.includes('--retry-failed');
+  const retryFailed = args.includes('--retry-failed'), resetCheckpoint = args.includes('--reset-checkpoint');
   const noSchemaPack = args.includes('--no-schema-pack'); // v0.41.37.0 #1569
+  const explicitProcessing = ([['--no-embed', 'noEmbed'], ['--no-extract', 'noExtract'], ['--no-schema-pack', 'noSchemaPack']] as const)
+    .filter(([flag]) => args.includes(flag)).map(([, key]) => key);
   const includeGitignored = args.includes('--include-gitignored');
   // Untracked-gap fix: --working-tree imports uncommitted working-tree state.
   // The config fallback (sync.include_working_tree) resolves inside
@@ -5124,7 +5150,7 @@ See also:
         dryRun, full, noPull,
         noEmbed: effectiveNoEmbed,
         noExtract,
-        skipFailed, retryFailed, noSchemaPack,
+        skipFailed, retryFailed, noSchemaPack, explicitProcessing,
         includeGitignored,
         workingTree,
         sourceId: src.id,
@@ -5359,7 +5385,7 @@ See also:
   const singleSourceInterrupt = new AbortController();
   const onSingleSourceSigint = () => { try { singleSourceInterrupt.abort(new Error('SIGINT')); } catch { /* */ } };
   const opts: SyncOpts = {
-    repoPath, dryRun, full, noPull, noEmbed, noExtract, skipFailed, retryFailed, noSchemaPack, includeGitignored, workingTree, sourceId,
+    repoPath, dryRun, full, noPull, noEmbed, noExtract, skipFailed, retryFailed, resetCheckpoint, noSchemaPack, explicitProcessing, includeGitignored, workingTree, sourceId,
     strategy: strategyArg, concurrency,
     srcSubpath,
     exclude: excludePatterns.length > 0 ? excludePatterns : undefined,
@@ -5998,4 +6024,5 @@ export function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = p
       write(`  Re-run 'gbrain sync' to continue (last_commit unchanged; safe to retry).`);
       break;
   }
+  printManagedSyncNotes(result, write);
 }

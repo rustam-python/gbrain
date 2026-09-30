@@ -105,7 +105,7 @@ describe('#25 patterns prompt', () => {
   test('asks for pattern pages in the language of the reflections, with script-neutral slugs', () => {
     const prompt = patternsTesting.buildPatternsPrompt(
       [{ slug: 'wiki/personal/reflections/2026-09-27-тема', title: 'Тема', excerpt: 'Текст.' }] as never,
-      2,
+      2, undefined, undefined, '2026-09-30',
     );
     expect(prompt).toMatch(SLUG_FOLLOWS_TITLE);
     expect(prompt).toMatch(LANGUAGE_RULE);

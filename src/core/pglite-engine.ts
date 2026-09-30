@@ -4,11 +4,12 @@ import { trackPgliteDatabase, PgliteClosingError, notifyPgliteOpened } from './p
 import { mutatePageTag } from './page-state/tags.ts';
 import type { PageKey, PageSnapshot, PageSnapshotOptions, PageWriteOptions } from './page-state/types.ts';
 import { assertPageRevision } from './page-state/types.ts';
-import { lockPageKeys as acquirePageKeys } from './page-state/guards.ts';
+import { lockUnheldPageKeys, withHeldPageKeys, type HeldPageKeys } from './page-state/guards.ts';
 import { readPageSnapshot as readCanonicalPageSnapshot } from './page-state/snapshot.ts';
 import { createPageVersion } from './page-state/versions.ts';
-import { recordRenameAlias } from './page-state/rename-alias.ts';
+import { moveSlugBindings, recordRenameAlias } from './page-state/rename-alias.ts';
 import { composablePgliteTransaction } from './page-state/transactions.ts';
+import { dropRowTypeArrayParsers, PgliteStatementCache } from './pglite-statements.ts';
 import { GRANT_COLUMNS_SQL } from './grants/schema.ts';
 import type { PageReadScope } from './types.ts';
 import type { PageReadPolicy } from './types.ts';
@@ -75,7 +76,7 @@ import { withVectorSettings } from './search/vector-settings.ts';
 import { PGLITE_SCHEMA_SQL, getPGLiteSchema } from './pglite-schema.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 import { readStoredEmbeddingIdentity } from './stored-embedding-identity.ts';
-import { DELETE_BATCH_SIZE, TRAVERSE_PATH_ROW_CAP } from './engine-constants.ts';
+import { DELETE_BATCH_SIZE, TRAVERSE_PATH_ROW_CAP, TRAVERSE_WALK_ROW_CAP } from './engine-constants.ts';
 import { PageMissingError } from './engine-errors.ts';
 import { SOURCE_CONFIG_OBJECT_SQL } from './source-config-sql.ts';
 import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion, chunkWriteInvalidation, currentTextProjectionFilter, requiresSafeChunks, safeChunksFilter } from './search/safe-chunks.ts';
@@ -113,7 +114,7 @@ import { PAGE_SORT_SQL, MIN_ENTITY_PAGES_FOR_COVERAGE } from './types.ts';
 import { finalizeLastSeen } from './chronicle/last-seen.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildBestPerPagePoolCte, buildOrFallbackWebsearchQuery, boundWebsearchQuery } from './search/sql-ranking.ts';
-import { privatePagesFilterFragment, privateLinkOriginFilterFragment, privateTimelineEventFilterFragment, privateProvenanceFilterFragment } from './search/private-visibility.ts';
+import { privatePagesFilterFragment, privateSnapshotFilterFragment, privateLinkOriginFilterFragment, privateTimelineEventFilterFragment, privateProvenanceFilterFragment } from './search/private-visibility.ts';
 import { unverifiedExtractionFragment } from './extraction-review.ts';
 import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './orphan-policy.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
@@ -133,13 +134,13 @@ import { hasCJK } from './cjk.ts';
 import * as factsImpl from './pglite-engine/facts.ts';
 import type { PgliteFactsDeps } from './pglite-engine/facts.ts';
 import * as takesImpl from './pglite-engine/takes.ts';
+import { PgliteCheckpointGuard } from './pglite-engine/checkpoint-guard.ts';
 import type { PgliteTakesDeps } from './pglite-engine/takes.ts';
 import * as codeEdgesImpl from './pglite-engine/code-edges.ts';
 import type { PgliteCodeEdgesDeps } from './pglite-engine/code-edges.ts';
 import * as salienceImpl from './pglite-engine/salience.ts';
 import type { PgliteSalienceDeps } from './pglite-engine/salience.ts';
 import { searchKeywordCJK } from './pglite-engine/cjk-search.ts';
-import { MOVE_WITHDRAWAL_SUBJECT_SQL } from './facts/withdrawal-schema.ts';
 
 /**
  * #4284 — opt-in out-of-band watchdog for a PGLite disconnect with a live
@@ -573,10 +574,12 @@ export function buildWalRepairNotice(receipt: WalRepairReceipt): string {
     '⚠️  gbrain repaired this brain\'s PGLite WAL in place.',
     `    Data dir: ${receipt.dataDir}`,
     `    Cause: torn WAL/checkpoint state from an unclean shutdown (issue #223 class).`,
-    `    Data files were preserved; transactions not checkpointed before the`,
-    `    corruption may be lost (the standard pg_resetwal caveat).`,
+    `    Transactions not checkpointed before the corruption may be lost, and`,
+    `    indexes are not rebuilt: pages written just before the crash can be`,
+    `    missing from vector search while keyword search still finds them.`,
     `    Pre-repair backup: ${receipt.backupPath}`,
-    `    Recommended: run \`gbrain doctor\` to verify brain integrity.`,
+    `    Next: rebuild the vector indexes with \`gbrain reindex --vectors\`,`,
+    `    then run \`gbrain doctor\` to verify brain integrity.`,
     `    Disable auto-repair with GBRAIN_PGLITE_WAL_REPAIR=off.`,
   ].join('\n');
 }
@@ -700,6 +703,7 @@ export class PGLiteEngine implements BrainEngine {
   private vectorIterativeScan?: Promise<boolean>;
   /** Transaction clones keep chunk invalidation and replacement atomic. */
   private _chunkWritesInTransaction = false;
+  private _checkpointGuard: PgliteCheckpointGuard | undefined;
   readonly kind = 'pglite' as const;
   private _db: PGLiteDB | null = null;
   private _lock: LockHandle | null = null;
@@ -718,9 +722,12 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   private _attachDatabase(database: PGLiteDB): PGLiteDB {
-    this._dbWork = trackPgliteDatabase(database);
+    this._statements = new PgliteStatementCache(database);
+    this._dbWork = trackPgliteDatabase(this._statements.attach(database, false));
+    this._checkpointGuard = undefined;
     return this._dbWork.database;
   }
+  private _statements: PgliteStatementCache | null = null;
   // #2034: captured at connect() so reconnect() can restore the same data dir
   // after a drop, matching PostgresEngine's _savedConfig contract.
   private _savedConfig: EngineConfig | null = null;
@@ -760,7 +767,10 @@ export class PGLiteEngine implements BrainEngine {
     }
     this.vectorIterativeScan = undefined;
     const opening = this._connectInternal(config).then(async () => {
-      try { if (registerRoots) await registerManagedFilesystemEngine(this, config.database_path); }
+      try {
+        await dropRowTypeArrayParsers(this.db);
+        if (registerRoots) await registerManagedFilesystemEngine(this, config.database_path);
+      }
       catch (error) {
         try { await this._closeInternal(); }
         catch (closeError) {
@@ -1002,6 +1012,7 @@ export class PGLiteEngine implements BrainEngine {
       if (lock?.acquired) await releaseLock(lock);
       this._lock = null;
       this._dbWork = null;
+      this._statements = null;
     } finally {
       // A slow close keeps the watchdog armed until it actually settles. On a
       // failed close the lock is retained; callers must terminate the process.
@@ -1707,14 +1718,18 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   async transaction<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
-    return this.db.transaction(async handle => {
-      const tx = composablePgliteTransaction(handle);
+    const run = (db = this.db) => withHeldPageKeys(this._pageTransaction ? this._heldPageKeys : null, held => db.transaction(async handle => {
+      const tx = composablePgliteTransaction(this._statements?.attach(handle, true) ?? handle);
       const txEngine = Object.create(this) as PGLiteEngine;
       Object.defineProperty(txEngine, '_chunkWritesInTransaction', { value: true });
       Object.defineProperty(txEngine, '_pageTransaction', { value: true });
+      Object.defineProperty(txEngine, '_heldPageKeys', { value: held });
       Object.defineProperty(txEngine, 'db', { get: () => tx });
       return fn(txEngine);
-    });
+    }));
+    if (this._pageTransaction || !this._dbWork) return run();
+    const guard = this._checkpointGuard ??= new PgliteCheckpointGuard();
+    return this._dbWork.admit(db => guard.runOutermost(sql => db.query(sql), () => run(db)));
   }
 
   async transactionDirect<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
@@ -1732,8 +1747,9 @@ export class PGLiteEngine implements BrainEngine {
 
   async lockPageKeys(keys: readonly PageKey[]): Promise<void> {
     if (!this._pageTransaction) throw new Error('lockPageKeys requires engine.transaction()');
-    await acquirePageKeys(this, keys);
+    await lockUnheldPageKeys(this, this._heldPageKeys!, keys);
   }
+  private _heldPageKeys: HeldPageKeys | null = null;
 
   /**
    * v0.41.13 (#1309) — identity-based dedup pre-check.
@@ -2453,7 +2469,7 @@ export class PGLiteEngine implements BrainEngine {
     const innerLimit = Math.min(limit * 3, MAX_SEARCH_LIMIT * 3);
 
     // Source-aware ranking (v0.22): see postgres-engine.ts for rationale.
-    const boostMap = resolveBoostMap();
+    const boostMap = opts?.source_boosts ?? resolveBoostMap();
     const sourceFactorCase = buildSourceFactorCase('p.slug', boostMap, opts?.detail);
     const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
     const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
@@ -2604,7 +2620,7 @@ export class PGLiteEngine implements BrainEngine {
       console.warn(`[gbrain] Warning: search limit clamped from ${opts.limit} to ${MAX_SEARCH_LIMIT}`);
     }
 
-    const boostMap = resolveBoostMap();
+    const boostMap = opts?.source_boosts ?? resolveBoostMap();
     const sourceFactorCase = buildSourceFactorCase('p.slug', boostMap, opts?.detail);
     const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
     const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
@@ -2764,7 +2780,7 @@ export class PGLiteEngine implements BrainEngine {
 
     // Source-aware ranking applied here too — searchKeywordChunks is the
     // chunk-grain anchor primitive that two-pass retrieval (Layer 7) uses.
-    const boostMap = resolveBoostMap();
+    const boostMap = opts?.source_boosts ?? resolveBoostMap();
     const sourceFactorCase = buildSourceFactorCase('p.slug', boostMap, opts?.detail);
     const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
     const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
@@ -2855,7 +2871,7 @@ export class PGLiteEngine implements BrainEngine {
     // HNSW; outer SELECT re-ranks by raw_score * source_factor over the
     // narrow candidate pool. innerLimit scales with offset to preserve the
     // pagination contract. See postgres-engine.ts searchVector for rationale.
-    const boostMap = resolveBoostMap();
+    const boostMap = opts?.source_boosts ?? resolveBoostMap();
     // Outer SELECT references the aliased CTE column. Aliasing the CTE as `hc`
     // disambiguates the correlated subquery (`te.page_id = hc.page_id`) from
     // the inner column. Without the alias, an unqualified `page_id` in the
@@ -3203,7 +3219,7 @@ export class PGLiteEngine implements BrainEngine {
     // #4246: embedded_text_hash records md5(chunk_text) AT EMBED TIME so a
     // later text rewrite that keeps the vector is detectable as content
     // drift (invalidateContentDriftEmbeddings). NULL when no embedding lands.
-    const cols = `(page_id, chunk_index, chunk_text, chunk_source, ${writeColId}, model, token_count, embedded_at, embedded_text_hash, language, symbol_name, symbol_type, start_line, end_line, parent_symbol_path, doc_comment, symbol_name_qualified, modality, embedding_image)`;
+    const cols = `(page_id, chunk_index, chunk_text, chunk_source, ${writeColId}, model, token_count, embedded_at, embedded_text_hash, embedding_input_hash, language, symbol_name, symbol_type, start_line, end_line, parent_symbol_path, doc_comment, symbol_name_qualified, modality, embedding_image)`;
     const rowParts: string[] = [];
     const params: unknown[] = [];
     let paramIdx = 1;
@@ -3248,10 +3264,13 @@ export class PGLiteEngine implements BrainEngine {
       // #4246: hash in SQL (not JS) so stamp + drift comparison share ONE
       // md5 implementation. Binds chunk_text a second time.
       const embeddedTextHashPh = embeddingStr ? `md5($${paramIdx++})` : 'NULL';
+      // #5553: embedding-input provenance travels only with the vector it describes.
+      const embeddingInputHash = embeddingStr ? chunk.embedding_input_hash ?? null : null;
+      const embeddingInputHashPh = embeddingInputHash ? `$${paramIdx++}` : 'NULL';
 
       rowParts.push(
         `($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, ` +
-        `${embeddingPh}, $${paramIdx++}, $${paramIdx++}, ${embeddedAtPh}, ${embeddedTextHashPh}, ` +
+        `${embeddingPh}, $${paramIdx++}, $${paramIdx++}, ${embeddedAtPh}, ${embeddedTextHashPh}, ${embeddingInputHashPh}, ` +
         `$${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, ` +
         `$${paramIdx++}::text[], $${paramIdx++}, $${paramIdx++}, ` +
         `$${paramIdx++}, ${embeddingImagePh})`,
@@ -3266,6 +3285,7 @@ export class PGLiteEngine implements BrainEngine {
       if (embeddingStr) params.push(embeddingStr);
       if (embeddingImageStr) params.push(embeddingImageStr);
       if (embeddingStr) params.push(sanitizedChunkText); // embedded_text_hash md5() input
+      if (embeddingInputHash) params.push(embeddingInputHash);
       params.push(
         pageId, chunk.chunk_index, sanitizedChunkText, chunk.chunk_source,
         chunk.model || resolvedModel, chunk.token_count || null,
@@ -3327,6 +3347,14 @@ export class PGLiteEngine implements BrainEngine {
                 AND (content_chunks.embedded_at IS NULL OR EXCLUDED.embedded_at > content_chunks.embedded_at)
                 THEN EXCLUDED.embedded_text_hash
            ELSE content_chunks.embedded_text_hash
+         END,
+         embedding_input_hash = CASE
+           WHEN EXCLUDED.chunk_text != content_chunks.chunk_text THEN EXCLUDED.embedding_input_hash
+           WHEN content_chunks.${writeColId} IS NULL THEN EXCLUDED.embedding_input_hash
+           WHEN EXCLUDED.embedded_at IS NOT NULL
+                AND (content_chunks.embedded_at IS NULL OR EXCLUDED.embedded_at > content_chunks.embedded_at)
+                THEN EXCLUDED.embedding_input_hash
+           ELSE content_chunks.embedding_input_hash
          END,
          language = CASE WHEN EXCLUDED.chunk_text != content_chunks.chunk_text THEN EXCLUDED.language ELSE COALESCE(EXCLUDED.language, content_chunks.language) END,
          symbol_name = CASE WHEN EXCLUDED.chunk_text != content_chunks.chunk_text THEN EXCLUDED.symbol_name ELSE COALESCE(EXCLUDED.symbol_name, content_chunks.symbol_name) END,
@@ -4265,7 +4293,8 @@ export class PGLiteEngine implements BrainEngine {
            WHERE l2.from_page_id = g.id AND p3.deleted_at IS NULL ${privacy('p3', 'l2')} ${aggScope}),
           '[]'::jsonb
         ) as links
-      FROM graph g
+      FROM (SELECT DISTINCT id, slug, title, type, depth
+            FROM (SELECT id, slug, title, type, depth FROM graph LIMIT ${TRAVERSE_WALK_ROW_CAP}) capped) g
       ORDER BY g.depth, g.slug`,
       params
     );
@@ -4340,15 +4369,18 @@ export class PGLiteEngine implements BrainEngine {
           FROM walk w
           JOIN links l ON l.from_page_id = w.id
           JOIN pages p2 ON p2.id = l.to_page_id
-          WHERE w.depth < $2
+          WHERE w.depth + 1 < $2
             AND NOT (p2.id = ANY(w.visited))
             AND p2.deleted_at IS NULL ${privacy('p2', 'l')}
             ${linkTypeWhere}
             ${stepScope}
-        )
-        SELECT w.slug AS from_slug, p2.slug AS to_slug,
+        ),
+        capped AS (SELECT id, slug, depth FROM walk LIMIT ${TRAVERSE_WALK_ROW_CAP + 1}),
+        nodes AS (SELECT DISTINCT id, slug, depth FROM capped)
+        SELECT (SELECT count(*) FROM capped) > ${TRAVERSE_WALK_ROW_CAP} AS walk_truncated,
+               w.slug AS from_slug, p2.slug AS to_slug,
                l.link_type, l.context, w.depth + 1 AS depth
-        FROM walk w
+        FROM nodes w
         JOIN links l ON l.from_page_id = w.id
         JOIN pages p2 ON p2.id = l.to_page_id
         WHERE w.depth < $2
@@ -4368,15 +4400,18 @@ export class PGLiteEngine implements BrainEngine {
           FROM walk w
           JOIN links l ON l.to_page_id = w.id
           JOIN pages p2 ON p2.id = l.from_page_id
-          WHERE w.depth < $2
+          WHERE w.depth + 1 < $2
             AND NOT (p2.id = ANY(w.visited))
             AND p2.deleted_at IS NULL ${privacy('p2', 'l')}
             ${linkTypeWhere}
             ${stepScope}
-        )
-        SELECT p2.slug AS from_slug, w.slug AS to_slug,
+        ),
+        capped AS (SELECT id, slug, depth FROM walk LIMIT ${TRAVERSE_WALK_ROW_CAP + 1}),
+        nodes AS (SELECT DISTINCT id, slug, depth FROM capped)
+        SELECT (SELECT count(*) FROM capped) > ${TRAVERSE_WALK_ROW_CAP} AS walk_truncated,
+               p2.slug AS from_slug, w.slug AS to_slug,
                l.link_type, l.context, w.depth + 1 AS depth
-        FROM walk w
+        FROM nodes w
         JOIN links l ON l.to_page_id = w.id
         JOIN pages p2 ON p2.id = l.from_page_id
         WHERE w.depth < $2
@@ -4398,15 +4433,18 @@ export class PGLiteEngine implements BrainEngine {
           FROM walk w
           JOIN links l ON (l.from_page_id = w.id OR l.to_page_id = w.id)
           JOIN pages p2 ON p2.id = CASE WHEN l.from_page_id = w.id THEN l.to_page_id ELSE l.from_page_id END
-          WHERE w.depth < $2
+          WHERE w.depth + 1 < $2
             AND NOT (p2.id = ANY(w.visited))
             AND p2.deleted_at IS NULL ${privacy('p2', 'l')}
             ${linkTypeWhere}
             ${stepScope}
-        )
-        SELECT pf.slug AS from_slug, pt.slug AS to_slug,
+        ),
+        capped AS (SELECT id, depth FROM walk LIMIT ${TRAVERSE_WALK_ROW_CAP + 1}),
+        nodes AS (SELECT DISTINCT id, depth FROM capped)
+        SELECT (SELECT count(*) FROM capped) > ${TRAVERSE_WALK_ROW_CAP} AS walk_truncated,
+               pf.slug AS from_slug, pt.slug AS to_slug,
                l.link_type, l.context, w.depth + 1 AS depth
-        FROM walk w
+        FROM nodes w
         JOIN links l ON (l.from_page_id = w.id OR l.to_page_id = w.id)
         JOIN pages pf ON pf.id = l.from_page_id
         JOIN pages pt ON pt.id = l.to_page_id
@@ -4424,7 +4462,7 @@ export class PGLiteEngine implements BrainEngine {
     const { rows } = await this.db.query(sql, params);
     // Row cap: the LIMIT above fetched CAP + 1 rows; the probe row only tells
     // us the walk overflowed and is dropped with everything past the cap.
-    const truncated = rows.length > TRAVERSE_PATH_ROW_CAP;
+    const truncated = rows.length > TRAVERSE_PATH_ROW_CAP || (rows as Array<{ walk_truncated?: boolean }>).some((r) => r.walk_truncated === true);
     const bounded = (truncated ? rows.slice(0, TRAVERSE_PATH_ROW_CAP) : rows) as Record<string, unknown>[];
     // Dedup edges (same from/to/type/depth can appear via multiple visited paths).
     const seen = new Set<string>();
@@ -4550,8 +4588,8 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   // Tags
-  async addTag(slug: string, tag: string, opts?: { sourceId?: string }): Promise<void> {
-    return mutatePageTag(this, { sourceId: opts?.sourceId ?? 'default', slug }, tag, true);
+  async addTag(slug: string, tag: string, opts?: { sourceId?: string; tagSource?: 'frontmatter' }): Promise<void> {
+    return mutatePageTag(this, { sourceId: opts?.sourceId ?? 'default', slug }, tag, true, opts?.tagSource);
   }
 
   async removeTag(slug: string, tag: string, opts?: { sourceId?: string }): Promise<void> {
@@ -5433,7 +5471,7 @@ export class PGLiteEngine implements BrainEngine {
 
   async getVersions(slug: string, opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean }): Promise<PageVersion[]> {
     const privacy = opts?.excludePrivate
-      ? `AND ${privatePagesFilterFragment('p')} AND ${privatePagesFilterFragment('pv')}` : '';
+      ? `AND ${privatePagesFilterFragment('p')} AND ${privateSnapshotFilterFragment('pv')}` : '';
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
       const { rows } = await this.db.query(
         `SELECT pv.* FROM page_versions pv
@@ -5809,8 +5847,7 @@ export class PGLiteEngine implements BrainEngine {
       );
       if (moved.length > 0) {
         await recordRenameAlias(tx, sourceId, oldSlug, newSlug);
-        // A forgotten claim stays forgotten for the renamed entity.
-        await tx.executeRaw(MOVE_WITHDRAWAL_SUBJECT_SQL, [sourceId, oldSlug, newSlug]);
+        await moveSlugBindings(tx, sourceId, oldSlug, newSlug);
       }
       // #3056: rows moved — a zero-row UPDATE does not throw, so the count is
       // the only way callers can see the no-op.

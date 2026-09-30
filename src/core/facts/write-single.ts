@@ -76,8 +76,8 @@ export async function writeSingleFact(
   sourceId: string,
   input: SingleFactInput,
 ): Promise<SingleFactResult> {
-  const { assertCoordinatedWrite } = await import('../persistence/context.ts');
-  await assertCoordinatedWrite(engine, sourceId);
+  const { managedPersistenceEnabled } = await import('../persistence/ownership.ts');
+  const managed = await managedPersistenceEnabled(engine);
 
   const { resolveEntitySlugWithSource } = await import('../entities/resolve.ts');
   const { cosineSimilarity } = await import('./classify.ts');
@@ -123,6 +123,18 @@ export async function writeSingleFact(
     }
   } else {
     degradedDedup = true;
+  }
+
+  if (managed) {
+    // The coordinator's fact intent owns dedup, supersession, the fence row and
+    // the file on a managed brain; the legacy direct writes stay unmanaged.
+    const { publishManagedEntityFacts } = await import('./managed-fact-write.ts');
+    const written = await publishManagedEntityFacts(engine, sourceId, resolvedSlug, [{ fact: factText, kind, notability: 'medium',
+      source: input.provenance, visibility, confidence: input.confidence ?? 1.0, validFrom: new Date(), validUntil,
+      embedding, embedding_model: embeddingModel, sessionId: input.sessionId ?? null }], { supersede: true });
+    const [stored] = await engine.executeRaw<{ entity_slug: string | null }>('SELECT entity_slug FROM facts WHERE id=$1', [written.ids[0]]);
+    return { id: written.ids[0], status: written.superseded ? 'superseded' : written.inserted ? 'inserted' : 'duplicate', entity_slug: stored?.entity_slug ?? null,
+      valid_until: validUntil, degraded_dedup: degradedDedup };
   }
 
   // Dedup + supersession decision (same candidates + threshold as the pipeline).
@@ -253,9 +265,13 @@ export async function writeSingleFact(
  * `superseded_by` for the audit trail. A supersession is an update, never a
  * durable withdrawal: the old claim stays rememberable and no other page is
  * invalidated. Both steps best-effort — the new fact is already durably
- * written; a partial supersede is an audit gap, not data loss.
+ * written; a partial supersede is an audit gap, not data loss — but a
+ * failure is logged with both ids, never swallowed.
  */
 async function expireSuperseded(engine: BrainEngine, oldId: number, newId: number): Promise<void> {
+  const report = (step: string, err: unknown) => console.warn(
+    `[facts.supersede] FACTS_SUPERSEDE_BOOKKEEPING_FAILED: ${step} for fact ${oldId} -> ${newId}: ${err instanceof Error ? err.message : String(err)}`,
+  );
   try {
     const { forgetFactInFence } = await import('./forget.ts');
     const [replacement] = await engine.executeRaw<{ row_num: number | null; same_page: boolean }>(
@@ -263,13 +279,13 @@ async function expireSuperseded(engine: BrainEngine, oldId: number, newId: numbe
          FROM facts n, facts o WHERE n.id = $1 AND o.id = $2`, [newId, oldId]);
     const rowNum = replacement?.same_page && replacement.row_num !== null ? Number(replacement.row_num) : null;
     await forgetFactInFence(engine, oldId, { supersededBy: { rowNum } });
-  } catch {
-    /* best-effort */
+  } catch (err) {
+    report('fence strike', err);
   }
   try {
     await engine.executeRaw(`UPDATE facts SET superseded_by = $1 WHERE id = $2`, [newId, oldId]);
-  } catch {
-    /* best-effort */
+  } catch (err) {
+    report('superseded_by link', err);
   }
 }
 

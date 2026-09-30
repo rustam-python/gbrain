@@ -2210,6 +2210,7 @@ export async function registerBuiltinHandlers(
   const quiet = opts?.quiet === true;
   worker.register('sync', async (job) => {
     const { performSync } = await import('./sync.ts');
+    const { explicitSyncProcessing } = await import('../core/persistence/sync-authority.ts');
     const repoPath = typeof job.data.repoPath === 'string' ? job.data.repoPath : undefined;
     const noPull = !resolveJobPull(job.data);
     // noEmbed defaults to true (embed is a separate job — submit `embed --stale`
@@ -2264,6 +2265,7 @@ export async function registerBuiltinHandlers(
     try {
       result = await performSync(engine, {
         repoPath, sourceId, noPull, noEmbed, noExtract, signal: job.signal,
+        explicitProcessing: explicitSyncProcessing(job.data),
         concurrency: concurrencyOverride,
         ...(githubItem ? { githubItem } : {}),
       });
@@ -3010,10 +3012,12 @@ export async function registerBuiltinHandlers(
     const olderThanHours = typeof job.data.olderThanHours === 'number' ? job.data.olderThanHours : 72;
     const dryRun = !!job.data.dryRun;
     let pagesPurged = 0;
+    let pagesBlocked: Array<{ source_id: string; slug: string; reason: string }> = [];
+    let pagesError: string | undefined;
     let sourcesPurged: string[] = [];
     if (scope === 'pages' || scope === 'all') {
-      const result = await engine.purgeDeletedPages(olderThanHours);
-      pagesPurged = result.count;
+      const result = await (await import('../core/persistence/purge-deleted.ts')).purgeDeletedPagesCoordinated(engine, olderThanHours);
+      pagesPurged = result.count; pagesBlocked = result.blocked; pagesError = result.error?.message;
     }
     let sourcesBlocked: Array<{ id: string; reason: string }> = [];
     if (scope === 'sources' || scope === 'all') {
@@ -3025,7 +3029,9 @@ export async function registerBuiltinHandlers(
     // GC stale op_checkpoints rows (folded scope item +C from review).
     const { purgeStaleCheckpoints } = await import('../core/op-checkpoint.ts');
     const checkpointsPurged = await purgeStaleCheckpoints(engine, 7);
-    return { pagesPurged, sourcesPurged, sourcesBlocked, checkpointsPurged, dryRun };
+    // #5405: a coordinated purge failure fails the job after the other purges ran.
+    if (pagesError) throw new Error(pagesError);
+    return { pagesPurged, pagesBlocked, sourcesPurged, sourcesBlocked, checkpointsPurged, dryRun };
   });
 
   // Phase-wrapper handlers — each delegates to runCycle({ phases: [name] }).
