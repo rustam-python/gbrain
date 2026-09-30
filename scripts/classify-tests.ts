@@ -203,7 +203,7 @@ export function generate(): { tsv: string; suites: number; cases: number; files:
   const rows: SuiteRow[] = [];
   const unknown: string[] = [];
   for (const f of listTestFiles(testDir)) {
-    const rel = relative(REPO_ROOT, f);
+    const rel = relative(REPO_ROOT, f).replaceAll('\\', '/');
     const res = classifyFile(rel, readFileSync(f, 'utf-8'));
     rows.push(...res.rows);
     if (res.unknown) unknown.push(rel);
