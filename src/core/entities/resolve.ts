@@ -629,10 +629,12 @@ async function tryPrefixExpansion(
 
 // Slug shape comes from the shared grammar (SLUG_PATH_SHAPE_RE) so an existing
 // page's slug always takes the exact-page branch; it only gates a SELECT by slug.
+// Entity slugs carry no dots (#5421), so dotted input is a name, not a slug.
 export function looksLikeSlug(s: string): boolean {
-  // Anything with whitespace or capital letters is a display name, not a slug.
+  // Anything with whitespace, capital letters or a dot is a display name, not a slug.
   if (/\s/.test(s)) return false;
   if (s !== s.toLowerCase()) return false;
+  if (s.includes('.')) return false;
   return SLUG_PATH_SHAPE_RE.test(s);
 }
 
