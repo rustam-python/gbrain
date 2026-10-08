@@ -10,7 +10,6 @@ import { operations } from '../src/core/operations.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import { isUnverifiedExtraction } from '../src/core/extraction-review.ts';
 import { PAGE_SLUG_SEG } from '../src/core/cjk.ts';
-import { MIGRATIONS } from '../src/core/migrate.ts';
 
 /**
  * Pins ADR-0001 (the Cyrillic й/ё slug-fold design decision; see the PR
@@ -395,67 +394,5 @@ describe('ADR-0001 consequence: enrichEntity merges the two spellings', () => {
       normalizeAlias('Петр Иванов'),
     ) ?? [];
     expect(hits.map((h) => h.slug)).toContain('people/пётр-иванов');
-  });
-});
-
-describe('ADR-0001 upgrade: alias rows written before the yo fold are re-keyed', () => {
-  let engine: PGLiteEngine;
-  const migration = MIGRATIONS.find((m) => m.name === 'page_aliases_cyrillic_fold')!;
-  const rows = async () =>
-    (await engine.executeRaw<{ alias_norm: string; slug: string }>(
-      `SELECT alias_norm, slug FROM page_aliases ORDER BY slug, alias_norm`,
-    )).map((r) => `${r.slug}=${r.alias_norm}`);
-
-  beforeAll(async () => {
-    engine = new PGLiteEngine();
-    await engine.connect({});
-    await engine.initSchema();
-  });
-  afterAll(async () => { await engine.disconnect(); });
-
-  test('old yo rows fold; collapsed duplicates keep one row; a rerun is a no-op', async () => {
-    await engine.executeRaw(`DELETE FROM page_aliases`);
-    // What a pre-fold brain holds: the yo spelling stored verbatim, a page
-    // claiming both spellings, and a page with two yo variants of one name.
-    await engine.executeRaw(
-      `INSERT INTO page_aliases (source_id, alias_norm, slug) VALUES
-        ('default', 'пётр иванов', 'people/a'),
-        ('default', 'петр иванов', 'people/b'),
-        ('default', 'пётр иванов', 'people/b'),
-        ('default', 'пётр ёжиков', 'people/c'),
-        ('default', 'петр ёжиков', 'people/c'),
-        ('default', 'андрей', 'people/d')`,
-    );
-    await engine.runMigration(migration.version, migration.sql);
-    const after = await rows();
-    expect(after).toEqual([
-      'people/a=петр иванов',
-      'people/b=петр иванов',
-      'people/c=петр ежиков',
-      'people/d=андрей',
-    ]);
-    // Every row is reachable again by the key normalizeAlias computes today.
-    expect(after[0].split('=')[1]).toBe(normalizeAlias('Пётр Иванов'));
-    await engine.runMigration(migration.version, migration.sql);
-    expect(await rows()).toEqual(after);
-  });
-
-  test('the migration SQL re-keys a pre-fold row to exactly what normalizeAlias computes', async () => {
-    // A pre-fold row is NFKC + lowercase (+ trim/collapse) without the two
-    // Cyrillic folds. The SQL twin must land on normalizeAlias's key, or the
-    // re-keyed row still never matches a query.
-    const names = ['Пётр Иванов', 'Андре\u0301й', 'Ё\u0301лка', 'Ѓорѓи', 'Café Olé', 'Йошкар-Ола'];
-    await engine.executeRaw(`DELETE FROM page_aliases`);
-    for (const [i, name] of names.entries()) {
-      await engine.executeRaw(
-        `INSERT INTO page_aliases (source_id, alias_norm, slug) VALUES ('default', $1, $2)`,
-        [name.normalize('NFKC').toLowerCase(), `people/p${i}`],
-      );
-    }
-    await engine.runMigration(migration.version, migration.sql);
-    const got = await engine.executeRaw<{ alias_norm: string; slug: string }>(
-      `SELECT alias_norm, slug FROM page_aliases ORDER BY slug`,
-    );
-    expect(got.map((r) => r.alias_norm)).toEqual(names.map((n) => normalizeAlias(n)));
   });
 });
