@@ -1,4 +1,5 @@
 import { writeJsonDocument } from '../core/cli-force-exit.ts';
+import { importFenceTally, type FencesNormalized } from '../core/fence-repair/report.ts';
 import { opError } from '../core/ops/contract.ts';
 import { hasSourceFilesystemLock, withSourceFilesystemLock, currentSourceFilesystemSignal } from '../core/minions/source-filesystem.ts';
 import { readdirSync, lstatSync, existsSync, mkdirSync } from 'fs';
@@ -10,6 +11,7 @@ import { OperationError } from '../core/ops/contract.ts';
 import type { TwinCheck } from '../core/sync-twins.ts';
 import { importFile, importImageFile, isImageFilePath, type ImportResult } from '../core/import-file.ts';
 import { gitFirstCommitDates } from '../core/git-first-commit.ts';
+import { gitLsFiles } from '../core/git-visible-files.ts';
 import { currentCompanyBrainSync, getCompanyBrainProfile, importCompanyBrainFile } from '../core/company-brain/profile.ts';
 import { loadConfig, gbrainPath } from '../core/config.ts';
 import { createProgress } from '../core/progress.ts';
@@ -38,7 +40,7 @@ import { realpathOrResolve } from '../core/path-confine.ts';
 import { slog } from '../core/console-prefix.ts';
 import { refreshProjectionStatistics } from '../core/search/projection-statistics.ts';
 import { importAnalyzeEveryPages, maybeRefreshPlannerStats, PLANNER_STATS_REPAIR_COMMAND } from '../core/planner-stats.ts';
-import { importManagedFile } from '../core/persistence/import-mutations.ts';
+import { importManagedFile, nextImportBatch, settleManagedImportBatch } from '../core/persistence/import-mutations.ts';
 import { acceptedPendingReceipt } from '../core/persistence/accepted-pending.ts';
 import { estimateCostFromChars, lookupEmbeddingPrice } from '../core/embedding-pricing.ts';
 import { getEmbeddingModel } from '../core/ai/gateway.ts';
@@ -216,7 +218,7 @@ export interface RunImportResult {
   /** Aggregated alias/undeclared explicit-type warnings (schema.type_warnings). */
   type_warnings?: Array<{ kind: 'alias_of' | 'undeclared'; type: string; canonical?: string; directory?: string; count: number }>;
   /** #5050: unchanged pages re-sealed at the safe-chunk fence, and the embedding work that left. */
-  resealed?: { pages: number; pending_chunks: number; embedding_usd: number | null };
+  resealed?: { pages: number; pending_chunks: number; embedding_usd: number | null }; fences_normalized?: FencesNormalized; fence_issues?: unknown;
 }
 
 /**
@@ -255,7 +257,7 @@ export async function runImport(
     /** #5988: paths the caller already held this run; they are skipped without importing (not failures). */
     heldPaths?: ReadonlySet<string>;
     /** #5988: each file's outcome (a throw arrives as `{ status: 'error', error }`); `'held'` = the caller held it, not a failure. */
-    onFileResult?: (path: string, filePath: string, result: Pick<ImportResult, 'status' | 'error' | 'refusal' | 'frontmatter_recovery'>) => Promise<'held' | undefined>;
+    onFileResult?: (path: string, filePath: string, result: Pick<ImportResult, 'status' | 'error' | 'refusal' | 'frontmatter_recovery' | 'fences_normalized' | 'fence_issues'>) => Promise<'held' | undefined>;
     /**
      * #753/#774: glob patterns to exclude from the import (same semantics as
      * `isSyncable`'s `exclude` — matched against the dir-relative path).
@@ -672,7 +674,7 @@ export async function runImport(
   const failures: Array<{ path: string; error: string }> = []; // Bug 9
   // Alias-footgun visibility: aggregate per-file type_warning results once
   // per distinct type per run (same surface `gbrain sync` carries).
-  const typeWarningCounts = new Map<string, import('../core/schema-pack/type-usage.ts').TypeWarningCount>();
+  const typeWarningCounts = new Map<string, import('../core/schema-pack/type-usage.ts').TypeWarningCount>(), fenceTally = importFenceTally(sourceId ?? 'default');
   const noteTypeWarning = (w: { kind: 'alias_of' | 'undeclared'; type: string; canonical?: string; directory?: string } | undefined): void => {
     if (!w) return;
     const key = `${w.kind}\t${w.type}`;
@@ -703,8 +705,8 @@ export async function runImport(
   // never plans against the empty tables it started with (O-CEO-17).
   const analyzeEvery = await importAnalyzeEveryPages(engine);
 
-  async function processFile(eng: BrainEngine, filePath: string) {
-    if (signal?.aborted) return;
+  async function processFile(eng: BrainEngine, filePath: string, settled?: PromiseSettledResult<ImportResult>) {
+    if (!settled && signal?.aborted) return;
     const relativePath = singleFile ? basename(filePath) : relative(dir, filePath);
     // #753/#774: slug + source_path base. When performFullSync syncs a
     // monorepo subdir, slugRoot is the git root so slugs stay git-root-
@@ -721,16 +723,17 @@ export async function runImport(
       // multimodal is enabled. The walker (collectMarkdownFiles) only picks
       // up images when GBRAIN_EMBEDDING_MULTIMODAL=true so this branch is
       // unreachable when the gate is off; defense-in-depth check anyway.
-      const result = company ? await importCompanyBrainFile(eng, filePath, sourceId!) : managedImport
+      if (settled?.status === 'rejected') throw settled.reason;
+      const result = settled ? settled.value : company ? await importCompanyBrainFile(eng, filePath, sourceId!) : managedImport
         ? await importManagedFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack, signal, slugRoot: opts.slugRoot })
         : isImageFilePath(relativePath) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
         ? await importImageFile(eng, filePath, importRelPath, { noEmbed, sourceId })
         : await importFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack, firstCommitAt: firstCommits?.get(filePath), isRetiredTwin: opts.isRetiredTwin });
       // An import that landed while cancellation arrived is still complete.
       // Account for it before stopping, so resume never loses a successful path.
-      noteTypeWarning((result as { type_warning?: Parameters<typeof noteTypeWarning>[0] }).type_warning);
+      noteTypeWarning((result as { type_warning?: Parameters<typeof noteTypeWarning>[0] }).type_warning); fenceTally.note(importRelPath, result);
       const _fileMs = Date.now() - _fileT0;
-      if (_fileMs > 5000) {
+      if (!settled && _fileMs > 5000) {
         console.error(`[gbrain phase] import.process_file slow ${_fileMs}ms ${relativePath}`);
       }
       if (await opts.onFileResult?.(importRelPath, filePath, result) === 'held') {
@@ -832,6 +835,11 @@ export async function runImport(
     }
   }
 
+  async function processBatch(eng: BrainEngine, batch: string[]) {
+    const settled = batch.length > 1 && !signal?.aborted ? await settleManagedImportBatch(eng, batch, file => opts.slugRoot ? relative(opts.slugRoot, file)
+      : relative(importRoot, file), rel => !!opts.heldPaths?.has(rel), { noEmbed, sourceId, activePack: importActivePack, signal, slugRoot: opts.slugRoot }) : undefined;
+    for (const [i, file] of batch.entries()) await processFile(eng, file, settled?.[i]);
+  }
   let workerError: unknown;
   let workerFailed = false;
   try {
@@ -841,13 +849,10 @@ export async function runImport(
       // checks belt-and-suspenders so we never crash on a null assertion.
       const config = loadConfig();
       if (engine.kind === 'pglite' || !config?.database_url) {
-        for (const file of files) {
-          if (signal?.aborted) break;
-          await processFile(engine, file);
-        }
+        for (let i = 0, batch: string[]; i < files.length && !signal?.aborted; i += batch.length) await processBatch(engine, batch = nextImportBatch(files, i, managedImport && !company));
       } else {
         const { PostgresEngine } = await import('../core/postgres-engine.ts');
-        const { resolvePoolSize } = await import('../core/db.ts');
+        const { connectWithRetry, resolvePoolSize } = await import('../core/db.ts');
         // Each child keeps the established two-connection pool. GBRAIN_POOL_SIZE
         // controls the parent pool; GBRAIN_MAX_CONNECTIONS clamps the child
         // count above so the combined footprint stays within the operator's cap.
@@ -863,7 +868,7 @@ export async function runImport(
           for (let i = 0; i < actualWorkers; i++) {
             if (signal?.aborted) break;
             const eng = new PostgresEngine();
-            await eng.connect({ database_url: databaseUrl, poolSize: workerPoolSize });
+            await connectWithRetry(eng, { database_url: databaseUrl, poolSize: workerPoolSize }, { retryConnectTimeout: true });
             workerEngines.push(eng);
           }
 
@@ -874,9 +879,9 @@ export async function runImport(
           const outcomes = await Promise.allSettled(workerEngines.map(async (eng) => {
             try {
               while (!stopWorkers && !signal?.aborted) {
-                const idx = queueIndex++;
-                if (idx >= files.length) break;
-                await processFile(eng, files[idx]);
+                if (queueIndex >= files.length) break;
+                const batch = nextImportBatch(files, queueIndex, managedImport && !company); queueIndex += batch.length;
+                await processBatch(eng, batch);
               }
             } catch (error) {
               stopWorkers = true;
@@ -902,10 +907,7 @@ export async function runImport(
       } // end else (postgres parallel)
     } else {
       // Sequential: use the provided engine
-      for (const filePath of files) {
-        if (signal?.aborted) break;
-        await processFile(engine, filePath);
-      }
+      for (let i = 0, batch: string[]; i < files.length && !signal?.aborted; i += batch.length) await processBatch(engine, batch = nextImportBatch(files, i, managedImport && !company));
     }
   } catch (error) {
     workerFailed = true;
@@ -1188,7 +1190,7 @@ export async function runImport(
     await writeJsonDocument(JSON.stringify({
       status: errors > 0 ? 'partial' : 'success', duration_s: parseFloat(totalTime),
       imported, skipped, errors, chunks: chunksCreated,
-      ...(resealSummary ? { resealed: resealSummary } : {}),
+      ...(resealSummary ? { resealed: resealSummary } : {}), ...fenceTally.fields(),
       total_files: allFiles.length,
       unchanged: skipped - failures.length - malformedFileSkips,
       malformed_skipped: malformedFileSkips,
@@ -1200,17 +1202,17 @@ export async function runImport(
     slog(`\nImport complete (${totalTime}s):`);
     slog(`  ${imported} pages imported`);
     slog(`  ${skipped} pages skipped (${skipped - failures.length - malformedFileSkips} unchanged, ${errors} errors, ${malformedFileSkips} malformed filenames)`);
-    slog(`  ${chunksCreated} chunks created`);
+    slog(`  ${chunksCreated} chunks created`); for (const line of fenceTally.lines()) slog(line);
     if (resealSummary) {
       slog(`  ${resealSummary.pages} unchanged page(s) re-sealed for remote search; ${resealSummary.pending_chunks} chunk(s) need embedding`
         + `${resealSummary.embedding_usd === null ? '' : ` (~$${resealSummary.embedding_usd.toFixed(4)})`}${noEmbed ? ' — run gbrain embed --stale' : ''}`);
     }
   }
 
-  if (imported > 0 && !opts.managedBookmark) await refreshProjectionStatistics(engine);
+  if (imported > 0 && !opts.managedBookmark) await refreshProjectionStatistics(engine, imported);
   return {
     imported, skipped, errors, chunksCreated, failures,
-    ...(resealSummary ? { resealed: resealSummary } : {}),
+    ...(resealSummary ? { resealed: resealSummary } : {}), ...fenceTally.fields(),
     ...(totalMalformed > 0 ? { malformedSkipped: totalMalformed } : {}),
     ...(typeWarningCounts.size > 0 && typeWarningsEnabled
       ? { type_warnings: [...typeWarningCounts.values()] }
@@ -1341,16 +1343,8 @@ function gitListSyncableFiles(
   onExcluded?: (relPath: string) => void,
   includeHidden?: string[],
 ): string[] | null {
-  let stdout: string;
-  try {
-    stdout = execFileSync(
-      'git',
-      ['-C', dir, 'ls-files', '--cached', '--others', '--exclude-standard', '-z'],
-      { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] },
-    );
-  } catch {
-    return null; // not a git work tree, or git not on PATH → FS-walk fallback
-  }
+  const stdout = gitLsFiles(dir, ['--cached', '--others', '--exclude-standard', '-z']);
+  if (stdout === null) return null; // not a git work tree, or git not on PATH → FS-walk fallback
   // A directory the enclosing repository ignores (a scratch or cache folder inside a checkout) lists
   // nothing here, so an explicit import of it would succeed with zero files. Walk it directly instead.
   if (stdout === '' && gitIgnoresDir(dir)) return null;

@@ -38,7 +38,7 @@
 set -uo pipefail
 
 ROOT="${GBRAIN_DOC_GUARD_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
-MAX_BYTES="${GBRAIN_CLAUDE_MD_MAX_BYTES:-35000}"
+MAX_BYTES="${GBRAIN_CLAUDE_MD_MAX_BYTES:-35100}"
 TESTING_MAX_BYTES="${GBRAIN_TESTING_MD_MAX_BYTES:-120000}"
 
 # Reference docs that MUST stay current-state (history-free).

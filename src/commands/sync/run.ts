@@ -4,7 +4,8 @@ import { getCompanyBrainProfile } from '../../core/company-brain/profile.ts';
 import { slog, withSourcePrefix } from '../../core/console-prefix.ts';
 import type { BrainEngine } from '../../core/engine.ts';
 import { msysToNativePath } from '../../core/path-confine.ts';
-import { syncFailureJsonFields, readManagedSyncFailures } from '../../core/persistence/sync-failures.ts';
+import { syncFailureJsonFields, readManagedSyncFailures, managedSyncRetryCommand } from '../../core/persistence/sync-failures.ts';
+import { managedSyncCursorKey } from '../../core/persistence/sync-run.ts';
 import { syncHoldJsonFields } from '../../core/persistence/sync-holds.ts';
 import { printHoldNotes } from '../sync-diagnostics.ts';
 import { getDefaultSourcePath } from '../../core/source-resolver.ts';
@@ -61,6 +62,11 @@ export async function runSyncInner(engine: BrainEngine, args: string[]) {
   // if 'trigger' isn't the first arg.
   if (args[0] === 'trigger') {
     return runSyncTrigger(engine, args.slice(1));
+  }
+  // #6340: the operator contract (status / unblock) reads and schedules; it never runs a sync.
+  if (args[0] === 'status' || args[0] === 'unblock') {
+    const { runSyncStatus, runSyncUnblock } = await import('./operator.ts');
+    return args[0] === 'status' ? runSyncStatus(engine, args.slice(1)) : runSyncUnblock(engine, args.slice(1));
   }
 
   // v0.37 fix wave (Lane D.4 + CDX2-12): print usage when `--help`/`-h` is
@@ -127,7 +133,7 @@ export async function runSyncInner(engine: BrainEngine, args: string[]) {
   const resumeCommand = syncResumeCommand(args, getCliOptions().brain);
   if (syncAll) return await runSyncAll(engine, { ...flags, ...fanout }, { noEmbed, embeddingCredentialError, resumeCommand });
 
-  return await runSingleSourceSync(engine, { ...flags, ...fanout }, { sourceId, companyPolicy, noEmbed, resumeCommand });
+  return await runSingleSourceSync(engine, { ...flags, ...fanout }, { sourceId, companyPolicy, noEmbed, resumeCommand, args });
 }
 
 async function runSyncBreakLock(
@@ -712,14 +718,14 @@ function emitSyncAllEnvelope(input: {
 async function runSingleSourceSync(
   engine: BrainEngine,
   flags: SyncFlags & SyncFanoutFlags,
-  input: { sourceId: string; companyPolicy: Awaited<ReturnType<typeof getCompanyBrainProfile>> | null; noEmbed: boolean; resumeCommand: string },
+  input: { sourceId: string; companyPolicy: Awaited<ReturnType<typeof getCompanyBrainProfile>> | null; noEmbed: boolean; resumeCommand: string; args: string[] },
 ): Promise<void> {
   const {
     repoPath, watch, interval, dryRun, full, noPull, noBulk, lanes, noExtract, skipFailed, retryFailed, resetCheckpoint, noSchemaPack,
     explicitProcessing, includeGitignored, workingTree, jsonOut, yesFlag, noAutoEmbed, strategyArg, srcSubpath,
     excludePatterns, includeHiddenPatterns, concurrency, timeoutSeconds,
   } = flags;
-  const { sourceId, companyPolicy, noEmbed, resumeCommand } = input;
+  const { sourceId, companyPolicy, noEmbed, resumeCommand, args } = input;
   // v0.41.13.0 (T6) — single-source --timeout: same per-source AbortController
   // shape as the --all runOne closure. Timer scoped to this CLI invocation;
   // try/finally clears it after performSync resolves (or throws).
@@ -786,8 +792,19 @@ async function runSingleSourceSync(
     // v0.42.42.0 (#2139, D13C): scope the retry count to THIS source — rows
     // carry source_id (#1939), so a single-source retry shouldn't report
     // another source's failures.
+    // A managed retry resumes only the cursor its own options select; failures under other options are named, not counted.
     const [brain] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
-    const failures = brain?.enabled ? await readManagedSyncFailures(engine, [sourceId]) : unacknowledgedSyncFailures().filter(f => f.source_id === sourceId);
+    let failures: Array<{ source_id: string }> = unacknowledgedSyncFailures().filter(f => f.source_id === sourceId);
+    if (brain?.enabled) {
+      const managed = await readManagedSyncFailures(engine, [sourceId]);
+      const key = await managedSyncCursorKey(engine, opts).catch(() => null);
+      const other = key ? managed.filter(f => f.cursor_key !== key) : [];
+      failures = key ? managed.filter(f => f.cursor_key === key) : managed;
+      if (other.length) {
+        slog(`${other.length} previously-failed file(s) of this source belong to a run with different sync options and are not retried by this invocation. Retry them with:`);
+        for (const command of new Set(other.map(f => managedSyncRetryCommand(f)))) slog(`  ${command}`);
+      }
+    }
     if (failures.length === 0) {
       slog('No local ledger entries; checking the durable sync cursor for unfinished or failed writes.');
     } else {
@@ -801,7 +818,10 @@ async function runSingleSourceSync(
     let result: SyncResult;
     process.on('SIGINT', onSingleSourceSigint);
     try {
-      result = await performSync(engine, opts);
+      // #6317 (D1 a′): on a managed Postgres brain whose host a live serve owns, the drain runs inside that serve as this
+      // CLI's writer and returns the same SyncResult; every other case keeps this process's own consumer.
+      const delegated = companyPolicy ? null : await (await import('../sync-delegate.ts')).maybeDelegateManagedSyncToServe(engine, args, opts);
+      result = delegated?.kind === 'delegated' ? delegated.result : await performSync(engine, opts);
     } finally {
       if (singleSourceTimer !== undefined) clearTimeout(singleSourceTimer);
       process.off('SIGINT', onSingleSourceSigint);

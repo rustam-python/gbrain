@@ -16,23 +16,13 @@ import { isTimeoutError, pushDegraded } from './degraded.ts';
 import { markKeywordHits } from '../evidence.ts';
 import { resolveEffectiveRecency, resolveEffectiveSalience } from './effective-modes.ts';
 import { searchSalvageEnabled } from '../token-budget.ts';
-import { warnOncePerProcess } from '../../utils.ts';
+import { isDatetimeInputError, warnOncePerProcess } from '../../utils.ts';
 
 export interface LexicalArms {
   earlyModality: ModalityMode;
   keywordResults: SearchResult[];
   titleResults: SearchResult[];
   exactLookupOpts: ExactLookupOpts;
-}
-
-/**
- * SQLSTATE 22007 / 22008: a date bound the database could not cast. That is
- * the caller's input, never a degraded arm, so it surfaces instead of
- * becoming an empty result.
- */
-function isDatetimeInputError(err: unknown): boolean {
-  const code = (err as { code?: unknown } | null)?.code;
-  return code === '22007' || code === '22008';
 }
 
 /** Keyword + title FTS arms, fetched concurrently (fail-open per arm, rethrow when both hit a dead database). */
@@ -181,6 +171,8 @@ export async function buildRelationalList(req: HybridRequest): Promise<SearchRes
       excludePrivate: opts?.excludePrivate,
       requireSafeChunks: opts?.requireSafeChunks,
       takesHoldersAllowList: opts?.takesHoldersAllowList,
+      minTrust: opts?.minTrust,
+      suppressFlagged: opts?.suppressFlagged,
       planner: resolvedMode.relational_planner,
       orientOneHop: resolvedMode.relational_orient_onehop ?? resolvedMode.relational_planner,
       onMeta: (m) => {
@@ -207,7 +199,8 @@ export async function resolveModalityAndQueries(req: HybridRequest) {
     explicitModality === undefined &&
     regexModality === 'text' &&
     resolvedMode.cross_modal_llm_intent &&
-    isAmbiguousModalityQuery(query)
+    isAmbiguousModalityQuery(query) &&
+    (await import('../../ai/multimodal-model.ts')).multimodalEmbeddingModel() !== null
   ) {
     try {
       const { classifyModalityWithLLM } = await import('../llm-intent.ts');

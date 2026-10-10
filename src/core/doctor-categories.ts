@@ -58,13 +58,21 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'abandoned_threads',
   'atom_provenance_drift',
   'captured_facts_active',
+  'conversation_label_facts',
+  'conversation_outcomes_stale',
   'connector_checkpoints',
   'connector_held_items',
   'git_held_files',
+  'fence_integrity',
+  // #5575: stored trust tier counts, the legacy-row backfill, scan and source claims.
+  'trust_tiers',
+  'trust_scan',
+  'trust_sources_unclaimed',
   'credential_projection_pending',
   'derived_visibility',
   'extractor_facts_expired',
   'loop_facts_drift',
+  'ontology_facts_fenced',
   'orphan_persistence_bindings',
   'safe_index_pending',
   'self_capture',
@@ -118,6 +126,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'grade_confidence_drift',
   'graph_coverage',
   'graph_signals_coverage',
+  // Which extraction prompts resolve relative dates (informational).
+  'extraction_date_grounding',
   'hidden_by_search_policy',
   'image_assets',
   'integrity',
@@ -160,6 +170,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'timeline_coverage',
   'timeline_orphans',
   'timeline_history',
+  // #6147: imported conversation pages that may still carry a typed credential (cached audit).
+  'transcript_secret_exposure',
   // #5254 — pages written database-only to a source with no canonical owner.
   'unbound_source',
   'undeclared_db_only_pages',
@@ -239,6 +251,13 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'publication_refusals',
   'persistence_request_growth',
   'persistence_request_indexes',
+  'persistence_write_stall',
+  'managed_sync_not_moving',
+  'persistence_session_timeouts',
+  // #6317: consumer heartbeat rows and host identity (doctor/checks/persistence-consumers.ts).
+  'two_consumers_on_host',
+  'consumers_without_heartbeat',
+  'host_identity_mismatch',
   'stale_embedding_effects',
   'vector_plan',
   'writer_version',
@@ -265,6 +284,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'legacy_token_grant_drift',
   // Lane E: tokens minted without scopes (grandfathered read+write+admin).
   'legacy_token_null_scope',
+  // D4: grants whose operation snapshot or stored surface keeps operations their scopes allow out of reach.
+  'grant_new_ops_available',
   'reranker_health',
   'rls',
   'rls_event_trigger',

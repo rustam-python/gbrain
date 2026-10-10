@@ -1,14 +1,17 @@
-import type { BrainEngine, FactRow } from '../engine.ts';
+import type { BrainEngine, FactAttribution, FactRow } from '../engine.ts';
 import { verbError } from '../ops/contract.ts';
 import { isAvailable, embedOne, getEmbeddingModel } from '../ai/gateway.ts';
 import { cosineSimilarity } from './classify.ts';
 import { isFactWithdrawn } from './withdrawal.ts';
+import { assertFactNotPurged } from './withdrawal.ts';
 import { cosineVerdict } from './capture-dedup.ts';
 
 export type FactCandidate = FactRow & { source_markdown_slug: string | null; row_num: number | null };
 export interface FactDecision { status: 'inserted' | 'duplicate' | 'superseded'; candidate: FactCandidate | null; }
 export interface SingleFactIntent {
   fact: string; kind: FactRow['kind']; visibility: FactRow['visibility']; entity_slug: string | null;
+  /** Speaker of the new claim; a fact another known speaker asserted is never its duplicate. */
+  attributed_to?: FactAttribution | null;
 }
 /** Provider work belongs to preparation, never to a page/source transaction. `disabled`: the brain opted out of embedding. */
 export async function prepareFactEmbedding(fact: string, signal?: AbortSignal, disabled = false): Promise<{ embedding: Float32Array | null; embedding_model: string | null; degraded: boolean }> {
@@ -22,6 +25,7 @@ export async function prepareFactEmbedding(fact: string, signal?: AbortSignal, d
   return { embedding: null, embedding_model: null, degraded: true };
 }
 export async function assertFactNotWithdrawn(engine: BrainEngine, sourceId: string, input: SingleFactIntent): Promise<void> {
+  await assertFactNotPurged(engine, sourceId, input);
   if (await isFactWithdrawn(engine, sourceId, input.visibility, input.fact, input.entity_slug)) {
     throw verbError('invalid_params', 'fact_withdrawn: this exact claim was explicitly forgotten in this source and visibility.',
       'Remember a corrected claim. Repeating the old claim does not restore withdrawn memory.');
@@ -35,12 +39,13 @@ export async function decideSingleFact(engine: BrainEngine, sourceId: string, in
   const [exact] = await engine.executeRaw<FactCandidate>(`SELECT * FROM facts WHERE source_id=$1
     AND entity_slug IS NOT DISTINCT FROM $2 AND visibility=$3 AND expired_at IS NULL
     AND (valid_until IS NULL OR valid_until>now()) AND gbrain_fact_fingerprint(fact)=gbrain_fact_fingerprint($4)
-    ORDER BY id LIMIT 1`, [sourceId, input.entity_slug, input.visibility, input.fact]);
+    AND ($5::text IS NULL OR attributed_to IS NULL OR attributed_to=$5)
+    ORDER BY id LIMIT 1`, [sourceId, input.entity_slug, input.visibility, input.fact, input.attributed_to ?? null]);
   if (exact) return { status: 'duplicate', candidate: { ...exact, id: Number(exact.id) } };
   if (embedding && input.entity_slug) {
-    const candidates = await engine.findCandidateDuplicates(sourceId, input.entity_slug, input.fact, { embedding, embeddingModel, k: 5 });
-    const metadata = await engine.executeRaw<{ id: number; source_markdown_slug: string | null; row_num: number | null }>(
-      'SELECT id,source_markdown_slug,row_num FROM facts WHERE source_id=$1 AND id=ANY($2::int[])',
+    const candidates = await engine.findCandidateDuplicates(sourceId, input.entity_slug, input.fact, { embedding, embeddingModel, k: 5, attributedTo: input.attributed_to ?? null });
+    const metadata = await engine.executeRaw<{ id: number; source_markdown_slug: string | null; row_num: number | null; trust_tier: FactRow['trust_tier'] }>(
+      'SELECT id,source_markdown_slug,row_num,trust_tier FROM facts WHERE source_id=$1 AND id=ANY($2::int[])',
       [sourceId, candidates.map(c => c.id)]);
     let candidate: FactCandidate | null = null;
     let score = -1;

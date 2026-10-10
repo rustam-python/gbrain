@@ -393,6 +393,10 @@ export interface PageReadScope {
   excludePrivate?: boolean;
   /** Untrusted chunk reads require a verified protected-body index, even with visibility opt-outs. */
   requireSafeChunks?: boolean;
+  /** #5575 read floor (eligibility/policy.ts): only pages at or above this tier; a chunk's tier is its page's. */
+  minTrust?: import('./trust/tier.ts').TrustTier;
+  /** #5575 CEO-20, proactive reads only: hide unconfirmed agent-written pages with an instruction-family gate flag. */
+  suppressFlagged?: boolean;
 }
 
 export interface PageReadPolicy extends PageReadScope {
@@ -799,6 +803,13 @@ export interface ChunkInput {
 }
 
 // Search
+export interface RrfAttribution {
+  raw: number;
+  normalized: number;
+  compiled_truth_boost: number;
+  arms: import('./search/rrf-page-fusion.ts').RrfArmVote[];
+}
+
 export interface SearchResult {
   slug: string;
   page_id: number;
@@ -821,6 +832,11 @@ export interface SearchResult {
    * Absent when the page is clean.
    */
   content_flag?: { reason: string; detail: string };
+  /** #5575 A6: the page's trust tier and short write origin (eligibility/stamp.ts), stamped after ranking. */
+  trust_tier?: import('./trust/tier.ts').TrustTier;
+  origin?: string;
+  /** #5575 CEO-20: unconfirmed agent-written content with an instruction-family gate flag (explicit reads only). */
+  unconfirmed?: true;
   /**
    * 2026-09 fix wave (#3617 follow-up): true when this row came from the
    * keyword/title arm's AND→OR zero-strict-recall fallback rather than a
@@ -946,6 +962,18 @@ export interface SearchResult {
   /** RRF + cosine score BEFORE any boost stage mutated it. */
   base_score?: number;
   /**
+   * Explain attribution from weighted RRF fusion: the summed vote (`raw`),
+   * the score after max-normalization (`normalized`), the compiled-truth
+   * factor, and every arm-instance vote behind it (0-based ranks). Absent on
+   * rows that never went through `rrfFusionWeighted` (keyword-only single-arm
+   * paths). Lean MCP rows strip it; `explain` renders it as score_details.
+   */
+  rrf?: RrfAttribution;
+  /** Cosine blend input: the max-normalized RRF score the 0.7/0.3 blend used. */
+  blend_norm_rrf?: number;
+  /** Per-row ranking breakdown, set by the `search`/`query` ops only when the caller passes `explain: true`. */
+  score_details?: import('./search/explain-formatter.ts').ScoreDetails;
+  /**
    * v0.46.15 — RAW query↔chunk cosine similarity from cosineReScore's
    * hydration (the active embedding column's space). Absent on keyword-only
    * / no-embedding paths. This is the ONLY calibrated semantic signal on the
@@ -960,6 +988,8 @@ export interface SearchResult {
   feedback_boost?: number;
   /** The page's content_hash when this result was retrieved (stamped while retrieval feedback is enabled). */
   content_hash?: string | null;
+  /** Caller-visible inbound linking pages behind backlink_boost (stamped with it). */
+  backlink_count?: number;
   /** Multiplier applied by applySalienceBoost. */
   salience_boost?: number;
   /** Multiplier applied by applyRecencyBoost. */
@@ -1155,6 +1185,10 @@ export interface SearchOpts extends PageReadPolicy {
   onVectorPoolMeta?: (m: VectorPoolMeta) => void;
   /** #5824 rollback: keep the freshness guard inside the HNSW candidate CTE. Latched by the caller (search/vector-legacy-guard.ts). */
   vectorLegacyGuard?: boolean;
+  /** #6132: pgvector `hnsw.iterative_scan` mode (default relaxed_order), latched by the caller (search/hnsw-iterative-scan.ts). */
+  hnswIterativeScan?: import('./search/hnsw-iterative-scan.ts').HnswIterativeScanMode;
+  /** #5989: bounded CJK keyword arm (deadline + meta sink); set by hybrid only (engine-sql/cjk-search.ts). */
+  cjkKeyword?: import('./engine-sql/cjk-search.ts').CjkKeywordRun;
   /**
    * v0.42 — intent-aware adaptive return-sizing. `true` enables with config/
    * default caps; an object overrides caps per-call; omitted/`false` = off
@@ -1640,6 +1674,8 @@ export interface TimelineInput {
 
 export interface TimelineOpts extends PageReadScope {
   limit?: number;
+  /** #5575 read eligibility (eligibility/sql.ts) for read ops. */
+  eligibility?: import('./eligibility/policy.ts').ReadEligibility;
   after?: string;
   before?: string;
   /**
@@ -1974,6 +2010,7 @@ export const DEGRADED_STAGES = [
   'keyword_relaxed_carried',
   'safe_index_pending',
   'vector_candidates_incomplete',
+  'keyword_candidates_incomplete',
   'projection_pending',
   'projection_status_unknown',
 ] as const;
@@ -2070,6 +2107,8 @@ export interface HybridSearchMeta {
    * yield). Omitted on clean runs. Exhaustion is VISIBLE, not silent.
    */
   vector_pool_underfilled?: Omit<VectorPoolMeta, 'underfilled'>;
+  /** #5989: the bounded CJK keyword arm's outcome and wall time (separate from total hybrid latency). */
+  keyword_candidates?: import('./engine-sql/cjk-search.ts').CjkKeywordMeta;
   /**
    * v0.42.3.0 — autocut decision (signal, cut point, kept/total, gapRatio).
    * Omitted when autocut didn't run (no reranker). Surfaced for

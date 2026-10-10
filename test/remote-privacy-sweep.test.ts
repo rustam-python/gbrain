@@ -264,6 +264,7 @@ const EXPECTED_OUTCOME: Record<string, Outcome> = {
   sources_list: 'ok',
   sources_status: 'ok',
   find_orphans: 'ok',
+  wanted_pages: 'ok',
   find_contradictions: 'ok',
   find_experts: 'ok',
   find_trajectory: 'ok',
@@ -335,6 +336,11 @@ const EXPECTED_OUTCOME: Record<string, Outcome> = {
   // mutating ops (fresh-slug targets; envelope-echo checks only)
   remember: 'ok',
   forget: 'error',
+  purge_fact: 'error',
+  list_page_purges: 'error',
+  unpurge_page: 'error',
+  // Owner confirmation needs a memory_confirm grant; the sweep's connection has none (refused before any read).
+  confirm_memory: 'error',
   // rate_answer with no answer_id is a validation error; a real answer id only
   // ever names pages that answer returned to the same client.
   rate_answer: 'error',
