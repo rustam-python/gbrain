@@ -119,6 +119,18 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
    */
   publications: string
   onclose: (connId: number) => void;
+  /**
+   * Called when a pooled or released connection is terminated instead of
+   * reused because its ReadyForQuery status was not idle ('T' or 'E').
+   */
+  onpoisoned: (status: string) => void;
+  /**
+   * GBrain: share the parameter types of a described statement across this pool's
+   * connections, so a connection running it for the first time skips the describe
+   * round trip and keeps pipelining. Only built-in types are shared.
+   * @default true
+   */
+  shared_types: boolean | Map<string, number[]>;
   backoff: boolean | ((attemptNum: number) => number);
   max_lifetime: number | null;
   keep_alive: number | null;
@@ -706,6 +718,8 @@ declare namespace postgres {
 
     options: ParsedOptions<TTypes>;
     parameters: ConnectionParameters;
+    /** GBrain: the pool's own queue lengths at this instant (`queued` = queries waiting for a connection). */
+    pool: { max: number; open: number; busy: number; full: number; reserved: number; connecting: number; closed: number; ended: number; queued: number };
 
     end(options?: { timeout?: number | undefined } | undefined): Promise<void>;
 

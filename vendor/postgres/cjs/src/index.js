@@ -68,6 +68,20 @@ function Postgres(a, b) {
 
   Object.assign(sql, {
     get parameters() { return options.parameters },
+    // GBrain: the pool's own queue lengths, read-only, for the consumer's pool diagnostics (#6317).
+    get pool() {
+      return {
+        max: options.max,
+        open: open.length,
+        busy: busy.length,
+        full: full.length,
+        reserved: reserved.length,
+        connecting: connecting.length,
+        closed: closed.length,
+        ended: ended.length,
+        queued: queries.length
+      }
+    },
     largeObject: largeObject.bind(null, sql),
     subscribe,
     CLOSE,
@@ -273,7 +287,7 @@ function Postgres(a, b) {
       if (!busy) {
         if (releasing) {
           c.reserved = null
-          onopen(c)
+          onopen(c, true)
         } else {
           move(c, reserved)
         }
@@ -449,7 +463,7 @@ function Postgres(a, b) {
     return new Promise((resolve, reject) => {
       query.state
         ? query.active
-          ? Connection(options).cancel(query.state, resolve, reject)
+          ? cancelActive(query, resolve, reject)
           : query.cancelled = { resolve, reject }
         : (
           queries.remove(query),
@@ -458,6 +472,25 @@ function Postgres(a, b) {
           resolve()
         )
     })
+  }
+
+  function cancelActive(query, resolve, reject, delay = 50) {
+    Connection(options).cancel(query.state, () => {
+      if (!query.active)
+        return resolve()
+      let waiting = true
+      const timer = setTimeout(next, delay)
+      Promise.prototype.then.call(query, next, next)
+      function next() {
+        if (!waiting)
+          return
+        waiting = false
+        clearTimeout(timer)
+        query.active
+          ? cancelActive(query, resolve, reject, Math.min(delay * 2, 1000))
+          : resolve()
+      }
+    }, reject)
   }
 
   async function end({ timeout = null } = {}) {
@@ -496,7 +529,9 @@ function Postgres(a, b) {
     move(c, ended)
   }
 
-  function onopen(c) {
+  function onopen(c, released) {
+    if (c.status && c.status !== 73 && (released || options.max !== 1)) // not I
+      return poisoned(c)
     if (ending) {
       while (queries.length)
         queries.shift().reject(Errors.connection('CONNECTION_ENDED', options))
@@ -519,6 +554,16 @@ function Postgres(a, b) {
     ready
       ? move(c, busy)
       : move(c, full)
+  }
+
+  function poisoned(c) {
+    if (c.queue === ended)
+      return
+    move(c, ended)
+    try {
+      options.onpoisoned && options.onpoisoned(String.fromCharCode(c.status))
+    } catch (_) {}
+    c.terminate()
   }
 
   function onclose(c, e) {
@@ -604,6 +649,8 @@ function parseOptions(a, b) {
     onnotice        : o.onnotice,
     onnotify        : o.onnotify,
     onclose         : o.onclose,
+    onpoisoned      : o.onpoisoned,
+    shared_types    : o.shared_types === false ? null : o.shared_types instanceof Map ? o.shared_types : new Map(),
     onparameter     : o.onparameter,
     socket          : o.socket,
     transform       : parseTransform(o.transform || { undefined: undefined }),

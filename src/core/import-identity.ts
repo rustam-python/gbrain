@@ -7,8 +7,8 @@ import { existsSync, realpathSync } from 'fs';
 import { basename, resolve, sep } from 'path';
 import type { BrainEngine } from './engine.ts';
 import type { Page } from './types.ts';
-import { slugifyPath } from './sync.ts';
 import type { TwinCheck } from './sync-twins.ts';
+import { slugifyPath } from './sync.ts';
 
 export interface ImportIdentityInput {
   sourceId: string;
@@ -20,7 +20,7 @@ export interface ImportIdentityInput {
   /** Repo-relative path and the directory it is relative to, when importing a file. */
   sourcePath?: string;
   sourceRoot?: string;
-  /** Old-slug twins this full sync retires are not duplicates: look past them (#6). */
+  /** Tells a full sync's old-slug twins apart from a real duplicate (#6). */
   isRetiredTwin?: TwinCheck;
 }
 
@@ -53,24 +53,23 @@ export async function decideImportIdentity(engine: BrainEngine, input: ImportIde
   if (!engine.findDuplicatePage) return { kind: 'none' };
   let dup: { slug: string; id: number } | null;
   let dupPage: Page | null = null;
-  // Old-slug twins a full sync retires are not duplicates: look past them (#6).
+  // An old-slug twin this full sync retires is not a duplicate: look past it (#6).
   const twins: string[] = [];
   for (;;) {
     try {
-      dup = await engine.findDuplicatePage(input.sourceId, {
-        hash: input.hash, frontmatterId: input.frontmatterId, excludeSlug: input.slug, excludeSlugs: twins,
-      });
+      dup = await engine.findDuplicatePage(input.sourceId, { hash: input.hash, frontmatterId: input.frontmatterId, excludeSlug: input.slug, excludeSlugs: twins });
     } catch (err) {
       throw new Error(
         `[import] dedup pre-check failed for ${input.sourcePath ?? input.slug}: ` +
         `${(err as Error).message}. Re-run import after DB recovery.`
       );
     }
-    if (!dup) return { kind: 'none' };
+    if (!dup) break;
     dupPage = await engine.getPage(dup.slug, { sourceId: input.sourceId });
     if (!dupPage || !input.sourcePath || !input.isRetiredTwin?.(dupPage, { slug: input.slug, sourcePath: input.sourcePath })) break;
     twins.push(dup.slug);
   }
+  if (!dup) return { kind: 'none' };
   const dupFmId = (dupPage?.frontmatter as Record<string, unknown> | undefined)?.id;
   const sameExternalId = input.frontmatterId !== null && dupFmId === input.frontmatterId;
   if (!sameExternalId) return { kind: 'shared_hash', dupSlug: dup.slug };

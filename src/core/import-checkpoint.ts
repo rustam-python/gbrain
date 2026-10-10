@@ -24,6 +24,10 @@ import { SLUG_GRAMMAR_VERSION } from './cjk.ts';
  * `processFile` returns successfully, the completed set is keyed by the
  * relative path string (sort-order-agnostic), and failed files never
  * enter the set.
+ *
+ * Persisted paths record progress, not the imported revision. Resume must
+ * re-check files through importFile's content_hash comparison: neither path
+ * membership nor an mtime before the checkpoint flush proves unchanged content.
  */
 export interface ImportCheckpoint {
   /** Checkpoint payload schema. v1 is path-based with explicit producer metadata. */

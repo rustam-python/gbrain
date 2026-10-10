@@ -25,6 +25,20 @@ async function removedRowIds(engine: BrainEngine, page: TimelinePage): Promise<S
   return new Set(removed.map(row => Number(row.id)));
 }
 
+async function classifyTimelinePage(engine: BrainEngine, page: TimelinePage) {
+  return pendingTimelineRows(engine, { ...page, timeline: page.timeline ?? '' }, await removedRowIds(engine, page));
+}
+
+/** Current counts for specific pages (doctor rechecks pages an earlier run of a multi-run pass found). */
+export async function recountTimelinePages(engine: BrainEngine, sourceIds: string[], ids: number[]) {
+  if (ids.length === 0) return [];
+  const pages = await engine.executeRaw<TimelinePage>(`SELECT p.id,p.source_id,p.slug,p.compiled_truth,p.timeline FROM pages p
+    WHERE p.id = ANY($1::bigint[]) AND p.source_id=ANY($2::text[]) AND p.deleted_at IS NULL`, [ids, sourceIds]);
+  const counted = [];
+  for (const page of pages) counted.push({ id: page.id, ...await classifyTimelinePage(engine, page) });
+  return counted;
+}
+
 /**
  * Pages carrying non-event timeline rows, in id order after `afterId`, each
  * classified exactly. `budget` caps the pages inspected (doctor's bound).
@@ -41,14 +55,14 @@ export async function scanTimelineHistory(engine: BrainEngine, sourceIds: string
     for (const page of batch) {
       if ((budget.pages !== undefined && inspected >= budget.pages) || (budget.deadline !== undefined && Date.now() > budget.deadline)) {
         truncated = true;
-        return { pages, inspected, truncated };
+        return { pages, inspected, truncated, cursor };
       }
       inspected++;
       cursor = page.id;
-      const counts = await pendingTimelineRows(engine, { ...page, timeline: page.timeline ?? '' }, await removedRowIds(engine, page));
+      const counts = await classifyTimelinePage(engine, page);
       if (counts.materializable || counts.unrenderable) pages.push({ ...page, ...counts });
     }
-    if (batch.length < BATCH) return { pages, inspected, truncated };
+    if (batch.length < BATCH) return { pages, inspected, truncated, cursor };
   }
 }
 
@@ -58,7 +72,13 @@ export const timelineRepair: RepairHandler = {
     const { pages } = await scanTimelineHistory(engine, scope.source_ids, after?.id ?? 0);
     const items: RepairItem[] = pages.filter(p => p.materializable > 0).map(p => ({ cursor: { phase: 0, id: p.id }, source_id: p.source_id,
       slug: p.slug, chars: p.compiled_truth.length + (p.timeline ?? '').length, action: `materialize ${p.materializable} row(s)` }));
-    return { items, residuals: {
+    const [{ n: markup }] = await engine.executeRaw<{ n: number }>(`SELECT count(*)::int AS n FROM timeline_entries t JOIN pages p ON p.id=t.page_id
+      WHERE p.source_id=ANY($1::text[]) AND p.deleted_at IS NULL AND t.event_page_id IS NULL
+        AND (t.summary LIKE '%<!--%' OR t.summary LIKE '%-->%' OR t.source LIKE '%<!--%' OR t.source LIKE '%-->%')`, [scope.source_ids]);
+    // #6184: such rows are never rendered back (they would duplicate a section END marker); name the cleanup.
+    const warnings = markup ? [`timeline_comment_markup: ${markup} timeline row(s) carry HTML comment markup and stay database-side; `
+      + `preview the cleanup with gbrain repair timeline-comments${scope.source_ids.length === 1 ? ` --source ${scope.source_ids[0]}` : ''}.`] : [];
+    return { ...(warnings.length ? { warnings } : {}), items, residuals: {
       materializable_rows: pages.reduce((n, p) => n + p.materializable, 0),
       kept_unrenderable_rows: pages.reduce((n, p) => n + p.unrenderable, 0),
     } };
