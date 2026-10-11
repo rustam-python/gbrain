@@ -58,6 +58,7 @@ const EXEMPT: Record<string, string> = {
   'src/core/schema-pack/page-to-link.ts': 'schema-pack retype of existing pages',
   'src/core/schema-pack/retype.ts': 'schema-pack retype of existing pages',
   'src/core/schema-pack/sync.ts': 'schema-pack sync of existing pages',
+  'src/core/sync-twins.ts': 'retires a superseded old-slug twin (soft delete plus alias redirect); writes no content',
   'src/core/sweep.ts': 're-derives links and timeline rows from stored page text',
   'src/core/takes-write.ts': 'shared fence helpers; the takes_* verbs gate in takes-prepare.ts',
   'src/core/timeline-dedup-repair.ts': 'owner repair deduplicating existing timeline rows',

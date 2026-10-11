@@ -325,6 +325,9 @@ jobs:
       # timeout, self-skip) as one JUnit testcase; logs stay on failure.
       - run: bun run verify
         env:
+          # Fork: ubuntu-latest has 2 vCPUs; tsc exceeds the default 120 s cap there.
+          GBRAIN_VERIFY_TIMEOUT: '480'
+        env:
           GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
           GBRAIN_VERIFY_LOG_DIR: ${{ runner.temp }}/verify-logs
       - name: Upload verify logs
@@ -705,6 +708,8 @@ jobs:
         env:
           COVERAGE_DIR: ${{ runner.temp }}/coverage
           GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+          # Fork: slower GitHub-hosted runners; the gate's p95 budget is 5 ms on a quiet machine.
+          GBRAIN_WRITE_GATE_P95_MS: '25'
       - name: Upload receipts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
