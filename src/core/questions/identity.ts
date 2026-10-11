@@ -24,6 +24,7 @@ export function normalizeQuestion(question: string): string {
 
 export function questionSlug(question: string, scope: QuestionScope): string {
   const norm = normalizeQuestion(question);
+  // gbrain-allow-ascii-class: question id kebab kept as upstream mints it (fork sync); revisit if question ids should keep non-Latin text
   const kebab = norm.toLowerCase().replace(/[^a-z0-9\s-]+/g, '').trim().replace(/[\s-]+/g, '-').slice(0, 60).replace(/-+$/, '') || 'question';
   const digest = createHash('sha256')
     .update([norm.toLowerCase(), scope.slug_prefix ?? '', scope.entity ?? ''].join('\n'))

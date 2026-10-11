@@ -2652,7 +2652,7 @@
       "findDuplicatePage": {
         "default": [
           {
-            "paramCount": 7,
+            "paramCount": 8,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,

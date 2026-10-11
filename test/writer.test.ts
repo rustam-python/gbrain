@@ -584,8 +584,8 @@ describe('link validator', () => {
     });
     const errors = findings.filter(f => f.severity === 'error').map(f => f.message);
     expect(errors).toEqual([
-      'Dangling wikilink to notes/v2.0.0 (no such page)',
-      'Dangling wikilink to people/алиса (no such page)',
+      'Dangling wikilink to notes/v2.0.0 (no such page; ../notes/v2.0.0.md from people/bob resolves there)',
+      'Dangling wikilink to people/алиса (no such page; ../people/%D0%B0%D0%BB%D0%B8%D1%81%D0%B0.md from people/bob resolves there)',
     ]);
     expect(findings.filter(f => f.severity === 'warning').map(f => f.message))
       .toEqual(['Unresolvable link path: images/photo.png']);

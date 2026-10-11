@@ -47,7 +47,11 @@ export const linkValidator: PageValidator = {
         continue;
       }
 
-      const slug = resolveMarkdownLinkSlug(ctx.slug, href.trim());
+      // Without `.md` a dotted last segment is a file (`images/photo.png`), not a
+      // page (#24): a warning, never a dangling-page error.
+      const hrefPath = href.trim().split('#')[0]!;
+      const isFileRef = !/\.md$/i.test(hrefPath) && /\.[^/.]+$/.test(hrefPath);
+      const slug = isFileRef ? null : resolveMarkdownLinkSlug(ctx.slug, href.trim());
       if (!slug) {
         findings.push({
           slug: ctx.slug,

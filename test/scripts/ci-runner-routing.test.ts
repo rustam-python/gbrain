@@ -20,7 +20,10 @@ const arm = 'ubicloud-standard-4-arm-ubuntu-2404';
 const targetRunners = (job: Job) =>
   JSON.parse(/fromJSON\('([^']+)'\)\[matrix\.target\]/.exec(job['runs-on']!)![1]!) as Record<string, string>;
 
-describe('CI runner routing', () => {
+// Fork: workflows run on GitHub-hosted runners (no Ubicloud account), so the
+// upstream runner-label topology pinned here does not apply. Re-enable if the
+// fork ever returns to Ubicloud labels.
+describe.skip('CI runner routing', () => {
   test('owned Linux validation jobs use Ubicloud without moving release publishing', () => {
     for (const file of ['test.yml', 'e2e.yml', 'heavy-tests.yml', 'persistence-validation.yml', 'native-locks.yml', 'actionlint.yml', 'semgrep.yml']) {
       for (const job of Object.values(load(file).jobs)) {

@@ -200,10 +200,11 @@
               "null",
               "null",
               "null",
+              "array<>",
               "null"
             ],
-            "sql": "SELECT id, slug FROM pages WHERE source_id = $1 AND deleted_at IS NULL AND (content_hash = $2 OR (frontmatter->>'id' = $3 AND $4::text IS NOT NULL)) AND ($5::text IS NULL OR slug <> $6) ORDER BY (frontmatter->>'id' IS NOT DISTINCT FROM $7::text) DESC, id LIMIT 1",
-            "textSha256": "1ece124de02722699feb88aa18049e77476ae35cf2d6265d5e74884c6b99ab2f"
+            "sql": "SELECT id, slug FROM pages WHERE source_id = $1 AND deleted_at IS NULL AND (content_hash = $2 OR (frontmatter->>'id' = $3 AND $4::text IS NOT NULL)) AND ($5::text IS NULL OR slug <> $6) AND NOT (slug = ANY($7::text[])) ORDER BY (frontmatter->>'id' IS NOT DISTINCT FROM $8::text) DESC, id LIMIT 1",
+            "textSha256": "b989143a6628093ec5e56eb84ad32649661064c0681f758c68592292c40868fd"
           }
         ]
       },

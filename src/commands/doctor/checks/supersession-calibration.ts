@@ -23,6 +23,7 @@ const SCRIPT = resolve(import.meta.dir, '../../../../scripts/eval-c2-candidate-f
 
 /** Calibrate (paid, ask first: embeds the fixture, then sweeps for free) → register the guarded pick. */
 function calibrationFix(model: string, dims: number, key: string, overrides: Record<string, unknown>): Action {
+  // gbrain-allow-ascii-class: machine identifier in a temp filename, ASCII is intended
   const out = join(tmpdir(), `gbrain-supersession-${key.replace(/[^a-z0-9]+/gi, '-')}.json.gz`);
   const register = JSON.stringify({ ...overrides, [key]: '<THRESHOLD>' }).replace('"<THRESHOLD>"', 'THRESHOLD');
   return {

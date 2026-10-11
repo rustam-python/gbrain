@@ -85,7 +85,7 @@
           "findAnomalies: (opts: AnomaliesOpts) => Promise<AnomalyResult[]>",
           "findByTitleFuzzy: (name: string, dirPrefix?: string, minSimilarity?: number, sourceId?: string) => Promise<{ slug: string; similarity: number; } | null>",
           "findCandidateDuplicates: (source_id: string, entitySlug: string, factText: string, opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; arm?: \"keyword\"; attributedTo?: FactAttribution | null; }) => Promise<FactRow[]>",
-          "findDuplicatePage?: ((sourceId: string, opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string; }) => Promise<{ slug: string; id: number; } | null>) | undefined",
+          "findDuplicatePage?: ((sourceId: string, opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string; excludeSlugs?: string[]; }) => Promise<{ slug: string; id: number; } | null>) | undefined",
           "findDuplicatePages?: ((sourceId: string, inputs: ReadonlyArray<{ hash: string; frontmatterId?: string | null; excludeSlug?: string; }>) => Promise<Array<{ slug: string; id: number; } | null>>) | undefined",
           "findOntologyConflicts: (opts?: PageReadScope & { minConfidence?: number; visibility?: OntologyReadOpts[\"visibility\"]; }) => Promise<OntologyConflict[]>",
           "findOrphanPages: (opts?: PageReadScope & { sourceId?: string; sourceIds?: string[]; mode?: \"inbound\" | \"islanded\"; }) => Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string; }>>",
@@ -1049,7 +1049,7 @@
           "findAnomalies: (opts: AnomaliesOpts) => Promise<AnomalyResult[]>",
           "findByTitleFuzzy: (name: string, dirPrefix?: string, minSimilarity?: number, sourceId?: string) => Promise<{ slug: string; similarity: number; } | null>",
           "findCandidateDuplicates: (source_id: string, entitySlug: string, factText: string, opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; arm?: \"keyword\"; attributedTo?: FactAttribution | null; }) => Promise<FactRow[]>",
-          "findDuplicatePage: (sourceId: string, opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string; }) => Promise<{ slug: string; id: number; } | null>",
+          "findDuplicatePage: (sourceId: string, opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string; excludeSlugs?: string[]; }) => Promise<{ slug: string; id: number; } | null>",
           "findDuplicatePages: (sourceId: string, inputs: Parameters<typeof findDuplicatePages>[2]) => Promise<({ slug: string; id: number; } | null)[]>",
           "findOntologyConflicts: (opts?: PageReadScope & { minConfidence?: number; visibility?: OntologyReadOpts[\"visibility\"]; }) => Promise<OntologyConflict[]>",
           "findOrphanPages: (opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; mode?: \"inbound\" | \"islanded\"; }) => Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string; }>>",
@@ -3282,7 +3282,7 @@
           "findAnomalies: (opts: AnomaliesOpts) => Promise<AnomalyResult[]>",
           "findByTitleFuzzy: (name: string, dirPrefix?: string, minSimilarity?: number, sourceId?: string) => Promise<{ slug: string; similarity: number; } | null>",
           "findCandidateDuplicates: (source_id: string, entitySlug: string, factText: string, opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; arm?: \"keyword\"; attributedTo?: FactAttribution | null; }) => Promise<FactRow[]>",
-          "findDuplicatePage?: ((sourceId: string, opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string; }) => Promise<{ slug: string; id: number; } | null>) | undefined",
+          "findDuplicatePage?: ((sourceId: string, opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string; excludeSlugs?: string[]; }) => Promise<{ slug: string; id: number; } | null>) | undefined",
           "findDuplicatePages?: ((sourceId: string, inputs: ReadonlyArray<{ hash: string; frontmatterId?: string | null; excludeSlug?: string; }>) => Promise<Array<{ slug: string; id: number; } | null>>) | undefined",
           "findOntologyConflicts: (opts?: PageReadScope & { minConfidence?: number; visibility?: OntologyReadOpts[\"visibility\"]; }) => Promise<OntologyConflict[]>",
           "findOrphanPages: (opts?: PageReadScope & { sourceId?: string; sourceIds?: string[]; mode?: \"inbound\" | \"islanded\"; }) => Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string; }>>",
@@ -4568,21 +4568,21 @@
         "kind": "variable",
         "name": "importFile",
         "signature": [
-          "(engine: BrainEngine, filePath: string, relativePath: string, opts?: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string; forceRechunk?: boolean; activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string>; }>; }; firstCommitAt?: Date; }) => Promise<ImportResult>"
+          "(engine: BrainEngine, filePath: string, relativePath: string, opts?: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string; forceRechunk?: boolean; isRetiredTwin?: TwinCheck; activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string>; }>; }; firstCommitAt?: Date; }) => Promise<ImportResult>"
         ]
       },
       {
         "kind": "function",
         "name": "importFromContent",
         "signature": [
-          "(engine: BrainEngine, slug: string, content: string, opts?: { prepare?: (prepared: PreparedContentImport) => Promise<ImportResult>; coordinated?: boolean; existingSnapshot?: PageSnapshot | null; prepareFrontmatter?: (page: ParsedPage) => void; noEmbed?: boolean; sourceId?: string; filename?: string; sourcePath?: string; sourceRoot?: string; fileTimes?: { birthtime?: Date; mtime?: Date; firstCommit?: Date; }; forceRechunk?: boolean; activePack?: ParseOpts[\"activePack\"]; source_kind?: string | null; source_uri?: string | null; ingested_via?: string | null; remote?: boolean; preserveGateMarkers?: boolean; allowEmptyOverwrite?: boolean; overrideTier?: unknown; writeGate?: WriteGateInput; beforeCommit?: (tx: BrainEngine, slug: string) => Promise<void>; onPostCommitEmbedding?: (complete: () => Promise<ImportEmbeddingResult>) => void; } & ImportFenceOptions) => Promise<ImportResult>"
+          "(engine: BrainEngine, slug: string, content: string, opts?: { prepare?: (prepared: PreparedContentImport) => Promise<ImportResult>; coordinated?: boolean; existingSnapshot?: PageSnapshot | null; prepareFrontmatter?: (page: ParsedPage) => void; noEmbed?: boolean; sourceId?: string; filename?: string; sourcePath?: string; isRetiredTwin?: TwinCheck; sourceRoot?: string; fileTimes?: { birthtime?: Date; mtime?: Date; firstCommit?: Date; }; forceRechunk?: boolean; activePack?: ParseOpts[\"activePack\"]; source_kind?: string | null; source_uri?: string | null; ingested_via?: string | null; remote?: boolean; preserveGateMarkers?: boolean; allowEmptyOverwrite?: boolean; overrideTier?: unknown; writeGate?: WriteGateInput; beforeCommit?: (tx: BrainEngine, slug: string) => Promise<void>; onPostCommitEmbedding?: (complete: () => Promise<ImportEmbeddingResult>) => void; } & ImportFenceOptions) => Promise<ImportResult>"
         ]
       },
       {
         "kind": "function",
         "name": "importFromFile",
         "signature": [
-          "(engine: BrainEngine, filePath: string, relativePath: string, opts?: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string; forceRechunk?: boolean; activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string>; }>; }; firstCommitAt?: Date; }) => Promise<ImportResult>"
+          "(engine: BrainEngine, filePath: string, relativePath: string, opts?: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string; forceRechunk?: boolean; isRetiredTwin?: TwinCheck; activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string>; }>; }; firstCommitAt?: Date; }) => Promise<ImportResult>"
         ]
       },
       {
@@ -6299,7 +6299,7 @@
           "findAnomalies: (opts: AnomaliesOpts) => Promise<AnomalyResult[]>",
           "findByTitleFuzzy: (name: string, dirPrefix?: string, minSimilarity?: number, sourceId?: string) => Promise<{ slug: string; similarity: number; } | null>",
           "findCandidateDuplicates: (source_id: string, entitySlug: string, factText: string, opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; arm?: \"keyword\"; attributedTo?: FactAttribution | null; }) => Promise<FactRow[]>",
-          "findDuplicatePage: (sourceId: string, opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string; }) => Promise<{ slug: string; id: number; } | null>",
+          "findDuplicatePage: (sourceId: string, opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string; excludeSlugs?: string[]; }) => Promise<{ slug: string; id: number; } | null>",
           "findDuplicatePages: (sourceId: string, inputs: Parameters<typeof pagesImpl.findDuplicatePages>[2]) => Promise<({ slug: string; id: number; } | null)[]>",
           "findOntologyConflicts: (opts?: PageReadScope & { minConfidence?: number; visibility?: OntologyReadOpts[\"visibility\"]; }) => Promise<OntologyConflict[]>",
           "findOrphanPages: (opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; mode?: \"inbound\" | \"islanded\"; }) => Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string; }>>",
@@ -7814,6 +7814,13 @@
         "name": "stripGapsSection",
         "signature": [
           "(answer: string) => string"
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "synthesisSlug",
+        "signature": [
+          "(question: string, date: string) => string"
         ]
       }
     ],
