@@ -389,7 +389,7 @@ exit 0
   it("typecheck runs on every platform: only the macOS 26 workflow raises the per-check cap, Linux keeps 120 s (#6056)", () => {
     const workflows = readdirSync(".github/workflows").filter((f) => /\.ya?ml$/.test(f));
     const read = (f: string) => readFileSync(join(".github/workflows", f), "utf8");
-    expect(workflows.filter((f) => read(f).includes("GBRAIN_VERIFY_TIMEOUT"))).toEqual(["macos-validation.yml"]);
+    expect(workflows.filter((f) => read(f).includes("GBRAIN_VERIFY_TIMEOUT"))).toEqual(["macos-validation.yml", "test.yml"]); // fork: test.yml raises the cap too (2-vCPU GitHub-hosted runner)
     const mac = read("macos-validation.yml");
     expect(mac).toMatch(/^\s+runs-on: macos-26$/m);
     expect(mac).toMatch(/^\s+GBRAIN_VERIFY_TIMEOUT: '240'$/m);
@@ -399,7 +399,7 @@ exit 0
     const testYml = read("test.yml");
     const verifyJob = testYml.slice(testYml.indexOf("\n  verify:\n"), testYml.indexOf("\n  verify:\n") + 4000);
     expect(verifyJob).toContain("- run: bun run verify");
-    expect(verifyJob).toMatch(/runs-on: ubicloud-standard-\d+-ubuntu/);
+    expect(verifyJob).toMatch(/runs-on: (ubicloud-standard-\d+-ubuntu|ubuntu-latest)/);
     const dry = spawnSync("bash", [SCRIPT, "--dry-list"], { encoding: "utf8" }).stdout.split("\n");
     expect(dry).toContain("typecheck");
     const pkgScripts = (JSON.parse(readFileSync("package.json", "utf8")) as { scripts: Record<string, string> }).scripts;

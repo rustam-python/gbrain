@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { runInNewContext } from 'node:vm';
 import { load as loadYaml } from 'js-yaml';
@@ -20,7 +20,20 @@ const arm = 'ubicloud-standard-4-arm-ubuntu-2404';
 const targetRunners = (job: Job) =>
   JSON.parse(/fromJSON\('([^']+)'\)\[matrix\.target\]/.exec(job['runs-on']!)![1]!) as Record<string, string>;
 
-describe('CI runner routing', () => {
+// Fork: workflows run on GitHub-hosted runners (no Ubicloud account), so the
+// upstream runner-label topology pinned here does not apply. Re-enable if the
+// fork ever returns to Ubicloud labels.
+describe('CI runner routing (fork)', () => {
+  test('workflows use GitHub-hosted runners, no Ubicloud labels', () => {
+    const files = readdirSync(join(root, '.github/workflows')).filter(f => f.endsWith('.yml'));
+    expect(files.length).toBeGreaterThan(0);
+    for (const f of files) {
+      expect(readFileSync(join(root, '.github/workflows', f), 'utf8')).not.toContain('ubicloud');
+    }
+  });
+});
+
+describe.skip('CI runner routing', () => {
   test('owned Linux validation jobs use Ubicloud without moving release publishing', () => {
     for (const file of ['test.yml', 'e2e.yml', 'heavy-tests.yml', 'persistence-validation.yml', 'native-locks.yml', 'actionlint.yml', 'semgrep.yml']) {
       for (const job of Object.values(load(file).jobs)) {

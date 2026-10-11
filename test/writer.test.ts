@@ -584,8 +584,8 @@ describe('link validator', () => {
     });
     const errors = findings.filter(f => f.severity === 'error').map(f => f.message);
     expect(errors).toEqual([
-      'Dangling wikilink to notes/v2.0.0 (no such page)',
-      'Dangling wikilink to people/алиса (no such page)',
+      'Dangling wikilink to notes/v2.0.0 (no such page; ../notes/v2.0.0.md from people/bob resolves there)',
+      'Dangling wikilink to people/алиса (no such page; ../people/%D0%B0%D0%BB%D0%B8%D1%81%D0%B0.md from people/bob resolves there)',
     ]);
     expect(findings.filter(f => f.severity === 'warning').map(f => f.message))
       .toEqual(['Unresolvable link path: images/photo.png']);
@@ -667,6 +667,28 @@ describe('link validator', () => {
     expect(findings).toHaveLength(1);
     expect(findings[0].severity).toBe('error');
     expect(findings[0].message).toContain('people/борис-пример');
+  });
+
+  test('#6266: links resolve against the linking page directory, exactly like the extractor', async () => {
+    const put = (slug: string) => engine.putPage(slug, { type: 'concept', title: slug, compiled_truth: 'x', frontmatter: {} });
+    await put('wiki/concepts/x');
+    await put('wiki/sources/sibling');
+    await put('people/alice');
+    const check = (slug: string, compiledTruth: string) =>
+      linkValidator.validate({ slug, type: 'concept', compiledTruth, timeline: '', frontmatter: {}, engine });
+
+    // A correct nested link: no finding (master strips ../ and looks up concepts/x).
+    expect(await check('wiki/sources/foo', 'See [x](../concepts/x.md).')).toEqual([]);
+    // Wrong depth: master accepts it; the extractor resolves it to concepts/x, which doesn't exist.
+    const wrong = await check('wiki/sources/foo', 'See [x](../../concepts/x.md) and [y](../../wiki/concepts/x.md).');
+    expect(wrong).toHaveLength(1);
+    expect(wrong[0]!.severity).toBe('error');
+    expect(wrong[0]!.message).toContain('Dangling wikilink to concepts/x');
+    expect(wrong[0]!.message).toContain('../../concepts/x.md');
+    // A ./ sibling resolves in the page's own directory.
+    expect(await check('wiki/sources/foo', 'See [s](./sibling.md).')).toEqual([]);
+    // Flat brain: one level down, ../ lands at the root.
+    expect(await check('meetings/m', 'Met [Alice](../people/alice.md).')).toEqual([]);
   });
 
   test('ignores links inside fenced code', async () => {
