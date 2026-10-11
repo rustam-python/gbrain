@@ -325,11 +325,10 @@ jobs:
       # timeout, self-skip) as one JUnit testcase; logs stay on failure.
       - run: bun run verify
         env:
-          # Fork: ubuntu-latest has 2 vCPUs; tsc exceeds the default 120 s cap there.
-          GBRAIN_VERIFY_TIMEOUT: '480'
-        env:
           GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
           GBRAIN_VERIFY_LOG_DIR: ${{ runner.temp }}/verify-logs
+          # Fork: ubuntu-latest has 2 vCPUs; tsc exceeds the default 120 s cap there.
+          GBRAIN_VERIFY_TIMEOUT: '480'
       - name: Upload verify logs
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
