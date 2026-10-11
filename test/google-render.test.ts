@@ -157,6 +157,13 @@ describe('isNoiseSender', () => {
     expect(isNoiseSender('alice@example.com')).toBe(false);
     expect(isNoiseSender('replies-welcome@example.com')).toBe(false);
   });
+
+  test('#5103: Google system senders match by exact address, never by substring', () => {
+    expect(isNoiseSender('gemini-notes@google.com')).toBe(true);
+    expect(isNoiseSender('Gemini-Notes@Google.com')).toBe(true);
+    expect(isNoiseSender('gemini-notes@google.com.evil.example')).toBe(false);
+    expect(isNoiseSender('not-gemini-notes@google.com')).toBe(false);
+  });
 });
 
 describe('isCalendarSystemMail', () => {
@@ -473,6 +480,13 @@ describe('personSlugFromContact', () => {
     expect(personSlugFromContact(contact({ displayName: 'Алиса Пример' }))).toBe('people/алиса-пример');
     expect(personSlugFromContact(contact({ displayName: 'Алёна Йорк-Пример' }))).toBe('people/алёна-йорк-пример');
     expect(personSlugFromContact(contact({ displayName: 'Zoë Exámple' }))).toBe('people/zoe-example');
+  });
+
+  test('#4845: the contacts directory is a parameter, default people/', () => {
+    expect(personSlugFromContact(contact(), false, 'contacts')).toBe('contacts/alice-example');
+    expect(personSlugFromContact(contact(), true, 'google/contacts')).toMatch(/^google\/contacts\/alice-example-[0-9a-f]{8}$/);
+    expect(renderPersonPage(contact(), false, 'contacts')?.relPath).toBe('contacts/alice-example.md');
+    expect(renderPersonPage(contact())?.relPath).toBe('people/alice-example.md');
   });
 });
 
