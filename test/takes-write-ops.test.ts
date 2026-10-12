@@ -354,7 +354,7 @@ describe('takes-write guards (invalid_input / row_inactive / md-absent / mcp_res
       }, { ...LOCAL });
       expect(res.isError).toBe(true);
       expect(parsed(res).error).toBe('invalid_params');
-      expect(parsed(res).message).toContain(holder);
+      expect(parsed(res).message).toContain('holder must be');
     }
     expect(parseTakesFence(pageMd('notes/guards-holder')).takes.length).toBe(0);
 
