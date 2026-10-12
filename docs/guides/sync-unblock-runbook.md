@@ -92,7 +92,7 @@ Every hold and error has three fields, from one table
 | `file_too_large` | page | none | yes | always |
 | `content_rejected` | page | none | yes | always |
 | `parser_regression` | page | upgrade | yes | always: a gbrain bug |
-| `managed_image_sync_unsupported` | page | none | no | never: images stay held by design |
+| `managed_image_sync_unsupported` | page | none | no | never: images stay held while multimodal embedding is off |
 | `revision_conflict` | page | retry | no | the same path fails again after a rerun |
 | `page_identity_changed` | page | retry | no | the same path fails again after a rerun |
 | `pinned_git_worktree_conflict` | page | retry | no | the same path fails again after a rerun |
@@ -112,6 +112,13 @@ Every hold and error has three fields, from one table
 | `plan_stale` | systemic | none | yes | always |
 | `invalid_params` | systemic | none | yes | always |
 <!-- sync-fault-table:end -->
+
+A `cancelled` error whose group was released by a lane fault (`lock_timeout`
+or `statement_timeout` on a parallel publish lane) also carries that fault as
+`last_error.detail`, and the cancelled rows keep it as their `blocked_reason`
+(`lane_lock_timeout`, `lane_statement_timeout`) and in the cancel message.
+The verdict is the same retry; the detail says the database, not the page,
+ended the group.
 
 An unknown code is systemic and human: `gbrain errors <code>` explains it
 offline, `gbrain doctor --json` says what the brain thinks.
