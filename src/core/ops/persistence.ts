@@ -112,11 +112,13 @@ async function publicReceipt(ctx: OperationContext, row: WriteRequest, facts?: W
     processingOptions: intent?.processingOptions, syncOptions: intent?.syncOptions, repoPath: intent?.repoPath }) : null;
   // #5929: a trusted local reader learns when the owner that ran the attempt is on another build.
   const mismatch = ctx.remote === false ? (await import('../persistence/publication-failure.ts')).ownerBuildMismatch(row.error_detail, (await import('../../version.ts')).VERSION) : null;
+  const withdrawn = (await import('../facts/withdrawal.ts')).withdrawnFromDetail(row.error_detail);
   return {
     ...publicWriteReceipt(receiptFor(row, facts)),
     operation: row.operation, source_id: row.source_id, slug: row.slug,
     ...(mismatch ? { owner_build: mismatch } : {}),
     ...(isWriteErrorCode(row.error_code) ? { write_error: row.error_code, write_error_message: writeFailureDiagnostic(row.error_code, row.error_message).message } : {}),
+    ...(withdrawn ? { withdrawn } : {}),
     ...(checkpoint ? { detail: checkpoint.detail, suggestion: checkpoint.suggestion, docs: checkpoint.docs } : {}),
     effects: (await publicEffectsForRequest(ctx.engine, row.id)).map(effect => {
       const hint = effect.reason ? receiptDeliveredHint({ error_code: effect.reason, source_id: row.source_id, slug: row.slug }) : null;
@@ -127,11 +129,11 @@ async function publicReceipt(ctx: OperationContext, row: WriteRequest, facts?: W
 
 function requiredRequestId(value: unknown): string {
   const id = parseWriteRequestId(value);
-  if (!id) throw opError('invalid_params', 'request_id is required.', 'Pass the request_id (a UUID) from the write\'s receipt; list_write_requests shows recent ones.');
+  if (!id) throw opError('invalid_params', 'request_id is required.', 'Pass the request_id you sent with the write, or the one its receipt shows; list_write_requests shows recent ones.');
   return id;
 }
 
-const requestParam = { type: 'string' as const, required: true, description: 'The UUID you sent with the write.' };
+const requestParam = { type: 'string' as const, required: true, description: 'The id you sent, or the receipt\'s.' };
 
 export const persistenceOperations: Operation[] = [
   {
@@ -155,7 +157,7 @@ export const persistenceOperations: Operation[] = [
     name: 'list_write_requests',
     idempotent: true,
     outputRedaction: 'no_stored_text',
-    description: 'List your write receipts in one source, newest first. Use when a request_id was lost.',
+    description: 'List your write receipts in one source, newest first, for a lost request_id.',
     params: {
       source_id: { type: 'string', description: 'Default: yours.' },
       limit: { type: 'number', default: 25, description: '1-100 (default 25).' },

@@ -16,7 +16,7 @@ the row shape per call.
 
 ## `add_timeline_entry`
 
-Append an entry to the canonical Markdown timeline and structured timeline store in one committed write. Exact replay changes neither store.
+Append an entry to the canonical Markdown timeline and structured timeline store in one committed write. Exact replay changes neither store. The receipt returns `bullet`, the rendered Markdown line. There is no update or remove verb: the page is the system of record, so to change or remove an entry read the page with `get_page include_content: true`, replace or delete that bullet with `edit_page` (passing `expected_revision`), and the timeline row follows the page.
 
 | Parameter | Type | Guidance |
 | --- | --- | --- |
@@ -252,10 +252,11 @@ List the skills this agent's brain publishes. A skill is a named prose instructi
 | Parameter | Type | Guidance |
 | --- | --- | --- |
 | `schema_version` | number | Request 2 for the canonical source-qualified sealed catalog; omitted preserves version 1. |
-| `limit` | number | Version 2 page size, 1-100. |
+| `limit` | number | Version 2 page size, 1-100; with `query`, how many ranked skills to return (default 10). |
 | `cursor` | string | Version 2 opaque snapshot cursor. |
 | `source_id` | string | Narrow version 2 enumeration to one permitted source. |
 | `section` | string | Optional: only skills whose routing section matches this exactly. |
+| `query` | string | Full surface, version 1 host catalog only: the task in plain words. Skills are ranked by word overlap over their name, triggers and description (a whole trigger phrase inside the query counts most, then name words, then description words); skills matching nothing are dropped, ties break by name, `limit` caps the list, and each kept entry carries `match: { score, matched_on: trigger \| name \| description }`. Without `query` the catalog is unchanged (name order, every skill, no `match`). On a shared catalog (`schema_version: 2`, or a brain whose shared catalog is active) `query` is refused with `invalid_params` rather than ignored: filter with `section` there. No model call. |
 
 ## `list_write_requests`
 
@@ -322,11 +323,12 @@ Hybrid search with vector + keyword + multi-query expansion. Prefer `query` for 
 
 ## `recall`
 
-MEMORY VERB (v1): retrieve saved facts/snippets — the protocol read verb. Filters hot-memory facts by entity / since / session_id; pass `query` to ALSO run hybrid search over pages (results[] arm); pass `budget_tokens` for server-side packing (response reports budget_used + dropped_count — never trims client-side). Remote callers see visibility=world facts only. Routing: for ONE known person/company/project card use `entity` (zero LLM); for broad questions needing reasoning use `synthesize` (expensive). Branch on structured fields (status/kind/evidence), never on prose. Every response carries protocol_version.
+MEMORY VERB (v1): retrieve saved facts/snippets — the protocol read verb. Filters hot-memory facts by entity / since / session_id, newest first, or ranks them by relevance with `question`; pass `query` to ALSO run hybrid search over pages (results[] arm); pass `budget_tokens` for server-side packing (response reports budget_used + dropped_count — never trims client-side). Remote callers see visibility=world facts only. Routing: for ONE known person/company/project card use `entity` (zero LLM); for broad questions needing reasoning use `synthesize` (expensive). Branch on structured fields (status/kind/evidence), never on prose. Every response carries protocol_version.
 
 | Parameter | Type | Guidance |
 | --- | --- | --- |
 | `entity` | string | Entity slug (canonical). Returns facts about this entity newest first, each labelled with its source_id. Across several granted sources, same-slug entities that no entity-identity group links are different entities: facts comes back empty and ambiguous_entity names each (source_id, entity_slug); pass source_id to read one. |
+| `question` | string | Ranks active facts by relevance to this question (cosine to its embedding plus whole-word term share, +0.1 for a writer-dated fact) instead of newest first. Facts below the admission rule are left out, so an empty facts[] is a valid answer. Each fact carries `relevance` (a ranking score, about 0 to 2.1, not comparable across calls); the response carries `facts_order: "relevance"` and, when ranking ran without full semantic matching, `facts_degraded`. Applies inside `entity`, `session_id`, `since` and `grep`. Does not search pages (`query` does; both may be passed). Rejected with `supersessions` or `include_expired`, and over 2,000 characters (invalid_params, with the corrected call as `fix`). One query embedding per call, shared with a `query` of the same text. |
 | `query` | string | MEMORY_VERBS v1: free-text retrieval over pages (hybrid search arm). Response adds results[] (slug, title, chunk, evidence, create_safety, provenance). Combinable with entity (both arms run). Degrades to keyword-only search when no embedding provider is configured (search_degraded notes it; never an error). |
 | `budget_tokens` | number | MEMORY_VERBS v1: server-side token budget (char/4 estimate). Facts pack first, then results. Response adds budget_tokens, budget_used, dropped_count. |
 | `budget_policy` | string (`facts_first`, `query_first`) | Optional packing order. facts_first (default) packs facts first, then page results. query_first packs the ranked page prefix before facts only with a nonblank query and positive finite budget; a positive budget below one token keeps neither arm. Without a nonblank query and an active budget, packing stays facts_first. Neither policy skips oversized items or truncates. Supplying this option adds budget_packing accounting. Keep fact-focused/entity-filtered questions on facts_first. |
@@ -382,12 +384,16 @@ Fuzzy-resolve a partial slug to matching page slugs
 
 Cheap hybrid search (vector + keyword + RRF) with no LLM expansion. Best for exact known tokens, names, and structured-field lookups. A populated result set is NOT proof of coverage — for concept / synonym / landscape questions use `query` (adds multi-query expansion); for exhaustive enumeration use list_pages pagination. Pass `return_unit` ('window' / 'section' / 'page') for whole evidence instead of chunks; conversation pages already come back whole by default (return_unit 'auto'; 'chunk' opts out). For personal/emotional questions, prefer get_recent_salience or find_anomalies — they surface activity bursts without needing a search term. For code-symbol questions (callers, callees, definitions, blast radius), use code_callers / code_callees / code_def / code_refs instead — those return structural graph data, not text chunks. For agent memory reads (saved facts + budget-packed retrieval), prefer the `recall` verb.
 
+Every call also reports how many pages match the query's keywords (`keyword_total`, `keyword_truncated`; "10000+" past 10,000) in one line after the rows. That count covers keyword (full-text) matches only, not the ranked rows. To list every one of those pages, pass `match: "keyword"`: rows come one per page in keyword-score order with `total`, `truncated` and `next`, a ready-to-send argument object; keep calling with `next` until it is absent. A page whose text did not fit `token_budget` still gets a row, with `evidence_omitted: true`. If the count times out, the line says it is unavailable (degraded stage `keyword_count_unavailable`), never zero.
+
 | Parameter | Type | Guidance |
 | --- | --- | --- |
 | `query` (required) | string | Search text. Exact tokens, names, and structured-field values work best here (e.g. 'acme-example series A'), since this op does no LLM expansion. This is the search text param — there is no `text` or `q` param. |
 | `limit` | number | Max results (default 20) |
-| `offset` | number | Skip first N results (for pagination) |
-| `mode` | string | Search mode (conservative\|balanced\|tokenmax). Local callers only. |
+| `offset` | number | Skip the first N rows of the ranked list (at most 10,000). Hybrid rows are a ranked top-K, so offset paging can miss pages; use `match: "keyword"` and `next` to list every keyword match. |
+| `match` | string (`hybrid`, `keyword`) | `hybrid` (default): ranked top-K rows plus the keyword count line. `keyword`: every page matching the query's keywords (strict full-text match, the same set `keyword_total` counts), paged with `next`. Remote-safe; keyword matching costs less than hybrid. |
+| `cursor` | string | The keyset cursor inside a `match: "keyword"` response's `next`. Send `next` unchanged; a cursor without `match: "keyword"` is refused (`search_cursor_requires_keyword`). |
+| `mode` | string | Search mode (conservative\|balanced\|tokenmax). Local callers only: an agent-facing caller that sets it is refused (`search_mode_local_only`) with a fix naming `match: "keyword"`. |
 | `source_id` | string | Scope search to a single source. Defaults to OperationContext.sourceId (set from CLI --source / GBRAIN_SOURCE / .gbrain-source dotfile); when unset, an unqualified read spans every federated source. Pass '__all__' to span every source for trusted local callers; for remote callers '__all__' spans only your granted sources. |
 | `types` | array | Filter results to pages whose `type` is in this list (e.g. ['person','company']). CLI: --types person,company. Applied at SQL level on every retrieval leg — the same filter `whoknows` uses. Stacks with all other filters. |
 | `snippet_chars` | number | Cap each result's chunk_text at N characters (a "… [truncated]" marker names the get_page recovery move). 0 forces full text. Unset: subagent tool loops default to the agent.search_snippet_chars config (300; 0=full); every other caller gets full text. |
