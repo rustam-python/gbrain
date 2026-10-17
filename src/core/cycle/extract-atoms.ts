@@ -69,7 +69,8 @@ import { createGlobalLlmHaltTracker, haltedClassOf, providerContentBlockReason, 
 import { importFromContent } from '../import-file.ts';
 import { derivedWriteThrough } from './derived-write-through.ts';
 import { serializeMarkdown } from '../markdown.ts';
-import { DEFAULT_EXTRACT_MAX_INPUT_CHARS, extractAtomsInput, inputTruncatedLine, recordPartialDisposition, releasePartialDispositions, resolveExtractAtomsInputCap, stampTranscriptTombstone } from './extract-atoms-input.ts';
+import { DEFAULT_EXTRACT_MAX_INPUT_CHARS, extractAtomsInput, inputTruncatedLine, recordPartialDisposition, releasePartialDispositions, resolveExtractAtomsInputCap, stampTranscriptTombstone, type ExtractAtomsInput, type ExtractAtomsItem } from './extract-atoms-input.ts';
+import { commitExtractionPlan, readPageWatermark } from '../extraction-watermark.ts';
 import { claudeCliSelfSessionIds } from '../ai/providers/claude-cli-scratch.ts';
 import { BudgetExhausted, BudgetTracker, loadPricingOverrides } from '../budget/budget-tracker.ts';
 import type { MaintenanceWriteWait } from '../persistence/maintenance-wait.ts';
@@ -82,8 +83,8 @@ import { throwIfAborted } from '../abort-check.ts';
 import { createHash } from 'crypto';
 import { slugifySegment } from '../sync.ts';
 import { sourceLanguageRule, CONCEPT_LABEL_RULE, isConceptLabel } from './source-language.ts';
-import { resolveTierDefault } from '../model-config.ts';
-import { isUndefinedTableError, warnOncePerProcess } from '../utils.ts';
+import { resolveAlias, resolveTierDefault } from '../model-config.ts';
+import { isMissingSchemaObject, warnOncePerProcess } from '../utils.ts';
 import { utcDate } from './cycle-date.ts';
 import { normalizeForGrounding } from './synthesize-verify.ts';
 import type { TranscriptPageIndex } from '../transcripts/discover.ts';
@@ -634,7 +635,7 @@ export async function tombstonedTranscriptsForHashes(
     );
     return new Set(rows.map(r => transcriptStateKey(r.file_path, r.content_hash)));
   } catch (err) {
-    if (isUndefinedTableError(err)) {
+    if (isMissingSchemaObject(err, 'table', 'extract_atoms_transcript_state')) {
       // Un-migrated brain: the table lands with v146. Once per process, not a
       // full error line on every cycle until the operator migrates.
       warnOncePerProcess('extract_atoms.transcript_state_missing',
@@ -647,33 +648,31 @@ export async function tombstonedTranscriptsForHashes(
   }
 }
 
+export const EXTRACT_ATOMS_MODEL_KEY = 'models.dream.extract_atoms';
+
 /**
- * The exact two-step model resolution `runPhaseExtractAtoms` uses:
- * `models.dream.extract_atoms` DB config wins if set (same plain-`||`
- * truthiness as always — a whitespace-only value IS "configured"), else the
- * key-aware `resolveTierDefault('utility')`. Deliberately NOT
- * `resolveModel()`'s fuller chain (which also honors `models.tier.utility`,
- * `models.default`, and an env var) — extract_atoms has never read those, and
- * unifying the two behaviors is a separate, larger change. Exported so
- * `gbrain models` can report the actual routing instead of a generic chain
- * that can diverge from it in partially-configured installs; `source` comes
- * from the SAME call as `model` so the report's attribution can never
- * disagree with the resolved value. Fail-soft: a throwing config read routes
- * to the tier default (the same end state runPhaseExtractAtoms's config-read
- * try/catch has always produced).
+ * The model resolution `runPhaseExtractAtoms` uses, shared with the
+ * `gbrain models` row so the two cannot diverge (`source` and `label` come
+ * from the SAME call as `model`). Chain (#6675, decision D3 option B):
+ * `models.dream.extract_atoms` > `models.tier.utility` > the key-aware
+ * `resolveTierDefault('utility')`. `models.default` and `GBRAIN_MODEL` are
+ * deliberately skipped: a frontier generic default must not become the model
+ * of the highest-volume dream phase (its cost cap prices the utility tier).
+ * Values are trimmed and alias-resolved like `resolveModelDetailed`'s steps.
+ * Fail-soft: a throwing config read routes to the tier default.
  */
 export async function resolveExtractAtomsModelWithSource(
   engine: BrainEngine,
-): Promise<{ model: string; source: 'config' | 'tier_default' }> {
-  let configuredModel: string | null = null;
+): Promise<{ model: string; source: 'config' | 'tier_config' | 'tier_default'; label?: string }> {
   try {
-    configuredModel = await engine.getConfig('models.dream.extract_atoms');
+    const own = (await engine.getConfig(EXTRACT_ATOMS_MODEL_KEY))?.trim();
+    if (own) return { model: await resolveAlias(engine, own), source: 'config', label: `config: ${EXTRACT_ATOMS_MODEL_KEY}` };
+    const tier = (await engine.getConfig('models.tier.utility'))?.trim();
+    if (tier) return { model: await resolveAlias(engine, tier), source: 'tier_config', label: 'config: models.tier.utility' };
   } catch {
     // Fail-soft — fall through to the tier default.
   }
-  return configuredModel
-    ? { model: configuredModel, source: 'config' }
-    : { model: resolveTierDefault('utility'), source: 'tier_default' };
+  return { model: resolveTierDefault('utility'), source: 'tier_default' };
 }
 
 /** String-returning wrapper for runtime callers (`runPhaseExtractAtoms`). */
@@ -998,6 +997,10 @@ export async function runPhaseExtractAtoms(
   async function stampAtomsScanHash(item: AtomPageInput): Promise<void> {
     await writeAtomPageState(engine, sourceId, item, 'complete');
   }
+  /** Large pages A7: a page's watermark moves past the text this item read once its writes committed (a pending batch keeps the old one). */
+  async function commitAtomsWatermark(item: ExtractAtomsItem, input: ExtractAtomsInput, published: readonly { state: string }[]): Promise<void> {
+    if (item.kind === 'page' && item.identity && input.plan && published.every(receipt => receipt.state === 'committed')) await commitExtractionPlan(engine, item.identity.pageId, input.plan);
+  }
 
   /**
    * Durable per-item failure count, keyed to the CURRENT content hash so a
@@ -1033,7 +1036,7 @@ export async function runPhaseExtractAtoms(
         // A strike that never lands means this transcript never tombstones and
         // re-spends budget forever (#4916's class) — say so. A missing table
         // was already warned once by the tombstone check above.
-        if (!isUndefinedTableError(err)) {
+        if (!isMissingSchemaObject(err, 'table', 'extract_atoms_transcript_state')) {
           console.error(`[extract_atoms] transcript failure-count write failed for ${item.filePath}: ${err instanceof Error ? err.message : String(err)}`);
         }
         return null;
@@ -1081,7 +1084,7 @@ export async function runPhaseExtractAtoms(
     // item, so a quote can only verify against text the model actually saw.
     // #6503: a cut item is extracted once from its head and gets a partial
     // disposition instead of a completion stamp (extract-atoms-input.ts).
-    const input = extractAtomsInput(item, maxInputChars);
+    const input = extractAtomsInput(item, maxInputChars, item.kind === 'page' ? (await readPageWatermark(engine, sourceId, item.slug, 'extract_atoms')).stored : null);
     const { promptContent, truncated } = input;
     try {
       const origin: AtomOrigin | null = managed ? { ...await readAtomOrigin(engine, managed, item), ...(truncated ? { partialInputChars: maxInputChars } : {}) } : null;
@@ -1091,7 +1094,8 @@ export async function runPhaseExtractAtoms(
       const resumed = !opts.dryRun && managed && origin ? await resumeManagedAtoms(engine, managed, origin) : 'run';
       if (resumed === 'done') { duplicatesSkipped++; continue; }
       if (resumed === 'held') { heldFailed++; continue; } // #6325: settled after repeated failures; doctor lists it
-      if (truncated) { inputTruncated++; console.error(inputTruncatedLine(originLabel, input, maxInputChars)); } // counted only for a model call
+      const cutLine = truncated ? inputTruncatedLine(originLabel, input, maxInputChars) : null; // A7: a complete appended-tail read prints nothing
+      if (cutLine) { inputTruncated++; console.error(cutLine); } // counted only for a model call
 
       const result = await chat({
         model: extractModel,
@@ -1141,10 +1145,12 @@ export async function runPhaseExtractAtoms(
         // row is (source_id, file_path, content_hash)-keyed, so editing the
         // file re-eligibilizes it — which is what makes the permanence safe.
         if (!opts.dryRun) {
-          if (managed && origin) writeRequests.push(...await publishManagedAtoms(engine, managed, origin, []));
-          else if (truncated) await recordPartialDisposition(engine, sourceId, item, maxInputChars);
-          else if (item.kind === 'page') await stampAtomsScanHash(item);
-          else await stampTranscriptTombstone(engine, sourceId, item.filePath, item.contentHash);
+          const published = managed && origin ? await publishManagedAtoms(engine, managed, origin, []) : [];
+          writeRequests.push(...published);
+          if (!origin && truncated) await recordPartialDisposition(engine, sourceId, item, maxInputChars);
+          else if (!origin && item.kind === 'page') await stampAtomsScanHash(item);
+          else if (!origin && item.kind === 'transcript') await stampTranscriptTombstone(engine, sourceId, item.filePath, item.contentHash);
+          await commitAtomsWatermark(item, input, published);
         }
         if (item.kind === 'transcript') transcriptsProcessed++;
         else pagesProcessed++;
@@ -1282,6 +1288,7 @@ export async function runPhaseExtractAtoms(
           writeRequests.push(...published);
           if (published.some(receipt => receipt.state !== 'committed')) writesPending++;
           totalAtomsExtracted += managedAtoms.length;
+          await commitAtomsWatermark(item, input, published);
         } else {
         if (provenanceLinks.length > 0) {
           await engine.addLinksBatch(provenanceLinks, { auditSite: 'cycle.extract_atoms.provenance' }); // gbrain-allow-direct-insert: atom-provenance edges derived from the extraction itself (no markdown body to reconcile from)
@@ -1297,6 +1304,7 @@ export async function runPhaseExtractAtoms(
         await atomFiles?.(importedSlugs, retired);
         if (truncated) await recordPartialDisposition(engine, sourceId, item, maxInputChars);
         else if (item.kind === 'page') await stampAtomsScanHash(item);
+        await commitAtomsWatermark(item, input, []);
         }
       } else {
         totalAtomsExtracted += atoms.length; // count for dry-run reporting

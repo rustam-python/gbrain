@@ -91,6 +91,12 @@
     "getCallersOf#chunkId": {},
     "getCallersOf#default": {},
     "getCallersOf#sourceId": {},
+    "getChunkPage#default": {
+      "raw": 1
+    },
+    "getChunkPage#sourceIds+excludePrivate": {
+      "raw": 1
+    },
     "getChunkWindows#default": {},
     "getChunkWindows#scopedPrivateSafe": {},
     "getChunks#default": {
@@ -193,6 +199,12 @@
     "listCorpusSample#seed": {
       "tx": 1
     },
+    "listEmbeddingStateRows#default": {
+      "raw": 1
+    },
+    "listEmbeddingStateRows#sourceIds": {
+      "raw": 1
+    },
     "listEnrichCandidates#default": {},
     "listEnrichCandidates#sourceId": {},
     "listEnrichCandidates#sourceIds+reenrich": {},
@@ -277,6 +289,15 @@
       "raw": 4,
       "tx": 1
     },
+    "readEmbeddingStateCounts#full": {
+      "raw": 1
+    },
+    "readEmbeddingStateCounts#full+sourceIds": {
+      "raw": 1
+    },
+    "readEmbeddingStateCounts#ops": {
+      "raw": 1
+    },
     "readPageSnapshot#default": {},
     "readPageSnapshot#sourceId": {},
     "readPageSnapshotsBatch#default": {},
@@ -293,11 +314,11 @@
       "tx": 1
     },
     "replaceDerivedLinks#default": {
-      "raw": 12,
+      "raw": 13,
       "tx": 1
     },
     "replaceDerivedLinksBatch#default": {
-      "raw": 12,
+      "raw": 13,
       "tx": 1
     },
     "resolveSlugWithAlias#default": {},
@@ -372,11 +393,11 @@
     "traversePathsDetailed#out+sourceId+linkType": {},
     "updatePageContextualRetrievalState#default": {},
     "updateSlug#moved": {
-      "raw": 10,
+      "raw": 11,
       "tx": 1
     },
     "updateSlug#noop": {
-      "raw": 1,
+      "raw": 2,
       "tx": 1
     },
     "updateSourceConfig#default": {},

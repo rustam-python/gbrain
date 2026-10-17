@@ -399,6 +399,22 @@ export function normalizeClaimWhitespace(text: string): string {
 }
 
 /**
+ * #6650: why a parsed fence cell does not read back as the legacy fact the
+ * fact-fence adoption assigns to it, or null when it does. The planner runs it
+ * on the whole fence it renders and the publisher re-checks it before
+ * adopting, so the two can never disagree.
+ */
+export function fenceCellReadBackProblem(cell: ParsedFact | undefined, fact: { fact: string; visibility: string }):
+  'row_missing' | 'struck' | 'empty' | 'visibility' | 'text' | null {
+  if (!cell) return 'row_missing';
+  if (!cell.active) return 'struck';
+  if (cell.claim === '') return 'empty';
+  if (cell.visibility !== fact.visibility) return 'visibility';
+  if (normalizeClaimWhitespace(cell.claim) !== normalizeClaimWhitespace(fact.fact)) return 'text';
+  return null;
+}
+
+/**
  * Render an instant for a `valid_from` / `valid_until` cell. A UTC-midnight
  * value keeps the `YYYY-MM-DD` shape (date-only cells never churn); any other
  * instant is written as a UTC timestamp to the second, so a TTL or a default
@@ -643,6 +659,38 @@ export function upsertFactRow(
  * An unclosed code block before that point would swallow the fence (it would
  * render as code), so the fence goes above the block's opener instead.
  */
+/** #6686: which sections of a page hold a facts fence outside markdown code (the reader `replaceOrInsertFactsFence` uses). */
+export function factsFenceSections(page: { compiled_truth: string | null; timeline?: string | null }): { body: boolean; timeline: boolean } {
+  const holds = (text: string | null | undefined) => locateOutsideCode(text ?? '', FACTS_FENCE_BEGIN, FACTS_FENCE_END).beginIdx !== -1;
+  return { body: holds(page.compiled_truth), timeline: holds(page.timeline) };
+}
+
+/**
+ * #6686: the section a writer edits a page's facts fence in. A fence that lives
+ * below the timeline sentinel (in `timeline`) is edited there when the body has
+ * none, so the writer neither adds a second fence above the sentinel nor
+ * rewrites the page's layout; every other page (no fence, a body fence, or
+ * fences in both sections) is edited in the body, as before.
+ */
+export function factsFenceSection(page: { compiled_truth: string | null; timeline?: string | null }): 'compiled_truth' | 'timeline' {
+  const held = factsFenceSections(page);
+  return !held.body && held.timeline ? 'timeline' : 'compiled_truth';
+}
+
+/**
+ * #6686: strike fence row `rowNum` as superseded by row `by` in whichever section's fence holds it (a split page can
+ * hold the old row in the other section than the one the new row went to); a page without the row is returned as is.
+ */
+export function strikeFactRowInPage<T extends { compiled_truth: string; timeline: string }>(page: T, rowNum: number, by: number): T {
+  for (const key of ['compiled_truth', 'timeline'] as const) {
+    const rows = parseFactsFence(page[key]).facts;
+    if (!rows.some(f => f.rowNum === rowNum)) continue;
+    return { ...page, [key]: replaceOrInsertFactsFence(page[key], renderFactsTable(rows.map(f => f.rowNum === rowNum
+      ? { ...f, active: false, supersededBy: by, context: `superseded by #${by}` } : f))) };
+  }
+  return page;
+}
+
 export function replaceOrInsertFactsFence(body: string, fenceBlock: string): string {
   const { beginIdx, endIdx } = locateOutsideCode(body, FACTS_FENCE_BEGIN, FACTS_FENCE_END);
   if (beginIdx !== -1 && endIdx !== -1) {

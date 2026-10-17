@@ -1,4 +1,5 @@
 import { submitPageMutation } from '../persistence/page-mutations.ts';
+import { recordFunnelEvent } from '../funnel.ts';
 import { MERGE_PRECONDITION_PARAMS, WRITE_REQUEST_PARAM } from '../persistence/params.ts';
 /**
  * Takes + think operation cluster — pure move from operations.ts (v0.46.x
@@ -18,7 +19,7 @@ import {
   enforceClientSlugFence,
   validatePageSlug,
 } from './context.ts';
-import { embedQuery } from '../embedding.ts';
+import { embedQueryWithPrefix } from '../search/query-prefix.ts';
 import { ALL_SOURCES } from '../source-id.ts';
 import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 
@@ -282,7 +283,7 @@ const think: Operation = {
     const result = await runThink(ctx.engine, {
       question: String(p.question),
       // #3734: MCP think must populate the question vector for takes retrieval.
-      embedQuestion: (q) => embedQuery(q),
+      embedQuestion: (q) => embedQueryWithPrefix(ctx.engine, q),
       anchor: p.anchor ? String(p.anchor) : undefined,
       rounds: typeof p.rounds === 'number' ? (p.rounds as number) : undefined,
       save: safeSave,
@@ -500,7 +501,9 @@ const takes_supersede: Operation = {
     enforceClientSlugFence(ctx, slug, 'takes_supersede');
     validatePageSlug(slug); // defense-in-depth, matching put_page
     if (ctx.dryRun) return { dry_run: true, action: 'takes_supersede', slug, row_num: p.row_num };
-    return submitPageMutation(ctx, { operation: 'takes_supersede', params: p });
+    const out = await submitPageMutation(ctx, { operation: 'takes_supersede', params: p });
+    recordFunnelEvent('correction');
+    return out;
   },
 };
 
