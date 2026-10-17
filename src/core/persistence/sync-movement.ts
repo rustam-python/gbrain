@@ -62,12 +62,15 @@ export interface SourceMovement {
   last_commit_at: string | null;
   /** The watermark the verdict used: the newest of a commit, a head step advance and the drain's cursor advance. */
   last_progress_at: string | null;
-  cursor: (Pick<ManagedSyncBacklog, 'index' | 'total' | 'remaining' | 'held' | 'last_progress_at' | 'resume_command'>) | null;
+  cursor: (Pick<ManagedSyncBacklog, 'index' | 'total' | 'remaining' | 'held' | 'last_progress_at' | 'resume_command' | 'resume_args'>) | null;
   head: MovementHead | null;
   holds: MovementHolds;
   /** Managed requests admitted on the worktree and not yet settled (queued or running). */
   admitted: number;
-  live: { drain: boolean; drain_pid: number | null; consumer: 'claim' | 'local' | 'heartbeat' | null };
+  /** #6712 PR 2 (#6552): when the oldest of those was admitted (null when none), so a queue stranded before its first commit still ages. */
+  admitted_since: string | null;
+  /** #6706: `drain_job_id` is the active `sync` Minions job with a live lock that drives this source, when no CLI drain holds the sync lock. */
+  live: { drain: boolean; drain_pid: number | null; drain_job_id: number | null; consumer: 'claim' | 'local' | 'heartbeat' | null };
   ceiling_ms: number;
   owner_is_this_host: boolean | null;
   writer_status_command: string;
@@ -88,12 +91,28 @@ export function writerStatusCommand(sourceId: string): string { return `gbrain s
 export const MOVEMENT_WATERMARK_SQL = `SELECT
         (SELECT r.completed_at FROM persistence_requests r WHERE r.worktree_id=$1::uuid AND r.state='committed' AND r.source_incarnation=$2::uuid
            AND COALESCE(r.intent->>'kind','') LIKE 'managed_sync_%' ORDER BY r.completed_at DESC LIMIT 1) AS last_commit_at,
-        (SELECT count(*) FROM persistence_requests r WHERE r.worktree_id=$1::uuid AND r.state IN ('queued','running') AND COALESCE(r.intent->>'kind','') LIKE 'managed_sync_%') AS admitted`;
+        (SELECT count(*) FROM persistence_requests r WHERE r.worktree_id=$1::uuid AND r.state IN ('queued','running') AND COALESCE(r.intent->>'kind','') LIKE 'managed_sync_%') AS admitted,
+        (SELECT min(r.created_at) FROM persistence_requests r WHERE r.worktree_id=$1::uuid AND r.state IN ('queued','running') AND COALESCE(r.intent->>'kind','') LIKE 'managed_sync_%') AS admitted_since`;
 
 interface BindingRow { source_id: string; worktree_id: string; source_incarnation: string; owner_host_id: string | null }
-interface WatermarkRow { last_commit_at: unknown; admitted: number | string }
+interface WatermarkRow { last_commit_at: unknown; admitted: number | string; admitted_since?: unknown }
 interface HeadRow { request_id: string; state: string; claim_phase: unknown; execution_token: string | null; claim_lapsed: boolean | null; publication_started: boolean | null }
 interface HoldRow { count: number | string | null; stalled: number | string | null; fences: number | string | null; concurrent: number | string | null; updated_at: unknown }
+
+/**
+ * #6706: the id of the active `sync` Minions job with a live lock that is draining `sourceId`, or null. Never rejects.
+ * #6712 PR 1: a job drains under the source's drain lease, so its holder row names the job first; the job-table read
+ * stays for a job an older gbrain started (it takes no lease).
+ */
+export async function liveSyncJob(engine: BrainEngine, sourceId: string): Promise<number | null> {
+  const holder = await (await import('./sync-lease.ts')).readDrainHolder(engine, sourceId).catch(() => null);
+  if (holder?.kind === 'job' && holder.id && /^\d+$/.test(holder.id)) return Number(holder.id);
+  // The lease's beacon row (sync-lease.ts) is for older binaries; this build reads the lease holder above.
+  const [row] = await engine.executeRaw<{ id: number | string }>(`SELECT id FROM minion_jobs WHERE name='sync' AND status='active' AND lock_until > now() AND queue <> 'gbrain-drain-lease'
+    AND (COALESCE(data->>'sourceId', data->>'source_id')=$1 OR (COALESCE(data->>'sourceId', data->>'source_id') IS NULL
+      AND (data->>'repoPath' IS NULL AND $1='default' OR data->>'repoPath'=(SELECT local_path FROM sources WHERE id=$1)))) ORDER BY started_at LIMIT 1`, [sourceId]).catch(() => []);
+  return row ? Number(row.id) : null;
+}
 
 /** The movement of every active managed source (or of `sourceIds`), one bounded read each; sources without a binding are omitted. */
 export async function readSourceMovement(engine: BrainEngine, opts: { sourceIds?: string[]; now?: number } = {}): Promise<SourceMovement[]> {
@@ -129,6 +148,7 @@ export async function readSourceMovement(engine: BrainEngine, opts: { sourceIds?
     const head: MovementHead | null = headRow ? { request_id: headRow.request_id, state: headRow.state, phase: claim?.phase ?? null, step: claim?.step ?? null, step_since: stampSince,
       step_age_ms: claim?.step_age_ms ?? null, waiting_on: claim?.waiting_on ?? null, owner: claim?.owner ?? null, last_sql: claim?.last_sql ?? null, lapsed: headRow.claim_lapsed === true } : null;
     const drain = await liveSyncStatus(engine, binding.source_id);
+    const jobDrain = drain ? null : await liveSyncJob(engine, binding.source_id);
     const ownerHere = binding.owner_host_id === null ? null : binding.owner_host_id === host;
     const claimLive = !!claim && (claim.phase === 'preparing' || claim.phase === 'publishing');
     const consumer: SourceMovement['live']['consumer'] = claimLive ? 'claim' : ownerHere !== false && localConsumer ? 'local' : ownerHere !== false && await liveHeartbeat() ? 'heartbeat' : null;
@@ -139,8 +159,8 @@ export async function readSourceMovement(engine: BrainEngine, opts: { sourceIds?
     const progressAt = newest(lastCommitAt, claimLive ? head?.step_since : null, cursor?.last_progress_at);
     const sampledAt = new Date(now).toISOString();
     const base = { source_id: binding.source_id, sampled_at: sampledAt, last_commit_at: lastCommitAt, last_progress_at: progressAt,
-      cursor: cursor ? { index: cursor.index, total: cursor.total, remaining: cursor.remaining, held: cursor.held, last_progress_at: cursor.last_progress_at, resume_command: cursor.resume_command } : null,
-      head, holds, admitted, live: { drain: !!drain, drain_pid: drain?.holder_pid ?? null, consumer }, ceiling_ms: policy.ceilingMs, owner_is_this_host: ownerHere,
+      cursor: cursor ? { index: cursor.index, total: cursor.total, remaining: cursor.remaining, held: cursor.held, last_progress_at: cursor.last_progress_at, resume_command: cursor.resume_command, resume_args: cursor.resume_args } : null,
+      head, holds, admitted, admitted_since: iso(mark?.admitted_since), live: { drain: !!drain || !!jobDrain, drain_pid: drain?.holder_pid ?? null, drain_job_id: jobDrain, consumer }, ceiling_ms: policy.ceilingMs, owner_is_this_host: ownerHere,
       writer_status_command: writerStatusCommand(binding.source_id) };
     out.push({ ...base, ...verdict(base, now) });
   }

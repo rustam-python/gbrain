@@ -12,7 +12,8 @@ import { startHeartbeat } from '../../../core/progress.ts';
 import { checkUnverifiedExtractions } from './extraction-sync.ts';
 import type { Check } from '../../doctor.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
-import { agentFix, checkError } from '../check-fix.ts';
+import { agentFix, checkError, doctorVerify } from '../check-fix.ts';
+import { scanDeadline } from '../budget.ts';
 
 async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
   const { args, progress } = ctx;
@@ -50,14 +51,9 @@ async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
   const fullContentAudit = args.includes('--content-audit');
   progress.heartbeat('oversized_pages');
   try {
-    // Read effective bytes_block from the cached effectiveCfg loaded
-    // earlier in this doctor run if available; otherwise default.
-    // (We re-read here per-check to avoid threading config through
-    // every check — bytes_block is read once per doctor run via
-    // loadConfig which caches in module-level config layer.)
-    const { loadConfig: _loadCfg } = await import('../../../core/config.ts');
-    const _cfg = _loadCfg();
-    const bytesBlock = _cfg?.content_sanity?.bytes_block ?? 500_000;
+    // #6526: the write gate's bytes_block (the DB config plane over file and env),
+    // so a `gbrain config set content_sanity.bytes_block N` reaches this check too.
+    const bytesBlock = await (await import('../../../core/import-screen.ts')).effectiveBytesBlock(engine);
     // #1871: engine.executeRaw, not the dead-on-PGLite postgres singleton.
     const rows = await engine.executeRaw<{ slug: string; source_id: string; bytes: number }>(
       `SELECT p.slug, p.source_id,
@@ -70,7 +66,21 @@ async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
        LIMIT 100`,
       [bytesBlock],
     );
-    if (rows.length === 0) {
+    // Pages an older gbrain stored chunkless for size that now fit under the block: the free backfill re-indexes them.
+    const [skipped] = await engine.executeRaw<{ n: number }>(`SELECT COUNT(*)::int AS n FROM pages p
+       WHERE p.deleted_at IS NULL AND p.frontmatter->'embed_skip'->>'reason' = 'oversized'
+         AND (octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, ''))) <= $1`, [bytesBlock]);
+    const backfillable = Number(skipped?.n ?? 0);
+    if (backfillable > 0) {
+      checks.push({
+        name: 'oversized_pages',
+        status: 'warn',
+        message: `${backfillable} page(s) were stored without chunks by an older gbrain because of their size, and now fit under the ${bytesBlock}-byte bytes_block. `
+          + 'They are invisible to search until re-indexed. Fix: gbrain reindex --oversized (free, CPU only; pages over 1 MiB then wait for embedding approval).',
+        fix: agentFix(['gbrain', 'reindex', '--oversized'], 'Re-chunks the size-skipped pages so keyword search finds them; it calls no paid provider and holds large pages for embedding approval.',
+          'oversized_pages', { docs: 'docs/guides/memory-boundaries.md#large-pages-upgrade' }),
+      });
+    } else if (rows.length === 0) {
       checks.push({
         name: 'oversized_pages',
         status: 'ok',
@@ -84,7 +94,8 @@ async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
       checks.push({
         name: 'oversized_pages',
         status: 'warn',
-        message: `${rows.length} page(s) exceed ${bytesBlock}-byte block threshold. Top: ${top}. New ingests with the same shape get frontmatter.embed_skip set automatically; existing oversized pages can be split or accepted as non-embeddable.`,
+        message: `${rows.length} page(s) exceed the ${bytesBlock}-byte content_sanity.bytes_block. Top: ${top}. A page over the block is stored without chunks on its next write. `
+          + 'Raise content_sanity.bytes_block (up to the 24 MiB page ceiling) to make them searchable, or exclude them from the source.',
       });
     }
   } catch (err) {
@@ -227,6 +238,33 @@ export const contentSanityEntry: DoctorEntry = {
   run: runContentSanity,
 };
 
+/**
+ * #6803 part 3: its own entry, so the full `pages` scans above never spend its
+ * budget and `--only partial_embedding` runs only this indexed read. The
+ * finding, its per-source approve Actions and their N live in core/held-embedding.ts.
+ */
+async function runPartialEmbedding(ctx: DoctorContext): Promise<Check[]> {
+  const engine = connectedEngine(ctx);
+  const checks: Check[] = [];
+  ctx.progress.heartbeat('partial_embedding');
+  try {
+    const { budgetLimitedFinding } = await import('../../../core/held-embedding.ts');
+    const { currentEmbeddingSignature } = await import('../../../core/embedding.ts');
+    const found = await budgetLimitedFinding(engine, currentEmbeddingSignature());
+    if (!found) checks.push({ name: 'partial_embedding', status: 'ok', message: 'No large page has chunks waiting for embedding approval (held or capped by embed.max_usd_per_page).' });
+    else checks.push({ name: 'partial_embedding', status: 'warn', message: found.message, fix: found.fix, details: found.details });
+  } catch (err) {
+    checks.push(checkError('partial_embedding', 'read the per-page embedding budget', err));
+  }
+  return checks;
+}
+
+export const partialEmbeddingEntry: DoctorEntry = {
+  name: 'partial_embedding',
+  emits: ['partial_embedding'],
+  run: runPartialEmbedding,
+};
+
 async function runQuarantine(ctx: DoctorContext): Promise<Check[]> {
   const { orphanRatioSourceId, progress } = ctx;
   const engine = connectedEngine(ctx);
@@ -319,10 +357,11 @@ async function runFrontmatter(ctx: DoctorContext): Promise<Check[]> {
   progress.heartbeat('frontmatter_integrity');
   const fmHb = startHeartbeat(progress, 'scanning frontmatter…');
   const { frontmatterScanTimeoutMs, frontmatterRepairableFromReport } = await import('./frontmatter-repairable.ts');
-  const fmTimeoutMs = frontmatterScanTimeoutMs();
+  // #6803 C3: the walk also stops at the entry's (and so the run's) deadline, and reports what it read.
+  const fmDeadline = scanDeadline(ctx, frontmatterScanTimeoutMs());
+  const fmTimeoutMs = Math.max(0, fmDeadline - Date.now());
   try {
     const { scanBrainSources } = await import('../../../core/brain-writer.ts');
-    const fmDeadline = Date.now() + fmTimeoutMs;
     const fmAbort = AbortSignal.timeout(fmTimeoutMs);
     // Per-source DB denominator. Coarse — DB pages and on-disk syncable
     // files are overlapping but not identical (unsynced disk files,
@@ -330,6 +369,7 @@ async function runFrontmatter(ctx: DoctorContext): Promise<Check[]> {
     // message makes the mismatch honest. Failure of the COUNT degrades to
     // null and the message falls back to bare numerator.
     const dbPageCountForSource = async (sourceId: string): Promise<number | null> => {
+      if (Date.now() >= fmDeadline) return null;
       try {
         const rows = await engine.executeRaw<{ n: string }>(
           `SELECT COUNT(*)::text AS n FROM pages WHERE source_id = $1 AND deleted_at IS NULL`,
