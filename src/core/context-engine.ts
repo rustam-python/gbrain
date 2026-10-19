@@ -14,6 +14,7 @@
  */
 
 import type { OpenclawBoundaryTail } from './context/corpus-segments.ts';
+import type { BrainEngine } from './engine.ts';
 import { readFileSync, existsSync, statSync } from 'fs';
 import { join } from 'path';
 import { buildReflexAddition, warmReflex, type ResolveEntitiesFn as ReflexResolveEntitiesFn } from './context/reflex.ts';
@@ -915,6 +916,43 @@ async function recordOpenclawSeat(dir: string, sessionId: string, sessionFile: s
   } catch { /* provenance and telemetry never fail the checkpoint */ }
 }
 
+/**
+ * Rung 3: why a segment is left to the sweep before any model call, or null.
+ * #6786: finished by the one completion classifier (a `chat_unavailable`
+ * sidecar is pending). #6785: a failing window, whose retry cap the sweep owns.
+ */
+async function rung3SegmentHold(fullPath: string, name: string): Promise<string | null> {
+  const segs = await import('./context/corpus-segments.ts');
+  if (!segs.corpusFileAwaitsExtraction(fullPath, name)) return 'already_ingested';
+  const failing = segs.readCorpusFailure(fullPath);
+  if (!failing) return null;
+  return failing.count >= segs.CORPUS_WINDOW_FAILURE_CAP ? 'corpus_window_dead_lettered' : 'corpus_window_backoff';
+}
+
+/**
+ * Rung 3, #6785: a failure after a paid call is recorded at the segment's
+ * frontier window, the record the sweep's cap reads, so every later compact
+ * leaves the segment to the sweep (rung3SegmentHold).
+ */
+async function rung3Counted<T>(engine: BrainEngine, fullPath: string, name: string, incarnation: string | null, signal: AbortSignal, run: () => Promise<T>): Promise<T> {
+  const windows = await import('./context/corpus-windows.ts');
+  const { extractionConfigFingerprint } = await import('./facts/extraction-availability.ts');
+  const key = (await windows.corpusFrontierKey(fullPath, name)) ?? 'unreadable@0';
+  const fingerprint = await extractionConfigFingerprint(engine).catch(() => null);
+  return (await windows.extractUnderFailureCount({ full: fullPath, record: null, key, incarnation, fingerprint, nowMs: Date.now, signal }, run)).value;
+}
+
+/** Rung 3, #6785: the owner-readiness preflight; true when a claimed, not activated worktree holds the source. */
+async function rung3WriterHeld(engine: BrainEngine, sourceId: string): Promise<boolean> {
+  try {
+    await (await import('./persistence/filesystem-guard.ts')).assertSourceLegacyWriter(engine, sourceId);
+    return false;
+  } catch (e) {
+    if ((e as { code?: unknown }).code !== 'writer_coordinator_required') throw e;
+    return true;
+  }
+}
+
 // ── Engine Implementation ───────────────────────────────────────────────
 
 export function createGBrainContextEngine(ctx: {
@@ -1198,10 +1236,8 @@ export function createGBrainContextEngine(ctx: {
       // identical content maps to the same filename — if a prior run (or the
       // sweep) already ingested it, re-running the pipeline is pure duplicate
       // LLM spend absorbed only by fact-level dedup.
-      const { existsSync: ingested } = await import('node:fs');
-      if (ingested(fullPath + sweep.CORPUS_INGESTED_SUFFIX)) {
-        return { status: 'banked', reason: 'already_ingested' };
-      }
+      const held = await rung3SegmentHold(fullPath, segName(w.hash));
+      if (held) return { status: 'banked', reason: held };
       const gate = await (await import('./context/capture-consent.ts')).gateCorpusFile(pg, fullPath, 'compact');
       if (gate.action !== 'extract') return { status: 'banked', reason: gate.reason };
       const { extractionAvailableForEngine } = await import('./facts/extraction-availability.ts');
@@ -1212,6 +1248,7 @@ export function createGBrainContextEngine(ctx: {
       const fileSource = await (await import('./context/corpus-source.ts')).resolveCorpusFileSource(pg, root, segName(w.hash), 'spool');
       if (!fileSource.ok) return { status: 'banked', reason: fileSource.reason };
       const sourceId = fileSource.sourceId;
+      if (await rung3WriterHeld(pg, sourceId)) return { status: 'banked', reason: 'writer_coordinator_required' };
       if (deadlineHit()) return { status: 'banked', reason: 'deadline' };
       const { runFactsPipeline } = await import('./facts/backstop.ts');
       const abort = new AbortController();
@@ -1222,7 +1259,7 @@ export function createGBrainContextEngine(ctx: {
       const deadlinePoll = setInterval(() => { if (deadlineHit()) abort.abort(); }, 250);
       let r: Awaited<ReturnType<typeof runFactsPipeline>>;
       try {
-        r = await runFactsPipeline(rendered.text, {
+        r = await rung3Counted(pg, fullPath, segName(w.hash), fileSource.incarnation, abort.signal, () => runFactsPipeline(rendered.text, {
           engine: pg,
           sourceId,
           sessionId,
@@ -1230,7 +1267,7 @@ export function createGBrainContextEngine(ctx: {
           mode: 'inline',
           remote: false,
           abortSignal: abort.signal,
-        });
+        }));
       } finally {
         clearTimeout(timer);
         clearInterval(deadlinePoll);
@@ -1238,6 +1275,8 @@ export function createGBrainContextEngine(ctx: {
       // Post-check: the pipeline returns normally with PARTIALS on abort — an
       // aborted run writes no sidecar and stays sweep-retryable.
       if (abort.signal.aborted) return { status: 'banked', reason: 'aborted' };
+      // #6786: no servable model is not an outcome; the segment stays pending for the sweep.
+      if (r.skipped_reason === 'chat_unavailable') return { status: 'banked', reason: 'extract_skipped_chat_unavailable' };
       const verified: Array<{ slug: string; title: string }> = [];
       for (const slug of r.entity_slugs) {
         try {
@@ -1262,6 +1301,7 @@ export function createGBrainContextEngine(ctx: {
         ingested_at: new Date().toISOString(),
         facts_inserted: r.inserted,
         facts_duplicate: r.duplicate,
+        ...(r.skipped_reason ? { skipped: r.skipped_reason } : {}),
         links_banked: published ? verified.length : 0,
       }) + '\n');
       if (!published) return { status: 'harvested', links: verified, reason: 'manifest_failed' };

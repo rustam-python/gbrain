@@ -1,7 +1,7 @@
 import { observationDateLine, observationDateRule } from '../ai/date-grounding.ts';
 import { isConsumerDateGroundingOn } from '../facts/extract.ts';
 import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
-import { deferPublishOrThrow, postprocessManagedSynthesis, withPostprocessConflicts, withPublishPending, type PostprocessConflict } from './synthesize-postprocess.ts';
+import { deferPublishOrThrow, finishDeferredPostprocess, loadCommittedOutputsOrDefer, postprocessManagedSynthesis, withPostprocessConflicts, withPublishPending, type PostprocessConflict, type RetainedOutput } from './synthesize-postprocess.ts';
 /**
  * Synthesize phase (v0.23; #4152 two-stage cascade) — conversation-to-brain
  * pipeline. Cheap-model triage gates frontier-model synthesis:
@@ -75,7 +75,7 @@ import { runSubagentsInline, runDrainRenewalTick, percentile, INLINE_LOCK_MS } f
 import { buildManifestContext, buildLinkManifest, type ManifestContext } from './link-manifest.ts';
 import { resolveCycleDate, utcDate } from './cycle-date.ts';
 import { throwIfAborted } from '../abort-check.ts';
-import { stampDreamProvenance } from './dream-provenance.ts';
+import { stampDreamProvenance, summaryProvenanceLines } from './dream-provenance.ts';
 import { putDerivedPage, summaryDerivation, withTranscriptTaint } from './dream-taint.ts';
 import { findLegacyCompletion, findSynthV2Completion, partitionCompletedSynthesis } from './synthesize-completion.ts';
 
@@ -397,7 +397,8 @@ export async function runPhaseSynthesize(
   // calls keep their own job:* tag — the innermost AsyncLocalStorage phase
   // wins (minions/worker.ts wraps each job), and that is intentional: the
   // authoritative child spend rolls up from minion_jobs token columns below.
-  return withChatPhase('phase:synthesize', () => runPhaseSynthesizeInner(engine, opts));
+  const startedAt = Date.now(); // #6757: outputs an earlier pass deferred finish even when this pass returns before postprocessing
+  return withChatPhase('phase:synthesize', async () => finishDeferredPostprocess(engine, opts, startedAt, await runPhaseSynthesizeInner(engine, opts), loadSynthConfig));
 }
 
 async function runPhaseSynthesizeInner(
@@ -1136,11 +1137,11 @@ async function runPhaseSynthesizeInner(
     // (source, slug) row. #1586: refs are stamped with the cycle's resolved
     // source (children write there via SubagentHandlerData.source_id;
     // cycleSourceId is hoisted above the fan-out for the daily cap).
-    // F6 rule-D visibility: track which children actually wrote pages, so a
-    // rescued/passed transcript whose child declined to write (task D) is
-    // distinguishable from a triage miss in the phase telemetry.
+    // F6 rule-D visibility: track which children wrote pages, so a rescued/passed transcript
+    // whose child declined to write (task D) is distinguishable from a triage miss in telemetry.
     const jobsWithPages = new Set<number>();
-    let writtenRefs = withTranscriptSeats(await collectChildPutPageSlugs(engine, childIds, chunkInfo, cycleSourceId, jobRawSource, jobsWithPages), worthProcessing);
+    const committedOutputs = maintenance ? await loadCommittedOutputsOrDefer(engine, maintenance, childIds, { jobRawSource, transcripts: worthProcessing, signal: opts.signal }) : undefined;
+    let writtenRefs = withTranscriptSeats(await collectChildPutPageSlugs(engine, childIds, chunkInfo, cycleSourceId, jobRawSource, jobsWithPages, committedOutputs?.outputs), worthProcessing);
     let finalizedRefs = writtenRefs;
 
     // Grounding gate: verify every page the children wrote (whole page when
@@ -1149,15 +1150,15 @@ async function runPhaseSynthesizeInner(
     // chunks or the markdown body. Fail-open (abort still unwinds); kill
     // switch: dream.synthesize.quote_verify=false.
     let quoteVerifyStats: QuoteVerifyStats | null = null;
-    let publishPending = 0, postprocessConflicts: PostprocessConflict[] = [];
+    let publishPending = 0, postprocessConflicts: PostprocessConflict[] = [], postprocessDeferral: Awaited<ReturnType<typeof postprocessManagedSynthesis>>['deferral'] = null;
     const sinceByTranscript = await loadChildWriteEpochs(engine, childIds, jobRawSource, verifySince);
     const grounding = config.quoteVerify ? await resolveGroundingDecide(engine) : undefined;
     if (maintenance) {
       const processed = await postprocessManagedSynthesis(engine, maintenance, writtenRefs, childIds, jobRawSource,
-        worthProcessing, { cycleDate: summaryDate, quoteVerify: config.quoteVerify, sinceByTranscript, signal: opts.signal, grounding, meetingTranscriptsDir: config.meetingTranscriptsDir });
+        worthProcessing, { cycleDate: summaryDate, quoteVerify: config.quoteVerify, sinceByTranscript, signal: opts.signal, grounding, committedOutputs, meetingTranscriptsDir: config.meetingTranscriptsDir });
       writtenRefs = processed.writtenRefs;
       finalizedRefs = processed.finalizedRefs;
-      [publishPending, postprocessConflicts] = [processed.pending, processed.conflicts];
+      [publishPending, postprocessConflicts, postprocessDeferral] = [processed.pending, processed.conflicts, processed.deferral];
       quoteVerifyStats = config.quoteVerify ? processed.stats : null;
     } else if (config.quoteVerify && writtenRefs.length > 0) {
       const transcriptsForVerify = new Map<string, TranscriptForVerify>(worthProcessing.map(t => [t.filePath, { content: t.content }]));
@@ -1421,7 +1422,7 @@ async function runPhaseSynthesizeInner(
         // child counters + triage pass usage). cost_usd null when unpriced.
         spend: spendBlock,
       },
-    })));
+    }), postprocessDeferral));
   } catch (e) {
     return failed(makeError('InternalError', 'SYNTH_PHASE_FAIL', e instanceof Error ? (e.message || 'synthesize phase threw') : String(e),
       e instanceof OperationError ? e.suggestion : undefined), e instanceof OperationError ? { error_code: e.code } : {});
@@ -2899,6 +2900,7 @@ async function collectChildPutPageSlugs(
   // collects the job ids that produced ≥1 put_page write, so the caller can
   // count zero-page children without a second subagent_tool_executions scan.
   outJobsWithPages?: Set<number>,
+  committed: RetainedOutput[] = [], // #6616: canonical slug of a managed child's committed write; unmatched keeps its raw slug
 ): Promise<Array<{ slug: string; source_id: string; raw_source?: string; first_write_at?: Date }>> {
   if (childIds.length === 0) return [];
   // Raw fetch — NO SELECT DISTINCT. Preserves per-child slug duplicates so
@@ -2935,7 +2937,8 @@ async function collectChildPutPageSlugs(
     const jobId = Number(r.job_id);
     outJobsWithPages?.add(jobId);
     const ci = chunkInfo.get(jobId);
-    const slug = ci ? rewriteChunkedSlug(r.slug, ci.hash6, ci.idx) : r.slug;
+    const written = committed.find(o => Number(o.job_id) === jobId && o.input_slug === r.slug)?.request.slug ?? r.slug;
+    const slug = ci ? rewriteChunkedSlug(written, ci.hash6, ci.idx) : written;
     if (!rewritten.has(slug) || rewritten.get(slug) === undefined) {
       rewritten.set(slug, jobRawSource?.get(jobId));
     }
@@ -3062,8 +3065,8 @@ async function writeSummaryPage(
   if (writtenSlugs.length > 0) {
     // #4337: deterministic, lexicographically sorted sample — small cycles
     // stay fully linked; large cycles list exactly SUMMARY_LINK_SAMPLE_LIMIT
-    // links while keeping exact totals above. The full child set stays
-    // recoverable via per-page provenance frontmatter (pointer below).
+    // links while keeping exact totals above. The provenance section below
+    // names the frontmatter query and what it misses (#6642).
     const sampledSlugs = [...writtenSlugs].sort().slice(0, SUMMARY_LINK_SAMPLE_LIMIT);
     lines.push(
       writtenSlugs.length > SUMMARY_LINK_SAMPLE_LIMIT
@@ -3074,14 +3077,7 @@ async function writeSummaryPage(
       '',
     );
     if (writtenSlugs.length > SUMMARY_LINK_SAMPLE_LIMIT) {
-      lines.push(
-        '## Full output provenance',
-        '',
-        `The complete ${writtenSlugs.length}-page set is recoverable in this source by querying page frontmatter for ` +
-          `\`dream_generated: true\` and \`dream_cycle_date: ${summaryDate}\`, excluding \`${summarySlug}\`. ` +
-          'Every child page carries those provenance fields; this summary intentionally links only the deterministic sample above.',
-        '',
-      );
+      lines.push(...await summaryProvenanceLines(engine, { sourceId, cycleDate: summaryDate, summarySlug, writtenSlugs }));
     }
   }
 

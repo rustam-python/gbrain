@@ -10,6 +10,8 @@ import {
   escapeLikePattern,
   splitCJKQueryTerms,
   slugifyText,
+  stripKoreanParticle,
+  cjkMatchTerms,
 } from '../src/core/cjk.ts';
 import { slugifySegment } from '../src/core/sync.ts';
 
@@ -191,5 +193,38 @@ describe('slugifyText (#12)', () => {
   test('the cap counts code points and never leaves a trailing hyphen', () => {
     expect(slugifyText('\u{20000}'.repeat(5), 3)).toBe('\u{20000}'.repeat(3));
     expect(slugifyText('abc def', 4)).toBe('abc');
+  });
+});
+
+describe('stripKoreanParticle (#6666)', () => {
+  test('strips the longest trailing particle', () => {
+    expect(stripKoreanParticle('혈당에서')).toBe('혈당');
+    expect(stripKoreanParticle('검진을')).toBe('검진');
+    expect(stripKoreanParticle('병원으로')).toBe('병원');
+    expect(stripKoreanParticle('진료실에서')).toBe('진료실');
+    expect(stripKoreanParticle('결과에서는')).toBe('결과');
+  });
+
+  test('keeps a word that only ends in a particle syllable', () => {
+    expect(stripKoreanParticle('회의')).toBe('회의');
+    expect(stripKoreanParticle('결과')).toBe('결과');
+    expect(stripKoreanParticle('도로')).toBe('도로');
+    expect(stripKoreanParticle('에서')).toBe('에서');
+    expect(stripKoreanParticle('는')).toBe('는');
+  });
+
+  test('leaves Chinese, Japanese and ASCII terms alone', () => {
+    expect(stripKoreanParticle('席位')).toBe('席位');
+    expect(stripKoreanParticle('東京で')).toBe('東京で');
+    expect(stripKoreanParticle('LDL')).toBe('LDL');
+    expect(stripKoreanParticle('LDL수치가')).toBe('LDL수치');
+  });
+});
+
+describe('cjkMatchTerms (#6666)', () => {
+  test('stems each term and drops duplicates in order', () => {
+    expect(cjkMatchTerms('혈당에서 검진을')).toEqual(['혈당', '검진']);
+    expect(cjkMatchTerms('혈당 혈당에서 수치')).toEqual(['혈당', '수치']);
+    expect(cjkMatchTerms('席位 升级')).toEqual(['席位', '升级']);
   });
 });
