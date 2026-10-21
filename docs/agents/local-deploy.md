@@ -139,8 +139,15 @@ curl -s http://127.0.0.1:<CHAT_PORT>/props         # смотри n_ctx и chat_
 }
 ```
 
-Команды `gbrain config set` в этот файл не пишут, кроме `database_url`.
-Правь JSON напрямую и сохрани остальные ключи.
+Команды `gbrain config set` в этот файл почти не пишут. Исключения:
+`database_url` и блок `memory` (`memory.auto_writeback`,
+`memory.visibility_posture`). Блок `memory` gbrain ведёт сам: при
+`config set facts.default_visibility` он обновляет `memory.visibility_posture`,
+если блок уже есть. Модели и `provider_base_urls` правь в JSON напрямую и
+сохрани остальные ключи.
+
+Перед правкой сними копию файла (`config.json.bak-<дата>`): откат
+одной командой дешевле разбора, что именно сломалось.
 
 Строку `provider_base_urls.litellm` легко пропустить. Без неё имя
 `litellm` уходит на `http://localhost:4000` (порт LiteLLM по умолчанию),
@@ -207,6 +214,17 @@ Bearer-токен на чат-сервер. llama-server без `--api-key` ег
 Если в базе уже есть своё `facts.extraction_prompt_appendix`, не
 затирай его: покажи пользователю оба текста и спроси, какой оставить.
 
+Тир `subagent` (фоновые подагенты, `gbrain agent`) отдельно не настраивается.
+Если не задать `models.tier.subagent`, `gbrain models` покажет предупреждение:
+чат-модель из тира без инструментов не годится для цикла подагента, и
+gbrain подставит `anthropic:claude-sonnet-*`. Без ключа Anthropic такие
+задачи не запустятся. Для локальной установки это нормально, пока подагенты
+не нужны. Если нужны — укажи `litellm:<CHAT_ALIAS>`:
+
+```bash
+<GBRAIN_CMD> config set models.tier.subagent "litellm:<CHAT_ALIAS>"
+```
+
 Зачем ключи для агента:
 
 - `agent.use_gateway_loop true`: без него агент запускается только на
@@ -223,6 +241,37 @@ Bearer-токен на чат-сервер. llama-server без `--api-key` ег
   запаса не хватит, ход агента обрывается пустым ответом. Ключ действует
   на все задачи агента.
 
+### Снять текущие настройки (аудит и перенос)
+
+`config show` показывает по сути файловый слой, поэтому
+для полной картины читай ключи из раздела 5 по одному. Так же проверяй,
+чего не хватает после переезда на другую базу:
+
+```bash
+<GBRAIN_CMD> config show
+for k in provider_base_urls.ollama provider_base_urls.litellm \
+         provider_base_urls.llama-server provider_base_urls.llama-server-reranker \
+         models.tier.reasoning models.tier.subagent models.dream.patterns \
+         models.dream.synthesize agent.use_gateway_loop agent.max_output_tokens \
+         search.mode search.reranker.enabled search.reranker.model \
+         facts.extraction_max_tokens facts.default_visibility \
+         dream.propose_takes.max_tokens dream.propose_takes.retry_max_tokens \
+         conversation_parser.llm_fallback_enabled chunk_strategy pricing.overrides; do
+  printf '%s = ' "$k"; <GBRAIN_CMD> config get "$k" 2>&1 | head -1
+done
+```
+
+`config get` пишет в конце строки, из какого слоя пришло значение
+(`db plane` или `file/env plane`). Ответ `Config key not found` значит,
+что ключ не задан и действует значение по умолчанию.
+
+Ключи, которых нет в базе, не обязательно ошибка. Режим поиска
+(`search.mode`) и `facts.default_visibility` пользователь выбирает сам
+(вопросы 8 и 1 шага 1), а ключи агента (`agent.*`, `models.dream.patterns`,
+`models.dream.synthesize`, `provider_base_urls.litellm`) нужны только для
+фаз `dream patterns` и `dream synthesize`. Не ставь их молча: покажи, чего
+не хватает, и спроси.
+
 ## 6. Проверка после настройки
 
 Выполнять по порядку. Если шаг падает, остановись и сообщи.
@@ -234,6 +283,7 @@ Bearer-токен на чат-сервер. llama-server без `--api-key` ег
 <GBRAIN_CMD> config get provider_base_urls.litellm      # http://127.0.0.1:<CHAT_PORT>/v1
 
 # 2. Таблица маршрутизации моделей
+#    Предупреждение про tier.subagent и откат на Anthropic — см. раздел 5
 <GBRAIN_CMD> models
 
 # 3. Пробный вызов каждой модели (около 1 токена на модель)
