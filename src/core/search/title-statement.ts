@@ -11,6 +11,7 @@ import { searchLimitCap } from './eval-pool-depth.ts';
 import { getFtsLanguage } from '../fts-language.ts';
 import { chunkGenerationFilter, requiresSafeChunks } from './safe-chunks.ts';
 import { normalizeAlias } from './alias-normalize.ts';
+import { frontmatterWhereSql } from './frontmatter-where.ts';
 import { resolveBoostMap, resolveHardExcludes } from './source-boost.ts';
 import {
   boundWebsearchQuery,
@@ -27,6 +28,8 @@ export interface SearchTitlesDialect {
   relaxedPrefersIndex: boolean;
   /** Project `stale` from timeline_entries (PGLite); otherwise `false`. */
   staleProbe: boolean;
+  /** chunkManifestReads; unset reads the manifest. */
+  chunkManifest?: boolean;
 }
 
 export interface SearchTitlesStatement {
@@ -71,6 +74,7 @@ export function buildSearchTitlesStatement(query: string, opts: SearchOpts | und
     params.push(opts.types);
     filters += ` AND p.type = ANY($${params.length}::text[])`;
   }
+  filters += frontmatterWhereSql('p', opts?.where, json => `$${params.push(json)}`);
   if (opts?.exclude_slugs?.length) {
     params.push(opts.exclude_slugs);
     filters += ` AND p.slug != ALL($${params.length}::text[])`;
@@ -107,7 +111,7 @@ export function buildSearchTitlesStatement(query: string, opts: SearchOpts | und
   const sql = `
     WITH top_pages AS (
       SELECT p.slug, p.id AS page_id, p.title, p.type, p.source_id,
-        p.effective_date, p.effective_date_source, p.updated_at, p.body_generation,
+        p.effective_date, p.effective_date_source, p.updated_at, p.body_storage, p.body_generation,
         (lower(btrim(p.title, ' "''' || chr(160))) = $2) AS exact_title,
         ${rankSql} * ${sourceFactorCase} AS score
       FROM pages p
@@ -131,7 +135,7 @@ export function buildSearchTitlesStatement(query: string, opts: SearchOpts | und
     LEFT JOIN LATERAL (
       SELECT cc.id, cc.chunk_index, cc.chunk_text, cc.chunk_source
       FROM content_chunks cc
-      WHERE cc.page_id = tp.page_id AND ${chunkGenerationFilter('tp', 'cc')}
+      WHERE cc.page_id = tp.page_id AND ${chunkGenerationFilter('tp', 'cc', dialect.chunkManifest ?? true)}
         AND cc.modality = 'text'
         ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
       ORDER BY (cc.chunk_source = 'compiled_truth') DESC, cc.chunk_index ASC

@@ -134,7 +134,7 @@ async function performManagedBranch(engine: BrainEngine, outer: SyncOpts): Promi
         ...(n ? { drain: { ...n, passes: d.passes + n.passes, processed: d.processed + n.processed, written: d.written + n.written, waived: d.waived + n.waived } } : {}) };
       if (!next.staged) serr(`[sync] staged catch-up reached HEAD after ${stages} stages.`);
     }
-    await printCursorAdoption(result, sourceId);
+    printInheritedOptions(result);
     if (!opts.dryRun) await recordUpstreamObservation(engine, opts.sourceId ?? 'default', opts.repoPath);
     if (!opts.dryRun && ['synced', 'first_sync', 'up_to_date'].includes(result.status)) await clearSettledFailures(engine, opts.sourceId ?? 'default');
     if (!opts.dryRun) {
@@ -151,7 +151,8 @@ async function performManagedBranch(engine: BrainEngine, outer: SyncOpts): Promi
   if (outer.dryRun) return work(undefined);
   const { withSyncTail } = await import('../../core/persistence/sync-tail.ts');
   try {
-    return await (await import('../../core/repair/slug-autoheal.ts')).healAfterManagedSync(engine, outer, await withSyncTail(engine, sourceId, await withDrainLease(engine, sourceId, {
+    const { healOriginTwinsAfterManagedSync } = await import('../../core/repair/origin-twins-heal.ts');
+    return await healOriginTwinsAfterManagedSync(engine, outer, await (await import('../../core/repair/slug-autoheal.ts')).healAfterManagedSync(engine, outer, await withSyncTail(engine, sourceId, await withDrainLease(engine, sourceId, {
       holder: outer.drainHolder ?? { kind: 'cli', id: null }, remote: currentSubmissionAuthority()?.kind === 'remote_generic',
       ...(outer.followDrainLease ? { follow: { signal: outer.signal, deadlineAtMs: outer.deadlineAtMs } } : {}),
       tty: process.stderr.isTTY === true,
@@ -162,24 +163,15 @@ async function performManagedBranch(engine: BrainEngine, outer: SyncOpts): Promi
           ? `[sync] source ${sourceId} is being drained by ${who}; following it until it finishes or this run's budget ends (one drainer per source; it resumes the same cursor). Ctrl-C stops following and leaves it running.`
           : `[sync] following ${who}: ${done}.`);
       },
-    }, work), { signal: outer.signal, deadlineAtMs: outer.deadlineAtMs }));
+    }, work), { signal: outer.signal, deadlineAtMs: outer.deadlineAtMs })));
   } catch (err) {
     if (err instanceof LockUnavailableError && err.lockId === lockKey) throw new SyncLockBusyError(await formatLockBusyMessage(engine, lockKey), lockKey);
     throw err;
   }
 }
 
-/**
- * #6712 PR 1: the one-line notices of a resumed cursor. A run that finished another writer's (or another option set's)
- * unfinished run names that run's own options, and a kept opt-out names the command that settles what it skipped.
- */
-async function printCursorAdoption(result: SyncResult, sourceId: string): Promise<void> {
-  const adopted = result.cursorAdopted;
-  if (adopted?.sync_options !== undefined) {
-    const { managedSyncResumeArgs } = await import('../../core/sync-reconcile.ts');
-    serr(`[sync] resumed the unfinished sync run of source ${sourceId}${adopted.writer_changed ? ' that another writer started' : ''}; it finishes under its own frozen options `
-      + `(gbrain sync ${managedSyncResumeArgs({ sourceId, processingOptions: adopted.processing_options, syncOptions: adopted.sync_options }).join(' ')}), and the next run uses this run's.`);
-  }
+/** #6712 PR 1: the one-line notice of a kept opt-out, naming the command that settles what it skipped. */
+function printInheritedOptions(result: SyncResult): void {
   const kept = result.inherited_options ?? [];
   if (!kept.length) return;
   const flags = { noEmbed: '--no-embed', noExtract: '--no-extract', noSchemaPack: '--no-schema-pack' } as const;
