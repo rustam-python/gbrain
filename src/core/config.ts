@@ -7,6 +7,7 @@ import { loadConfigSnapshot } from './config-snapshot.ts';
 import { loadGbrainEnvFile } from './gbrain-env-file.ts';
 import { dotenvValuesForKey } from './env-trust.ts';
 import { REMOTE_PRIVATE_PAGES_KEY } from './search/private-visibility.ts';
+import { RUNTIME_READER_CONFIG_KEYS } from './config-runtime-keys.ts';
 
 /**
  * Where is the active DB URL coming from? Pure introspection, no connection
@@ -1310,6 +1311,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // 30 days; interval clamps to >=1 day at read time (backup/status-file.ts).
   'backup.check_enabled',
   'backup.check_interval_days',
+  'backup.remote_timeout_ms', // #6907: DB plane, read by the backup coverage compute (backup/repository.ts); 500-30000, default 2000
   // DB-plane search-mode knobs: one row per key mode.ts reads (its
   // KNOB_CONFIG_KEY, hand-mirrored so this module stays import-light; pinned
   // equal by test/config-search-registry.test.ts). camelCase where the code
@@ -1404,6 +1406,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'search.relational_orient_onehop',
   // Multi-hop chain slots: chain rows leading page 1 when a chain fired (mode.ts reads; 0..10).
   'search.relational_chain_slots',
+  'search.collapse', // result-time collapse of twins, redirect stubs and document copies (mode.ts reads; boolean)
+  'search.rank_priors', // rank priors after the reranker (mode.ts reads; boolean)
   'search.diverse_pool_depth', // session-diverse pool before the reranker (mode.ts reads; `off` | 0..100; 0 = off)
   // Ranker wave (Phase E2): keyword-arm confidence floor — weak keyword arm fuses at half weight (mode.ts reads; `off` | (0, 1]).
   'search.keyword_arm_confidence_floor',
@@ -1489,6 +1493,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'facts.extraction_max_tokens',
   // Automatic facts drain caps (src/core/facts/drain.ts FACTS_DRAIN_KEYS).
   'facts.drain_budget_usd', 'facts.drain_daily_budget_usd', 'facts.drain_max_jobs',
+  'facts.absorb_retry.max_resubmits', // C-9: re-submits per dead page-write facts-absorb job (default 3; 0 disables; facts/dead-absorb-retry.ts)
   // #3852: operator-set system-prompt appendix for the facts extractor (e.g.
   // a durable-vs-ephemeral rubric for agent work-session transcripts).
   // Composes with BOTH honest-notability prompt variants.
@@ -1721,13 +1726,16 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'orphans.exclude_prefixes',
   'orphans.exclude_slugs',
   'sync.cost_gate_min_usd',
+  'sync.admission', // #6712 PR 4b: normal | imports_only | classify_only, what a managed pass admits (persistence/sync-admission.ts)
+  'sync.max_deletes', 'sync.max_delete_ratio', // #7130: absolute caps on one managed pass's deletes (sync-reconcile.ts); per source: <key>.source.<id>
+  'purge.retention_hours', // #7130: hours a soft-deleted page waits before the autopilot purge phase may purge it (default 72)
   'sync.federated_v2',
   'sync.include_working_tree',
   // #5984: managed Postgres sync publishes pages in bulk groups (on by default; each page keeps its own request).
   'sync.bulk',
   'sync.bulk_size',
   // #6858 ask 6: on-commit sync in the resident serve and its freshness target (src/core/sync-config-keys.ts).
-  'sync.on_commit', 'sync.freshness_target_seconds',
+  'sync.on_commit', 'sync.freshness_target_seconds', 'sync.on_commit.sources', // GBRA-133 PR 2a: notifier exclusions (notifier/resident.ts)
   // #6712 PR 2: rollback keys (src/core/sync-config-keys.ts; windows in wire-skew.ts): readable and honored, not tunables.
   'sync.job_drain', 'sync.waive_batch', 'sync.foreground_priority',
   'sync.lanes', 'persistence.single_write_group', 'persistence.preadmit_cache', // the last two: write-path kill switches (persistence/switches.ts)
@@ -1745,6 +1753,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // restores fail-closed blocking. Detail, escalation and the parser-regression
   // stop are tuned by GBRAIN_SYNC_* env since #6712 PR 2 (RETIRED_SYNC_KEYS).
   'sync.holds', 'sync.slug_conflicts.auto_remove', // #6865: sync-time removal of a stray slug: line naming no page (repair/slug-autoheal.ts); default on
+  'sync.origin_twins.auto_resolve', // #6948: sync-time merge of verified duplicate-origin twins (repair/origin-twins-heal.ts); default on
   'fences.normalize', // #6188: inline Tier 1 fence normalization (fence-repair/config.ts); default on
   'fences.repair.enabled', 'fences.repair.llm', // #6188: the fence_repair cycle phase and its Tier 3 model step (fence-repair/config.ts); default on
   'fences.repair.max_usd_per_page', 'fences.repair.max_usd_per_day', // #6188: Tier 3 fence repair caps; 0 = no model spend
@@ -1774,9 +1783,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'persistence.limits.principal_intent_bytes', 'persistence.limits.brain_intent_bytes',
   'persistence.limits.principal_lifetime_ids', 'persistence.limits.brain_lifetime_ids',
   'persistence.limits.principal_terminal_bytes', 'persistence.limits.brain_terminal_bytes',
-  'persistence.limits.brain_recovery_bytes', 'persistence.limits.worktree_recovery_bytes',
+  'persistence.limits.brain_recovery_bytes', 'persistence.limits.worktree_recovery_bytes', 'persistence.limits.principal_staged_bytes', 'persistence.limits.brain_staged_bytes', 'persistence.limits.principal_uploads', 'persistence.limits.upload_idle_seconds', 'persistence.limits.upload_max_seconds',
   'persistence.receipt_retention_days', 'persistence.unbound_write', 'persistence.max_claim_ms', // #5254: persistence/unbound-source.ts; #6176: persistence/claim-phase.ts
-  'persistence.sync_preparation_ms', 'persistence.maintenance_preparation_ms', 'persistence.preparation_ceiling_ms', 'persistence.max_preparation_attempts', 'persistence.preparation_deadlines', // #6278: persistence/preparation-budget.ts, switches.ts
+  'persistence.sync_preparation_ms', 'persistence.maintenance_preparation_ms', 'persistence.preparation_ceiling_ms', 'persistence.max_preparation_attempts', 'persistence.preparation_deadlines', 'persistence.max_transient_retries', // #6278: persistence/preparation-budget.ts, switches.ts; transient-retry.ts
   'persistence.publication_ceiling_ms', 'persistence.terminal_failures.window_days', 'persistence.terminal_failures.spike_factor', 'persistence.terminal_failures.spike_min', // #6405: persistence/sync-drain.ts (in-pass publication ceiling); #6650: persistence/terminal-failures.ts
   'persistence.capacity.warn_days', 'persistence.capacity.fail_days', 'persistence.capacity.background_pause_pct', // #6696: persistence/capacity-forecast.ts, admission-origin.ts
   'persistence.maintenance.compaction_stale_hours', // #6696 (A11): persistence/compaction-pass.ts, doctor persistence_compaction
@@ -1792,6 +1801,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'planner.auto_analyze', 'planner.first_read_budget_ms', 'import.analyze_every_pages', 'health.cache_ttl_ms',
   // Wave B segmented page storage (src/core/page-body/limits.ts PAGE_BODY_CONFIG_KEYS; switch defaults off).
   'pages.segmented_storage', 'pages.max_bytes', 'pages.flip_retire_max_rows', 'versions.segmented_max_per_page', 'versions.segmented_max_pinned_bytes',
+  ...RUNTIME_READER_CONFIG_KEYS, // #6780: getConfig() runtime knobs (config-runtime-keys.ts)
 ];
 
 /**
@@ -1821,6 +1831,7 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   'minions.',
   'pace.',              // pace.mode + PACE_MODE_CONFIG_KEYS (src/core/pace-mode.ts)
   'decide.',            // System One decide.* (validated by src/core/ai/decide/config.ts DECIDE_CONFIG_KEYS)
+  'sync.max_deletes.source.', 'sync.max_delete_ratio.source.', // #7130: per-source delete caps (sync-reconcile.ts readSyncDeleteCaps)
   'connectors.',        // chat-connectors: source_id, sync_floor_min, embed_kickoff_min_pages, doctor_stale_hours, <provider>.{auto_sync,last_sync_at,auth_error_at,watermark_iso} (no secrets — creds are file-plane)
 ];
 

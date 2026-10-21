@@ -112,9 +112,10 @@ for (const kind of testBackends()) describe(`inexact Git rename identity (#6729,
     expect((await purgeDeletedPagesCoordinated(engine, 0)).slugs.filter(slug => slug.endsWith('-x-com'))).toEqual([]);
     expect(await pageRow(s.id, 'people/a-x-com')).toBeDefined();
 
-    // Doctor names them; the fix restores the first old page once the user asks (ask_user), and verify clears it.
+    // Doctor names them; the fix is the first pair's preview-bound remedy (ask_user, destructive) and restoring the old page is
+    // the alternative it names. Take the alternative here (the remedy has its own suite), then verify clears that pair.
     const { renameIdentityDowngradesEntry } = await import('../src/commands/doctor/checks/rename-identity-downgrades.ts');
-    const doctor = async () => (await renameIdentityDowngradesEntry.run({ engine } as unknown as DoctorContext)) as unknown as Array<{ status: string; details: { count: number; by_source: Array<{ source_id: string; count: number }>; restore_unavailable_sources?: string[] }; fix?: Record<string, unknown> & { argv: string[]; verify: { argv: string[] } } }>;
+    const doctor = async () => (await renameIdentityDowngradesEntry.run({ engine } as unknown as DoctorContext)) as unknown as Array<{ status: string; details: { count: number; by_source: Array<{ source_id: string; count: number }>; samples: Array<{ old_slug: string; new_slug: string }>; restore_unavailable_sources?: string[] }; fix?: Record<string, unknown> & { argv: string[]; why: string; plan_hash: string; verify: { argv: string[] } } }>;
     const mine = (finding: Awaited<ReturnType<typeof doctor>>[number]) => finding.details.by_source.find(entry => entry.source_id === s.id)?.count ?? 0;
     const [finding] = await doctor();
     expect(finding!.status).toBe('warn');
@@ -125,7 +126,11 @@ for (const kind of testBackends()) describe(`inexact Git rename identity (#6729,
     if (kind === 'postgres') {
       // An unbound classic Postgres source refuses page writes outside its checkout, so no surface offers the restore
       // there; the pairs still hold their old pages, with no time window, until a disposition.
-      expect(finding!.fix).toBeUndefined();
+      // The doctor fix there is the pair's remedy (a classic carry).
+      const { new_slug: carryOnto } = finding!.details.samples[0]!;
+      const carryPreview = ['gbrain', 'repair', 'rename-identity', '--source', s.id, '--slug', carryOnto];
+      expect(structuredClone(finding!.fix)).toMatchObject({ argv: [...carryPreview, '--apply', '--expect', finding!.fix!.plan_hash, '--yes'], preview_argv: carryPreview, consent: ['destructive'], ask_user: true });
+      expect(finding!.fix!.why).not.toContain('gbrain restore');
       expect(finding!.details.restore_unavailable_sources).toContain(s.id);
       await age(); await purgeStaleCheckpoints(engine);
       expect((await purgeDeletedPagesCoordinated(engine, 0)).slugs.filter(slug => slug.endsWith('-x-com'))).toEqual([]);
@@ -134,14 +139,17 @@ for (const kind of testBackends()) describe(`inexact Git rename identity (#6729,
       expect((await purgeDeletedPagesCoordinated(engine, 0)).slugs).toContain('people/a-x-com');
       return;
     }
-    const [, , slug, , sourceId] = finding!.fix!.argv;
+    const { old_slug: slug, new_slug: newSlug } = finding!.details.samples[0]!, sourceId = s.id;
     const restored = { 'people/a-x-com': { id: a.id, fact: 'A works on payments', alias: 'ali' }, 'people/b-x-com': { id: b.id, fact: 'B works on search', alias: 'bea' } }[slug!]!;
     const other = slug === 'people/a-x-com' ? { slug: 'people/b-x-com', id: b.id } : { slug: 'people/a-x-com', id: a.id };
-    expect(finding!.fix).toMatchObject({ argv: ['gbrain', 'restore', expect.stringMatching(/^people\/[ab]-x-com$/), '--source-id', s.id, '--force'], consent: [], actor: 'agent', ask_user: true,
-      user_message: expect.stringContaining(slug!), verify: { argv: ['gbrain', 'doctor', '--only', 'rename_identity_downgrades', '--json'] } });
+    expect(slug).toMatch(/^people\/[ab]-x-com$/);
+    const preview = ['gbrain', 'repair', 'rename-identity', '--source', s.id, '--slug', newSlug];
+    expect(structuredClone(finding!.fix)).toMatchObject({ argv: [...preview, '--apply', '--expect', finding!.fix!.plan_hash, '--yes'], preview_argv: preview, consent: ['destructive'], actor: 'agent', ask_user: true,
+      user_message: expect.stringContaining(slug), verify: { argv: ['gbrain', 'doctor', '--only', 'rename_identity_downgrades', '--json'] } });
+    expect(finding!.fix!.why).toContain(`gbrain restore ${slug} --source-id ${s.id} --force`);
     const { deriveNext } = await import('../src/core/agent-output.ts');
     expect(deriveNext(finding!.fix as never, { transport: 'cli', isCallable: () => false, preapproved: () => true })).toBe('ask_user');
-    // Run the argv (gbrain restore <slug> --source-id <id> --force) through its operation, then the verify.
+    // Run the alternative (gbrain restore <slug> --source-id <id> --force) through its operation, then the verify.
     const { operationsByName } = await import('../src/core/operations.ts');
     await operationsByName.restore_page!.handler({ ...repairCtx(engine), sourceId } as never, { slug, source_id: sourceId, force: true });
     expect((await pageRow(s.id, slug!))).toMatchObject({ id: restored.id, deleted_at: null });
@@ -259,8 +267,17 @@ for (const kind of testBackends()) describe(`inexact Git rename identity (#6729,
       expect((await pageRow(s.id, 'notes/spec-2'))!.id).not.toBe(spec.id);
       expect([(await pageRow(s.id, 'people/alice'))!.id, (await pageRow(s.id, 'people/bob'))!.id]).not.toContain(a.id);
       expect([(await pageRow(s.id, 'people/alice'))!.id, (await pageRow(s.id, 'people/bob'))!.id]).not.toContain(b.id);
+      // Design v3.2 §2.3 row 6 (delete_drift): in managed sync the retitle moved the old page in the database since its
+      // import, so its file's deletion has no proof and is held file_drift (side deleted); the page is never soft-deleted,
+      // so the downgraded pair has no old page to record.
       expect(result.identityDowngrades?.map(entry => [entry.from, entry.reason]).sort()).toEqual([
-        ['notes/spec.md', 'no_identity_signal'], ['people/a.md', 'title_not_unique'], ['people/b.md', 'title_not_unique']]);
+        ...(mode === 'classic' ? [['notes/spec.md', 'no_identity_signal']] : []), ['people/a.md', 'title_not_unique'], ['people/b.md', 'title_not_unique']]);
+      if (mode === 'managed') {
+        const { readGitSourceHolds } = await import('../src/core/persistence/sync-holds.ts');
+        const holds = (await readGitSourceHolds(engine, { sourceIds: [s.id] }))[0]?.holds ?? [];
+        expect(holds.map(hold => [hold.path, hold.code, hold.meta.side])).toEqual([['notes/spec.md', 'file_drift', 'deleted']]);
+        expect(await pageRow(s.id, 'notes/spec')).toMatchObject({ id: spec.id, deleted_at: null });
+      }
       git(s.root, 'mv', 'notes/draft.md', 'notes/draft-2.md'); write(s.root, 'notes/draft-2.md', h1(`Draft ${mode} h1 6729`, 'Edited.\n'));
       git(s.root, 'add', '-A');
       expect(git(s.root, 'diff', '--cached', '--name-status', '-M')).toMatch(/^R0\d\d\tnotes\/draft.md\tnotes\/draft-2.md$/);
@@ -366,8 +383,18 @@ for (const kind of testBackends()) describe(`inexact Git rename identity (#6729,
       if (mode === 'classic') continue;
       // Managed discovery's same-slug takeover: only a conflicting explicit id vetoes it, before anything is written.
       git(s.root, 'mv', 'notes/Id Doc.md', 'notes/id-doc.md'); write(s.root, 'notes/id-doc.md', doc('id: id-doc-two-6729\ntitle: Id doc', 'Another document.\n'));
+      write(s.root, 'notes/unrelated-6729.md', doc('title: Unrelated 6729'));
       commit(s.root, 'respell with a different id');
-      await expect(s.sync()).rejects.toMatchObject({ code: 'page_identity_changed', detail: 'rename_identity_conflict' });
+      // GBRA-130 B-4 (was: the sync refused page_identity_changed / rename_identity_conflict): the file alone is held and the page keeps
+      // its slug, id and body; the rest of the source syncs.
+      const held = await s.sync();
+      expect(held.held?.map(hold => [hold.path, hold.code, hold.reason])).toEqual([['notes/id-doc.md', 'page_identity_changed', 'identity_differs']]);
+      expect(await pageRow(s.id, 'notes/unrelated-6729')).toMatchObject({ deleted_at: null });
+      expect((await engine.executeRaw<{ id: string }>("SELECT frontmatter->>'id' AS id FROM pages WHERE source_id=$1 AND slug=$2", [s.id, 'notes/id-doc']))[0]?.id).toBe('id-doc-one-6729');
+      expect((await engine.executeRaw<{ compiled_truth: string }>("SELECT compiled_truth FROM pages WHERE source_id=$1 AND slug=$2", [s.id, 'notes/id-doc']))[0]?.compiled_truth).not.toContain('Another document');
+      expect((await pageRow(s.id, 'notes/id-doc'))).toMatchObject({ id: idDoc.id, deleted_at: null });
+      // The origin's deletion waits with the hold on the next pass too.
+      expect((await s.sync()).held?.map(hold => [hold.path, hold.reason])).toEqual([['notes/id-doc.md', 'identity_differs']]);
       expect((await pageRow(s.id, 'notes/id-doc'))).toMatchObject({ id: idDoc.id, deleted_at: null });
     }
   }), 240_000);
@@ -438,8 +465,18 @@ for (const kind of testBackends()) describe(`inexact Git rename identity (#6729,
     const one = (await pageRow(s.id, 'notes/foo-bar'))!;
     git(s.root, 'rm', '-q', 'notes/Foo Bar.md');
     write(s.root, 'notes/foo-bar.md', doc('id: doc-two-6729\ntitle: Document two', 'A different document.\n'));
+    write(s.root, 'notes/unrelated-6729.md', doc('title: Unrelated 6729'));
     commit(s.root, 'replace with a different document at the same slug');
-    await expect(s.sync()).rejects.toMatchObject({ code: 'page_identity_changed', detail: 'rename_identity_conflict' });
+    // GBRA-130 B-4 (was: the sync refused page_identity_changed / rename_identity_conflict): the file alone is held and the page keeps
+    // its slug, id and body; the rest of the source syncs.
+    const held = await s.sync();
+    expect(held.held?.map(hold => [hold.path, hold.code, hold.reason])).toEqual([['notes/foo-bar.md', 'page_identity_changed', 'identity_differs']]);
+    expect(await pageRow(s.id, 'notes/unrelated-6729')).toMatchObject({ deleted_at: null });
+    expect((await engine.executeRaw<{ id: string }>("SELECT frontmatter->>'id' AS id FROM pages WHERE source_id=$1 AND slug=$2", [s.id, 'notes/foo-bar']))[0]?.id).toBe('doc-one-6729');
+    expect((await engine.executeRaw<{ compiled_truth: string }>("SELECT compiled_truth FROM pages WHERE source_id=$1 AND slug=$2", [s.id, 'notes/foo-bar']))[0]?.compiled_truth).not.toContain('A different document');
+    expect(await pageRow(s.id, 'notes/foo-bar')).toMatchObject({ id: one.id, deleted_at: null });
+    expect((await s.sync()).held?.map(hold => [hold.path, hold.reason])).toEqual([['notes/foo-bar.md', 'identity_differs']]);
+    expect(await pageRow(s.id, 'notes/foo-bar')).toMatchObject({ id: one.id, deleted_at: null });
     expect((await pageRow(s.id, 'notes/foo-bar'))).toMatchObject({ id: one.id, deleted_at: null });
   }), 180_000);
 });

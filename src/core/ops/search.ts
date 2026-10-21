@@ -1,4 +1,5 @@
 import { searchAnswerFeedback } from '../feedback/record.ts';
+import { readSourceFreshness } from '../notifier/status.ts';
 import { recordRecallOutcome } from '../funnel.ts';
 import type { RelationalPlanMeta } from '../search/relational-recall.ts';
 import type { Notice } from '../agent-output.ts';
@@ -30,16 +31,21 @@ import { markKeywordHits } from '../search/evidence.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
 import type { HybridSearchMeta, SearchResult } from '../types.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
-import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS } from '../search/snippet-cap.ts';
+import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS, resultChunkCap } from '../search/snippet-cap.ts';
+import { scoresFollowRank } from '../search/score-contract.ts';
 import { redactRetrievalOutput } from '../search/output-redaction.ts';
 import { leanRowsKeepId, projectRows, resultRowsFor } from '../search/lean-rows.ts';
 import { buildScoreDetails } from '../search/explain-formatter.ts';
 import { SearchTimings } from '../search/stage-timings.ts';
+import { searchCostSnapshot, withSearchCost } from '../search/search-cost.ts';
+import { keepFrontmatterMatches } from '../search/frontmatter-where.ts';
+import { WHERE_PARAM, whereOpParam } from './where-param.ts';
+import { searchFilterHint } from '../search/filter-hint.ts';
 import { TargetTrace, diagnoseProbe, diagnoseTrace, probeTarget, type ExplainTargetDiagnosis } from '../search/explain-target.ts';
 import { assembleEvidenceForHits, capDeliveredSnippets, capEvidenceToBudget, deliverEvidence, pagePlanHits, resolveEvidencePlan, selectLongPages, unsupportedDelivery, withLongPagePolicy, type DeliveryMeta, type DeliveryScope, type EvidencePlan, type FrozenHit, type ReturnUnit } from '../search/evidence-delivery.ts';
 import { privateProvenanceFilterFragment, resolveExcludePrivatePages } from '../search/private-visibility.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
-import { SAFE_FENCE_CHUNKER_VERSION } from '../search/safe-chunks.ts';
+import { SAFE_FENCE_CHUNKER_VERSION, chunkManifestReads } from '../search/safe-chunks.ts';
 import { expandEngineTypeFilters } from '../schema-pack/query-types.ts';
 import { reconcileTypeFilter } from './search-type-filter.ts';
 import { probeProjectionReadiness } from '../search/projection-readiness.ts';
@@ -115,17 +121,20 @@ function searchOutput(ctx: OperationContext, p: Record<string, unknown>, results
   const lean = { keepId: leanRowsKeepId(ctx) };
   // `explain: true` — every row carries its score breakdown (kept in lean rows).
   if (p.explain === true) for (const r of results) r.score_details = buildScoreDetails(r);
+  // #7156: the returned score follows the returned order.
+  results = scoresFollowRank(results);
   // The shape is reported where it can vary: remote callers, or an explicit `fields`.
   const shown = ctx.remote !== false || p.fields !== undefined ? { rows } : {};
   // Stage timings are read last, after the returned rows are assembled (meta only, never content).
   const emit = (output: { meta: Record<string, unknown> }, returned: SearchResult[]) => {
     recordRecallOutcome(returned);
-    ctx.emitResponseMeta?.('retrieval', { ...output.meta, timings: timings.snapshot() });
+    const cost = searchCostSnapshot();
+    ctx.emitResponseMeta?.('retrieval', { ...output.meta, timings: timings.snapshot(), ...(cost?.calls ? { cost } : {}) });
     return returned;
   };
   if (!evidence) {
     const output = redactRetrievalOutput(results, { ...meta, ...shown });
-    return emit(output, projectRows(applySnippetCap(output.results, snippetCap).map(factRowOutput), rows, lean));
+    return emit(output, projectRows(applySnippetCap(output.results, resultChunkCap(p.snippet_chars, snippetCap)).map(factRowOutput), rows, lean));
   }
   // Evidence delivery: explicit snippet_chars wins over the delivered blocks;
   // otherwise the blocks are returned whole (their budget already bounds
@@ -419,26 +428,31 @@ async function buildRetrievalResponseMeta(
   queryText: string,
   results: unknown[],
   meta: HybridSearchMeta | null,
-  opts: { conceptHint?: boolean; types?: string[]; typeFilterNotice?: string; declarations?: DeclarationMemo; feedbackOp?: 'query' | 'search'; entity?: ResolvedEntity } = {},
+  opts: { conceptHint?: boolean; types?: string[]; typeFilterNotice?: string; declarations?: DeclarationMemo; feedbackOp?: 'query' | 'search'; entity?: ResolvedEntity; filterHintFor?: { op: 'search' | 'query'; p: Record<string, unknown> } } = {},
 ): Promise<Record<string, unknown>> {
   const m = meta as (HybridSearchMeta & { degraded?: unknown[]; retrieved_count?: number }) | null;
   const hint = opts.conceptHint && looksConceptShaped(queryText)
-    ? "concept-shaped question — the 'query' tool with expand: true adds multi-query expansion, " +
-      'which can recover synonym-phrased matches this keyword-leaning search can miss.'
+    ? "concept-shaped question — the 'query' tool ranks the same and adds saved-fact rows and a confidence grade."
     : undefined;
   const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
   const excludeSlugPrefixes = resolveHardExcludes();
   const aliases = (opts.declarations ?? new DeclarationMemo()).scan(results as DeclarationRow[], queryText);
   // #6721: these reads depend on nothing but the inputs above, so they run at once: on a pooled Postgres
   // the wall time is the slowest read's round trips, not their sum. The answer-feedback write still runs last.
-  const [safeIndexPending, readiness, entityFacts, matchedFacts, heldFiles] = await Promise.all([
+  const [safeIndexPending, readiness, entityFacts, matchedFacts, heldFiles, sourceFreshness, filterNotice] = await Promise.all([
     ctx.remote !== false && hasUnsealedPagesInScope(ctx, scope, excludePrivate, { types: opts.types, excludeSlugPrefixes }),
     probeProjectionReadiness(ctx.engine, { ...scope, excludePrivate, types: opts.types, excludeSlugPrefixes }),
     // Facts saved about the entity the query names come first (newest first, one hop through entities they name).
     opts.entity && ctx.emitResponseMeta ? entitySavedFacts(ctx.engine, opts.entity, { remote: ctx.remote !== false, excludePrivate }) : [],
     matchingSavedFacts(ctx, scope, queryText, aliases),
     stampHeldHits(ctx.engine, results as SearchResult[], scope, ctx).catch(() => []),
+    // GBRA-133 PR 2a.5: per-source freshness from the notifier's cached coverage record (no git call).
+    readSourceFreshness(ctx.engine, scope),
+    opts.filterHintFor ? searchFilterHint(ctx, scope, excludePrivate, queryText, results as SearchResult[], opts.types, opts.filterHintFor) : null,
   ]);
+  if (filterNotice) ctx.emitNotice?.(filterNotice);
+  const heldBySource = new Map(heldFiles.map(h => [h.source_id, h.missing + h.stale]));
+  const freshness = sourceFreshness.map(f => ({ ...f, held_count: heldBySource.get(f.source_id) ?? 0 }));
   // A fact the facts arm already returned as a row is not repeated beside the blocks.
   const factRowIds = new Set((results as SearchResult[]).flatMap(r => r.fact_row ? [r.fact_row.id] : []));
   const savedFacts = [...entityFacts, ...matchedFacts.filter(m => !entityFacts.some(e => e.id === m.id))]
@@ -468,6 +482,7 @@ async function buildRetrievalResponseMeta(
       ...(m.relational_plan ? { relational_plan: m.relational_plan } : {}),
       ...(m.rerank_gate ? { rerank_gate: m.rerank_gate } : {}),
       ...(m.cosine_rescore ? { cosine_rescore: m.cosine_rescore } : {}),
+      ...(m.collapse ? { collapse: m.collapse } : {}),
     } : {}),
     ...((m?.degraded !== undefined || degraded.length > 0) ? { degraded } : {}),
     projection_readiness: readiness,
@@ -475,6 +490,7 @@ async function buildRetrievalResponseMeta(
     ...(savedFacts.length ? { saved_facts: savedFacts } : {}),
     ...(aliases.length ? { other_names: aliases } : {}),
     ...(heldFiles.length ? { held_files: heldFiles } : {}),
+    ...(freshness.length ? { freshness } : {}),
     ...(hint || readiness.hint ? { hint: [hint, readiness.hint].filter(Boolean).join(' ') } : {}),
     ...(opts.feedbackOp ? await searchAnswerFeedback(ctx, opts.feedbackOp, results as SearchResult[]) : {}),
   };
@@ -558,7 +574,7 @@ async function prepareExplainTarget(
   let probe;
   try {
     probe = await probeTarget((sql, params) => ctx.engine.executeRaw(sql, params), slug,
-      { ...scope, excludePrivate, requireSafeChunks: ctx.remote !== false });
+      { ...scope, excludePrivate, requireSafeChunks: ctx.remote !== false }, await chunkManifestReads(ctx.engine));
   } catch {
     return { trace: new TargetTrace({ slug, sourceId }) };
   }
@@ -651,6 +667,7 @@ const search: Operation = {
     source_id: { type: 'string', description: SOURCE_ID_PARAM_DESCRIPTION },
     // #3985: multi-type filter (plumbing shipped v0.33; exposed here).
     types: { type: 'array', items: { type: 'string' }, description: TYPES_PARAM_DESCRIPTION },
+    where: WHERE_PARAM,
     // #3800: subagent token economy — per-call snippet cap.
     snippet_chars: { type: 'number', description: SNIPPET_CHARS_PARAM_DESCRIPTION },
     return_unit: RETURN_UNIT_PARAM,
@@ -677,6 +694,7 @@ const search: Operation = {
     const offset = paging.offset;
     // #3985: validated multi-type filter, threaded into both branches below.
     let types = normalizeTypesParam(ctx, 'search', p.types);
+    const where = whereOpParam(ctx, 'search', p.where);
     // #3800: snippet cap (param > subagent config default > full text).
     const snippetCap = await setup(() => resolveSnippetCap(ctx, p));
     const plan = await setup(() => evidencePlanFor(ctx, p, snippetCap, 'search'));
@@ -704,7 +722,7 @@ const search: Operation = {
     // hybrid `search` contract (privacy/cost: no query text to an embedding
     // provider). Defaults to cheap-hybrid (D4/D15).
     const keywordOnly = (await setup(() => ctx.engine.getConfig('search.mcp_keyword_only'))) === 'true';
-    const readOpts = { excludePrivate, requireSafeChunks: ctx.remote !== false, ...scope };
+    const readOpts = { excludePrivate, requireSafeChunks: ctx.remote !== false, ...scope, ...(where ? { where } : {}) };
 
     if (keywordOnly || paging.match === 'keyword') {
       if (types) {
@@ -728,11 +746,11 @@ const search: Operation = {
       }
       const lexicalDone = Promise.withResolvers<void>();
       const keywordCount = page ? null : timings.overlap('keyword_count', startKeywordCount(ctx.engine, queryText, undefined, keywordOpts, lexicalDone.promise));
-      const results = (page ? page.rows : dedupResults(await timings.stage('lexical', () => ctx.engine.searchKeyword(queryText, { limit, offset, ...keywordOpts })).finally(lexicalDone.resolve))).map(r => ({ ...r }));
+      const results = await keepFrontmatterMatches(ctx.engine, (page ? page.rows : dedupResults(await timings.stage('lexical', () => ctx.engine.searchKeyword(queryText, { limit, offset, ...keywordOpts })).finally(lexicalDone.resolve))).map(r => ({ ...r })), where);
       await stampKeywordRows(ctx, results, { ...scope, excludePrivate }, queryText, startedAt, timings);
       // #3800: cap AFTER capture/meta so eval + cache see the real payload.
       return evidenceOutput(ctx, p, results, plan, { ...scope, excludePrivate }, null, snippetCap, timings,
-        async rows => withCountMeta(await buildRetrievalResponseMeta(ctx, scope, queryText, rows, null, { conceptHint: true, types, typeFilterNotice: typeFilter.notice }),
+        async rows => withCountMeta(await buildRetrievalResponseMeta(ctx, scope, queryText, rows, null, { conceptHint: true, types, typeFilterNotice: typeFilter.notice, filterHintFor: { op: 'search', p } }),
           page ?? keywordCountMeta(await keywordCount!, offset + limit)), page !== null);
     }
 
@@ -750,6 +768,7 @@ const search: Operation = {
       requireSafeChunks: ctx.remote !== false,
       takesHoldersAllowList: readHolders(ctx),
       ...(types ? { types } : {}),
+      ...(where ? { where } : {}),
       ...scope,
       ...(perCallMode ? { mode: perCallMode } : {}),
       // #4415: agent-explicit recency + salience (same posture as `query`).
@@ -769,14 +788,14 @@ const search: Operation = {
       : { results: primary };
     let results = fanned.results.map(r => ({ ...r }));
     await emitFanoutNotices(ctx, fanned.fanout, scope);
-    results = await timings.stage('anchoring', () => anchorOpResults(ctx.engine, p, queryText, results, { ...scope, excludePrivate, requireSafeChunks: ctx.remote !== false, filtered: !!types, evidencePlan: !!plan }));
+    results = await keepFrontmatterMatches(ctx.engine, await timings.stage('anchoring', () => anchorOpResults(ctx.engine, p, queryText, results, { ...scope, excludePrivate, requireSafeChunks: ctx.remote !== false, filtered: !!types || !!where, evidencePlan: !!plan })), where);
     stampDeepResearchIds(results);
     const latency_ms = Date.now() - startedAt;
     bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
     maybeCaptureSearch(ctx, queryText, results, latency_ms, true, capturedMeta);
     // #3800: cap AFTER capture/meta so eval + cache see the real payload.
     return evidenceOutput(ctx, p, results, plan, { ...scope, excludePrivate }, capturedMeta, snippetCap, timings,
-      async rows => withCountMeta(withExplainTarget({ ...(await buildRetrievalResponseMeta(ctx, scope, queryText, rows, capturedMeta, { conceptHint: true, types, typeFilterNotice: typeFilter.notice, declarations, feedbackOp: 'search', entity: fanned.entity })), ...(fanned.fanout ? { fanout: fanned.fanout } : {}) }, finishExplainTarget(ctx, p, explainPrep, results, 'search')),
+      async rows => withCountMeta(withExplainTarget({ ...(await buildRetrievalResponseMeta(ctx, scope, queryText, rows, capturedMeta, { conceptHint: true, types, typeFilterNotice: typeFilter.notice, declarations, feedbackOp: 'search', entity: fanned.entity, filterHintFor: { op: 'search', p } })), ...(fanned.fanout ? { fanout: fanned.fanout } : {}) }, finishExplainTarget(ctx, p, explainPrep, results, 'search')),
         keywordCountMeta(await keywordCount, offset + limit)));
   },
   scope: 'read', mutating: false,
@@ -820,12 +839,13 @@ const query: Operation = {
     offset: { type: 'number', description: 'Rows to skip.' },
     // #3985: multi-type filter (plumbing shipped v0.33; exposed here).
     types: { type: 'array', items: { type: 'string' }, description: TYPES_PARAM_DESCRIPTION },
+    where: WHERE_PARAM,
     // #3800: subagent token economy — per-call snippet cap.
     snippet_chars: { type: 'number', description: SNIPPET_CHARS_PARAM_DESCRIPTION },
     return_unit: RETURN_UNIT_PARAM,
     return_window: RETURN_WINDOW_PARAM,
     token_budget: { type: 'number', description: 'Evidence token cap.' },
-    expand: { type: 'boolean', description: 'Default off; search.expansion overrides.' },
+    expand: { type: 'boolean', description: 'Default off; one LLM call, rarely helps.' },
     detail: { type: 'string', description: 'low (compiled truth), medium (default) or high (all chunks).' },
     fields: FIELDS_PARAM,
     mode: { type: 'string', description: 'Local callers only.' },
@@ -858,7 +878,7 @@ const query: Operation = {
     const queryText = p.query as string | undefined;
     // #3985: validated multi-type filter (text path; the image-similarity
     // branch below also honors it — searchVector filters types at SQL level).
-    let types = normalizeTypesParam(ctx, 'query', p.types);
+    let types = normalizeTypesParam(ctx, 'query', p.types); const where = whereOpParam(ctx, 'query', p.where);
     // #3800: snippet cap (param > subagent config default > full text).
     const snippetCap = await setup(() => resolveSnippetCap(ctx, p));
     const plan = await setup(() => evidencePlanFor(ctx, p, snippetCap, 'query'));
@@ -915,7 +935,7 @@ const query: Operation = {
         excludePrivate,
         requireSafeChunks: ctx.remote !== false,
         takesHoldersAllowList: readHolders(ctx),
-        ...(types ? { types } : {}),
+        ...(types ? { types } : {}), ...(where ? { where } : {}),
         ...querySourceScope,
         ...dates,
         onVectorPoolMeta: info => {
@@ -982,8 +1002,8 @@ const query: Operation = {
       // T4/D5 — per-call mode (local/trusted only; remote ignored).
       ...((): { mode?: string } => { const m = resolvePerCallMode(ctx, p.mode); return m ? { mode: m } : {}; })(),
       detail,
-      // #3985: multi-type filter — SearchOpts.types reaches every leg.
-      types,
+      // #3985 / #7159: type and frontmatter filters reach every leg.
+      types, where,
       language: (p.lang as string) || undefined,
       symbolKind: (p.symbol_kind as string) || undefined,
       nearSymbol: (p.near_symbol as string) || undefined,
@@ -1024,7 +1044,7 @@ const query: Operation = {
     const fanned = await timings.stage('alias_fanout', () => withAliasFanOut(ctx.engine, primaryRows, queryText, { ...querySourceScope, excludePrivate },
       { excludePrivate, requireSafeChunks: ctx.remote !== false, ...(types ? { types } : {}), ...querySourceScope }, () => declarations.scan(primaryRows, queryText)));
     await emitFanoutNotices(ctx, fanned.fanout, querySourceScope);
-    results = await applyQueryArms(ctx.engine, p, queryText, fanned.results, { ...querySourceScope, excludePrivate, requireSafeChunks: ctx.remote !== false, filtered: !!types, evidencePlan: !!plan, evidenceBudget: plan?.budgetTokens, remote: ctx.remote !== false, queryEmbedding, rowCap: () => resolveEffectiveLimit(ctx, p), timer: timings });
+    results = await applyQueryArms(ctx.engine, p, queryText, fanned.results, { ...querySourceScope, excludePrivate, requireSafeChunks: ctx.remote !== false, filtered: !!types || !!where, evidencePlan: !!plan, evidenceBudget: plan?.budgetTokens, remote: ctx.remote !== false, queryEmbedding, rowCap: () => resolveEffectiveLimit(ctx, p), timer: timings });
     // #1663 — CRAG confidence gate. Grade what retrieval returned (zero-LLM;
     // reads the stamped honesty signals: evidence, exact_lookup, rerank
     // score), attach grade + query shape to the retrieval meta on EVERY call,
@@ -1079,7 +1099,7 @@ const query: Operation = {
             detail,
             // Preserve the caller's #3985 type filter on the re-run, as
             // normalized for the base call (#5390: [] and "" stay absent).
-            ...(types ? { types } : {}),
+            ...(types ? { types } : {}), ...(where ? { where } : {}),
             language: (p.lang as string) || undefined,
             symbolKind: (p.symbol_kind as string) || undefined,
             // Preserve the caller's symbol-proximity constraints too — an
@@ -1147,7 +1167,7 @@ const query: Operation = {
     }
     const latency_ms = Date.now() - startedAt;
 
-    results = results.map(r => ({ ...r }));
+    results = (await keepFrontmatterMatches(ctx.engine, results, where)).map(r => ({ ...r }));
     stampDeepResearchIds(results);
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Same shape as the
@@ -1185,7 +1205,7 @@ const query: Operation = {
     // #3800: cap AFTER capture/meta/CRAG so every internal consumer graded
     // and recorded the real payload; only the returned envelope is snipped.
     return evidenceOutput(ctx, p, results, plan, { ...querySourceScope, excludePrivate, detail }, capturedMeta, snippetCap, timings,
-      async rows => withExplainTarget({ ...(await buildRetrievalResponseMeta(ctx, querySourceScope, queryText, rows, capturedMeta, { types, typeFilterNotice: typeFilter.notice, declarations, feedbackOp: 'query', entity: fanned.entity })), crag, ...(fanned.fanout ? { fanout: fanned.fanout } : {}) }, finishExplainTarget(ctx, p, explainPrep, results, 'query')));
+      async rows => withExplainTarget({ ...(await buildRetrievalResponseMeta(ctx, querySourceScope, queryText, rows, capturedMeta, { types, typeFilterNotice: typeFilter.notice, declarations, feedbackOp: 'query', entity: fanned.entity, filterHintFor: { op: 'query', p } })), crag, ...(fanned.fanout ? { fanout: fanned.fanout } : {}) }, finishExplainTarget(ctx, p, explainPrep, results, 'query')));
   },
   scope: 'read', mutating: false,
   cliHints: { name: 'query', positional: ['query'] },
@@ -1369,9 +1389,12 @@ const cache_stats: Operation = {
   },
 };
 
+/** Each search/query call runs under its own model-call cost meter (search/search-cost.ts). */
+const metered = (op: Operation): Operation => ({ ...op, handler: (ctx, p) => withSearchCost(() => op.handler(ctx, p)) });
+
 // Ops in EXACTLY the canonical `operations` array order.
 export const searchOperations: Operation[] = [
-  search, query, assemble_evidence, search_stats, search_modes, search_tune, cache_stats,
+  metered(search), metered(query), assemble_evidence, search_stats, search_modes, search_tune, cache_stats,
 ];
 
 /**

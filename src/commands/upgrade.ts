@@ -1,5 +1,5 @@
 import type { BrainEngine } from '../core/engine.ts';
-import { execSync, execFileSync, spawnSync } from 'child_process';
+import { execSync, execFileSync, spawnSync } from '../core/spawn.ts';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, realpathSync } from 'fs';
 import { basename, join, dirname, resolve } from 'path';
 import { isNewerVersion, parseSemver, semverGt } from '../core/semver.ts';
@@ -8,7 +8,7 @@ import { opError, type OperationError } from '../core/ops/contract.ts';
 import { writeCliError } from '../cli/cli-error.ts';
 import { VERSION } from '../version.ts';
 import type { InteractiveProbe } from '../core/interaction.ts';
-import { forwardProgressPast, migrationLedgerSummary } from '../core/migration-ledger.ts';
+import { forwardProgressPast, migrationLedgerSummary, wedgedLedgerHint } from '../core/migration-ledger.ts';
 import { loadCompletedMigrations } from '../core/preferences.ts';
 import { MIGRATIONS_RUNNING_EXIT_CODE, readMigrationLockHolder } from '../core/migration-orchestration-lock.ts';
 import { loadConfig } from '../core/config.ts';
@@ -412,7 +412,7 @@ export async function describeMigrationFailure(error: unknown, newVersion: strin
   const ledger = newVersion ? loadCompletedMigrations() : [];
   const wedged = newVersion ? migrationLedgerSummary(newVersion).wedged.filter(v => forwardProgressPast(v, ledger) === null) : [];
   if (wedged.length > 0) {
-    return `Migrations: wedged (${wedged.map(v => `v${v}`).join(', ')} ended partial 3+ times in a row). Fix the cause in ~/.gbrain/upgrade-errors.jsonl, then run: `
+    return `Migrations: wedged (${wedged.map(v => `v${v}`).join(', ')} ended partial 3+ times in a row). Fix the cause recorded in ${wedgedLedgerHint()}, then run: `
       + `${wedged.map(v => `gbrain apply-migrations --force-retry ${v}`).join(' && ')} && gbrain apply-migrations --yes`;
   }
   return 'Migrations: failed. Run: gbrain apply-migrations --yes';
