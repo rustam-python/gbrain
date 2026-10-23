@@ -54,6 +54,52 @@ export function twinCheckForFullSync(
   };
 }
 
+/**
+ * One transaction: a twin must never be deleted without its redirect (links to
+ * the old slug would break, and a deleted row drops out of the next reconcile,
+ * so nothing would retry it). An existing redirect for the old slug — e.g. one
+ * the owner set by hand — is kept.
+ * maintenanceTransaction (not a plain transaction): stamps the write
+ * attribution the managed-brain guard requires, same as the sibling batch
+ * delete in company-brain/profile.ts.
+ */
+async function retireTwin(engine: BrainEngine, sourceId: string, slug: string, canonical: string): Promise<boolean> {
+  return withCompanyBrainSource(engine, sourceId, scoped => maintenanceTransaction(scoped, async tx => {
+    const deleted = await tx.softDeletePages([slug], { sourceId });
+    if (deleted.length === 0) return false;
+    await insertAliasRow(tx, sourceId, slug, canonical, 'slug grammar change');
+    return true;
+  }));
+}
+
+/**
+ * Release a file's origin before the import writes its current-grammar page.
+ * The origin index (`pages_live_origin_key`) refuses a second live page for one
+ * file, so a twin the full sync would retire afterwards has to go first: the
+ * file is the source of truth, the twin is soft-deleted (recoverable 72h) and
+ * its slug redirects to the page this import writes. Only pages `isRetiredTwin`
+ * confirms are touched; a failure leaves the twin live and the import reports
+ * the origin refusal as before.
+ */
+export async function retireOriginTwinsForImport(
+  engine: BrainEngine,
+  sourceId: string,
+  imported: { slug: string; sourcePath: string },
+  isRetiredTwin: TwinCheck,
+): Promise<number> {
+  const path = normalizeReconcilePath(imported.sourcePath);
+  const rows = await engine.executeRaw<{ slug: string; source_path: string }>(
+    `SELECT slug, source_path FROM pages WHERE source_id = $1 AND deleted_at IS NULL AND slug <> $2 AND source_path = ANY($3::text[])`,
+    [sourceId, imported.slug, [path, path.replace(/\//g, '\\')]],
+  );
+  let retired = 0;
+  for (const row of rows) {
+    if (!isRetiredTwin(row, imported)) continue;
+    try { if (await retireTwin(engine, sourceId, row.slug, imported.slug)) retired++; } catch { /* the origin guard reports it */ }
+  }
+  return retired;
+}
+
 export async function retireSupersededTwins(
   engine: BrainEngine,
   sourceId: string,
@@ -77,19 +123,7 @@ export async function retireSupersededTwins(
   for (const { slug, canonical } of superseded) {
     if (live.slugs.has(slug)) continue;
     try {
-      // One transaction: a twin must never be deleted without its redirect
-      // (links to the old slug would break, and a deleted row drops out of the
-      // next reconcile, so nothing would retry it). An existing redirect for
-      // the old slug — e.g. one the owner set by hand — is kept.
-      // maintenanceTransaction (not a plain transaction): stamps the write
-      // attribution the managed-brain guard requires, same as the sibling
-      // batch delete in company-brain/profile.ts.
-      const done = await withCompanyBrainSource(engine, sourceId, scoped => maintenanceTransaction(scoped, async tx => {
-        const deleted = await tx.softDeletePages([slug], { sourceId });
-        if (deleted.length === 0) return false;
-        await insertAliasRow(tx, sourceId, slug, canonical, 'slug grammar change');
-        return true;
-      }));
+      const done = await retireTwin(engine, sourceId, slug, canonical);
       if (done) retired++;
     } catch (err) {
       log(`  Could not retire old-slug page ${slug} (-> ${canonical}); kept, retried on the next full sync: ${(err as Error).message}`);

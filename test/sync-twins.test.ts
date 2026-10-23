@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { retireSupersededTwins, twinCheckForFullSync } from '../src/core/sync-twins.ts';
+import { retireOriginTwinsForImport, retireSupersededTwins, twinCheckForFullSync } from '../src/core/sync-twins.ts';
 
 /**
  * Retiring an old-slug twin is two writes — soft-delete the twin, redirect its
@@ -56,10 +56,13 @@ afterAll(async () => { await engine.disconnect(); });
 beforeEach(async () => {
   await engine.executeRaw(`DELETE FROM slug_aliases`);
   await engine.executeRaw(`DELETE FROM pages`);
-  for (const slug of [TWIN.slug, TWIN.canonical]) {
+  // pages_live_origin_key allows one live page per file: the twin keeps the
+  // file's origin until the import releases it, the replacement is written
+  // without one here (retireSupersededTwins only reads its slug).
+  for (const [slug, path] of [[TWIN.slug, 'wiki/Ёлка.md'], [TWIN.canonical, null]] as const) {
     await engine.executeRaw(
-      `INSERT INTO pages (source_id, slug, type, title, compiled_truth, source_path) VALUES ($1, $2, 'concept', 't', 't', 'wiki/Ёлка.md')`,
-      [SRC, slug],
+      `INSERT INTO pages (source_id, slug, type, title, compiled_truth, source_path) VALUES ($1, $2, 'concept', 't', 't', $3)`,
+      [SRC, slug, path],
     );
   }
 });
@@ -88,6 +91,28 @@ describe('retiring an old-slug twin', () => {
     expect(await retireSupersededTwins(engine, SRC, [TWIN], () => {}, noFiles)).toBe(1);
     expect(await live(TWIN.slug)).toBe(false);
     expect(await redirect(TWIN.slug)).toBe('wiki/manual');
+  });
+});
+
+describe('releasing a file origin before the import writes its page', () => {
+  const imported = { slug: TWIN.canonical, sourcePath: 'wiki/Ёлка.md' };
+  const yes = () => true;
+
+  test('retires the confirmed twin of the file and redirects its slug to the new page', async () => {
+    expect(await retireOriginTwinsForImport(engine, SRC, imported, yes)).toBe(1);
+    expect(await live(TWIN.slug)).toBe(false);
+    expect(await redirect(TWIN.slug)).toBe(TWIN.canonical);
+  });
+
+  test('leaves a page the check does not confirm as a twin alone', async () => {
+    expect(await retireOriginTwinsForImport(engine, SRC, imported, () => false)).toBe(0);
+    expect(await live(TWIN.slug)).toBe(true);
+    expect(await redirect(TWIN.slug)).toBeUndefined();
+  });
+
+  test('a page of another file is never touched', async () => {
+    expect(await retireOriginTwinsForImport(engine, SRC, { ...imported, sourcePath: 'wiki/other.md' }, yes)).toBe(0);
+    expect(await live(TWIN.slug)).toBe(true);
   });
 });
 

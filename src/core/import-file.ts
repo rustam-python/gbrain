@@ -39,7 +39,7 @@ import { embedMultimodal, currentEmbeddingSignature } from './embedding.ts';
 import { embedBatchKeepingUsable, embedBatchWithBackoff } from './embed-retry.ts';
 import { isEmbeddingZeroNormError, type EmbeddingZeroNormError } from './ai/embedding-guard.ts';
 import { slugifyPath, slugifyCodePath, isCodeFilePath, hasMalformedPathSegment } from './sync.ts';
-import type { TwinCheck } from './sync-twins.ts';
+import { retireOriginTwinsForImport, type TwinCheck } from './sync-twins.ts';
 import { addCodeReferenceLinks } from './engine-sql/links.ts';
 import type { ChunkInput, Page, PageInput, PageType } from './types.ts';
 import type { PageSnapshot } from './page-state/types.ts';
@@ -592,6 +592,7 @@ export async function importFromContent(
 
   // Identity dedup (#1309): move, skip a true duplicate, or index both.
   // See decideImportIdentity for the posture.
+  if (!existing && opts.isRetiredTwin && opts.sourcePath) await retireOriginTwinsForImport(engine, sourceId ?? 'default', { slug, sourcePath: opts.sourcePath }, opts.isRetiredTwin);
   const fmId = (parsed.frontmatter as Record<string, unknown> | undefined)?.id;
   const fmIdStr = typeof fmId === 'string' && fmId.length > 0 ? fmId : null;
   const identity = opts.forceRechunk ? { kind: 'none' as const } : await decideImportIdentity(engine, {
