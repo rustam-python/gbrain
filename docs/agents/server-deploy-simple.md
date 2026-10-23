@@ -6,7 +6,7 @@
 
 Сервер может быть на Linux или на Windows. Во всех шагах, где команды разные,
 есть два блока: `bash` для Linux и `powershell` для Windows. Бери тот, что
-подходит под ответ на вопрос 16 из шага 1. Второй блок не выполняй.
+подходит под ответ на вопрос 14 из шага 1. Второй блок не выполняй.
 
 ## Главные правила (прочитай и не нарушай)
 
@@ -36,26 +36,27 @@
 Отправь ОДНО сообщение со всеми вопросами и жди ответов. Запиши ответы себе.
 
 1. Адрес сервера и логин для SSH? (Если ты работаешь прямо на этой машине, так и скажи.) → `<HOST>`, `<SSH_USER>`
-2. Сколько на сервере RAM, диска, ядер? Есть ли swap (на Windows этот вопрос пропусти)?
-3. Под каким пользователем запускать gbrain? → `<RUN_USER>`
-4. Postgres уже стоит? Если нет, ставим на этот же сервер?
-5. Адрес API провайдера моделей (OpenAI-совместимый) и файл с ключом? → `<API_BASE>`, `<KEY_FILE>`
-6. Модель эмбеддингов и её размерность? → `<EMBED_MODEL>`, `<EMBED_DIMS>`
-7. Чат-модель? → `<CHAT_MODEL>`
-8. Заметки на русском? (да/нет) Если да: как зовут владельца в именительном падеже? → `<OWNER_NAME>`
-9. Режим поиска: `conservative`, `balanced` или `tokenmax`? → `<SEARCH_MODE>`
-10. Какой коммит форка ставить? (Не знает: возьми `master` и потом скажи хэш.) → `<FORK_COMMIT>`
-11. Чат-модель умеет вызывать инструменты (tool calling)? (да/нет/не знаю)
-12. Чат-модель «думающая», то есть сначала рассуждает, потом отвечает? (да/нет/не знаю)
-13. Нужен реранкер? Если да: какая модель и у провайдера он реально работает? → `<RERANK_MODEL>`
-14. Нужны ли фоновые подагенты (`gbrain agent`)? (да/нет)
-15. Кто по умолчанию читает факты, которые gbrain извлекает? Локальный runbook ставит `world`: читают все агенты, у которых есть доступ к этой базе. Оставить `world`? → `<FACT_VISIBILITY>`
-16. Какая ОС на сервере: Linux или Windows? → `<OS>`
-17. Есть ли уже папка агента (workspace) с готовыми `SOUL.md` и `USER.md`? Если да, какой путь? → `<WORKSPACE_DIR>` (или «нет»)
-18. Куда класть бэкапы (дамп базы, архивы)? Каталог, где хватит места. → `<BACKUP_DEST>`
+2. Под каким пользователем запускать gbrain? → `<RUN_USER>`
+3. Какая база: PGLite (встроенная, ничего ставить не нужно, хватает для небольшой базы) или Postgres (рекомендуется от 1000 файлов)? Если Postgres: он уже стоит или ставим на этот же сервер? → `<DB_MODE>` (`pglite` или `postgres`)
+4. Адрес API провайдера моделей (OpenAI-совместимый) → `<API_BASE>`. Ключ API провайдера: в каком файле на сервере он лежит? Сам ключ в чат не присылай. → `<KEY_FILE>`
+5. Модель эмбеддингов и её размерность? → `<EMBED_MODEL>`, `<EMBED_DIMS>`
+6. Чат-модель? → `<CHAT_MODEL>`
+7. Заметки на русском? (да/нет) Если да: как зовут владельца в именительном падеже? → `<OWNER_NAME>`
+8. Режим поиска: `conservative`, `balanced` или `tokenmax`? → `<SEARCH_MODE>`
+9. Чат-модель умеет вызывать инструменты (tool calling)? (да/нет/не знаю)
+10. Чат-модель «думающая», то есть сначала рассуждает, потом отвечает? (да/нет/не знаю)
+11. Нужен реранкер? Если да: какая модель и у провайдера он реально работает? → `<RERANK_MODEL>`
+12. Нужны ли фоновые подагенты (`gbrain agent`)? (да/нет)
+13. Кто по умолчанию читает факты, которые gbrain извлекает? Локальный runbook ставит `world`: читают все агенты, у которых есть доступ к этой базе. Оставить `world`? → `<FACT_VISIBILITY>`
+14. Какая ОС на сервере: Linux или Windows? → `<OS>`
+15. Есть ли уже папка агента (workspace) с готовыми `SOUL.md` и `USER.md`? Если да, какой путь? → `<WORKSPACE_DIR>` (или «нет»)
+16. Куда класть бэкапы (дамп базы, архивы)? Каталог, где хватит места. → `<BACKUP_DEST>`
+
+Версию форка не спрашивай: всегда ставь последний коммит ветки `master` и в отчёте
+(шаг 14) назови его хэш.
 
 Должно быть: есть ответ на каждый вопрос. Нет ответа на какой-то: спроси ещё раз.
-Ответ «не знаю» на вопросы 11 и 12 считай как «нет».
+Ответ «не знаю» на вопросы 9 и 10 считай как «нет».
 
 ## Шаг 2. Проверь, нет ли старой установки gbrain
 
@@ -156,7 +157,7 @@ bootstrap файлы. Базу она по умолчанию оставляет
 
 ### 2.2. Сделать бэкап базы перед удалением?
 
-Рекомендуй «да». Бэкап складывай в `<BACKUP_DEST>` (вопрос 18). Узнай, какая база и что в ней:
+Рекомендуй «да». Бэкап складывай в `<BACKUP_DEST>` (вопрос 16). Узнай, какая база и что в ней. Команды с `psql` и `pg_dump` ниже только для Postgres (есть файл `.gbrain-database-url`). Для PGLite (есть `brain.pglite`, файла с адресом нет) пропусти их, выполни только `gbrain sources list` и копирование каталога `brain.pglite` в конце этого пункта:
 
 **Linux:**
 
@@ -468,6 +469,10 @@ powershell -c "irm bun.sh/install.ps1 | iex"
 
 ## Шаг 5. Проверь Postgres
 
+Только если `<DB_MODE>` = `postgres`. Для PGLite шаги 5 и 6 пропусти и иди к шагу 7:
+PGLite встроена в gbrain, ставить и создавать ничего не нужно. Её данные лежат в
+`~/.gbrain/brain.pglite` (Windows: `$HOME\.gbrain\brain.pglite`) и появятся после `init`.
+
 ```bash
 psql --version
 ```
@@ -489,6 +494,8 @@ Postgres не установлен, а пользователь разрешил
 отдельная работа, и тебе нужна подробная инструкция от человека. Не угадывай команды установки.
 
 ## Шаг 6. Создай базу
+
+Только если `<DB_MODE>` = `postgres`. Для PGLite пропусти этот шаг.
 
 Если в шаге 2 базу не удаляли и в ней есть страницы: СТОП. Спроси пользователя,
 использовать ли эту базу. Глубина эмбеддингов (`<EMBED_DIMS>`) в базе фиксирована,
@@ -529,7 +536,6 @@ icacls "$HOME\.gbrain-database-url"
 ```bash
 git clone https://github.com/rustam-python/gbrain.git ~/gbrain
 cd ~/gbrain
-git checkout <FORK_COMMIT>
 bun install
 ```
 
@@ -538,11 +544,13 @@ bun install
 ```powershell
 git clone https://github.com/rustam-python/gbrain.git "$HOME\gbrain"
 Set-Location "$HOME\gbrain"
-git checkout <FORK_COMMIT>
 bun install
 ```
 
-Должно быть: `bun install` закончился без слова `error`.
+Это последний коммит ветки `master` форка. Версию не выбирай.
+
+Должно быть: `bun install` закончился без слова `error`. Запиши хэш для отчёта:
+`git -C ~/gbrain rev-parse HEAD` (Windows: `git -C "$HOME\gbrain" rev-parse HEAD`).
 
 Каталог `gbrain` уже существует: СТОП. Не удаляй его. Вернись к шагу 2.
 
@@ -561,7 +569,7 @@ EOF
 
 Для нерусских заметок оставь файл пустым (`: > ~/.gbrain-env`).
 
-Потом добавь в файл строку с базой, не показывая её в чате:
+Только для Postgres (PGLite пропусти) добавь в файл строку с базой, не показывая её в чате:
 
 ```bash
 printf 'GBRAIN_DATABASE_URL=%s\n' "$(cat ~/.gbrain-database-url)" >> ~/.gbrain-env
@@ -576,7 +584,7 @@ printf 'GBRAIN_DATABASE_URL=%s\n' "$(cat ~/.gbrain-database-url)" >> ~/.gbrain-e
 $env:GBRAIN_FTS_LANGUAGE = 'russian'
 ```
 
-Для нерусских заметок эти две строки пропусти. Потом адрес базы, не показывая его в чате:
+Для нерусских заметок эти две строки пропусти. Только для Postgres (PGLite пропусти) адрес базы, не показывая его в чате:
 
 ```powershell
 $url = (Get-Content "$HOME\.gbrain-database-url" -Raw).Trim()
@@ -584,7 +592,7 @@ $url = (Get-Content "$HOME\.gbrain-database-url" -Raw).Trim()
 $env:GBRAIN_DATABASE_URL = $url
 ```
 
-Должно быть: `[Environment]::GetEnvironmentVariable('GBRAIN_DATABASE_URL','User') -ne $null` печатает `True`.
+Должно быть (Postgres): `[Environment]::GetEnvironmentVariable('GBRAIN_DATABASE_URL','User') -ne $null` печатает `True`.
 Новые окна `pwsh` увидят переменные сами, текущее окно уже их видит (вторая строка в каждом блоке).
 
 Важно: `GBRAIN_FTS_LANGUAGE` должна быть задана ДО шага 10 (`init`). После init
@@ -662,7 +670,32 @@ gbrain init --url $url --non-interactive `
   --search-mode <SEARCH_MODE>
 ```
 
-Если миграция упала на `CREATE EVENT TRIGGER` или `must be superuser`: СТОП.
+Команды выше для Postgres. Для PGLite (`<DB_MODE>` = `pglite`) вместо `--url ...` пиши `--pglite`,
+остальное без изменений.
+
+**Linux:**
+
+```bash
+gbrain init --pglite --non-interactive \
+  --embedding-model openrouter:<EMBED_MODEL> --embedding-dimensions <EMBED_DIMS> \
+  --expansion-model openrouter:<CHAT_MODEL> --chat-model openrouter:<CHAT_MODEL> \
+  --search-mode <SEARCH_MODE>
+```
+
+**Windows:**
+
+```powershell
+gbrain init --pglite --non-interactive `
+  --embedding-model "openrouter:<EMBED_MODEL>" --embedding-dimensions <EMBED_DIMS> `
+  --expansion-model "openrouter:<CHAT_MODEL>" --chat-model "openrouter:<CHAT_MODEL>" `
+  --search-mode <SEARCH_MODE>
+```
+
+Скажи пользователю: у PGLite база открыта одним процессом. Пока работает `gbrain serve`,
+команды CLI могут отказаться запускаться. Если пользователю нужен одновременный доступ
+(например, MCP с телефона и CLI), посоветуй Postgres.
+
+Если миграция упала на `CREATE EVENT TRIGGER` или `must be superuser` (только Postgres): СТОП.
 Это известная проблема, у роли нет прав суперпользователя. Скажи пользователю:
 «Миграции требуют на время выдать роли `SUPERUSER`. Выдать?» Только после «да»,
 и пользователь сам выполняет:
@@ -771,7 +804,7 @@ gbrain config set chunk_strategy semantic
 * `agent.use_gateway_loop true`: без него агентные задачи падают на любой модели, кроме Anthropic.
 * Последние пять ключей (`facts…`, `dream.propose_takes…`, `conversation_parser…`, `chunk_strategy`) значения взяли из локального runbook. Не меняй их числа.
 
-### 12.3. Только если чат-модель умеет вызывать инструменты (вопрос 11 = да)
+### 12.3. Только если чат-модель умеет вызывать инструменты (вопрос 9 = да)
 
 ```bash
 gbrain config set models.dream.patterns "openrouter:<CHAT_MODEL>"
@@ -781,7 +814,7 @@ gbrain config set models.dream.synthesize "openrouter:<CHAT_MODEL>"
 Ответ «нет» или «не знаю»: пропусти оба ключа и скажи пользователю в отчёте, что фаза
 `dream patterns` на этой модели не заработает.
 
-### 12.4. Только если модель «думающая» (вопрос 12 = да)
+### 12.4. Только если модель «думающая» (вопрос 10 = да)
 
 ```bash
 gbrain config set agent.max_output_tokens 32000
@@ -789,7 +822,7 @@ gbrain config set agent.max_output_tokens 32000
 
 ### 12.5. Реранкер
 
-Реранкер нужен и работает (вопрос 13):
+Реранкер нужен и работает (вопрос 11):
 
 ```bash
 gbrain config set search.reranker.enabled true
@@ -802,7 +835,7 @@ gbrain config set search.reranker.model "<RERANK_MODEL>"
 gbrain config set search.reranker.enabled false
 ```
 
-### 12.6. Только если нужны фоновые подагенты (вопрос 14 = да)
+### 12.6. Только если нужны фоновые подагенты (вопрос 12 = да)
 
 ```bash
 gbrain config set models.tier.subagent "openrouter:<CHAT_MODEL>"
@@ -811,7 +844,7 @@ gbrain config set models.tier.subagent "openrouter:<CHAT_MODEL>"
 Без этого `gbrain models` предупредит, что для подагентов нужен ключ Anthropic. Если
 подагенты не нужны, пропусти.
 
-### 12.7. Только если заметки на русском (вопрос 8 = да)
+### 12.7. Только если заметки на русском (вопрос 7 = да)
 
 Если `facts.extraction_prompt_appendix` в 12.1 уже не пустой: СТОП. Покажи
 пользователю старый и новый текст, не затирай без «да».
@@ -855,7 +888,7 @@ gbrain recall "проверка установки"
 
 Напиши пользователю:
 
-1. Что установлено: ОС, версия gbrain и хэш коммита.
+1. Что установлено: ОС, база (PGLite или Postgres), версия gbrain и хэш коммита (из шага 7).
 2. Что удалено в шаге 2 (если удаляли) и где лежит бэкап.
 3. Какие настройки поставил (список ключей) и какие пропустил.
 4. Что проверено и прошло (шаг 13).
