@@ -3,7 +3,7 @@
  * Each stage reads the resolved request (HybridRequest, request.ts) and
  * writes its per-request accumulators only as `req.<field>`.
  */
-import { applyGeneratedDemotion } from '../provenance-demotion.ts';
+import { applyGeneratedDemotion, type GeneratedPage } from '../provenance-demotion.ts';
 import { normalizeChainSlots } from '../relational-chain.ts';
 import type { BrainEngine } from '../../engine.ts';
 import { perArmPoolLimit } from '../eval-pool-depth.ts';
@@ -293,6 +293,7 @@ export async function resolveHybridRequest(
     // Direct searchKeyword consumers (countMentions, link-extraction, eval)
     // do NOT set this. Knob: search.keywordOrFallback (rationale: ModeBundle).
     orFallback: resolvedMode.keywordOrFallback,
+    onKeywordIncomplete: (reason) => pushDegraded(degraded, 'keyword_candidates_incomplete', reason),
     // v0.46.15: collect searchVector's bounded-escalation exhaustion signal —
     // engines have no telemetry sink (R2-10); hybrid owns the meta emit.
     // ACCUMULATES across vector calls (adversarial F8): expansion runs N
@@ -337,9 +338,9 @@ export async function resolveHybridRequest(
 
   // Intent identity boosts (exact/mentioned title or slug, mentioned alias),
   // shared by the fused path and both keyword-only paths. Caller re-sorts.
-export async function applyIdentityBoosts(req: HybridRequest, list: SearchResult[]): Promise<void> {
+export async function applyIdentityBoosts(req: HybridRequest, list: SearchResult[], generatedRead?: Promise<GeneratedPage[] | null>): Promise<void> {
   const { engine, query, opts, suggestions, intentWeightingOn, intentWeights, resolvedMode } = req;
-  await applyGeneratedDemotion(engine, list, query, { sourceId: opts?.sourceId, sourceIds: opts?.sourceIds, excludePrivate: opts?.excludePrivate });
+  await applyGeneratedDemotion(engine, list, query, { sourceId: opts?.sourceId, sourceIds: opts?.sourceIds, excludePrivate: opts?.excludePrivate }, generatedRead);
   if (intentWeights.exactMatchBoost === 1.0) {
     // #4694: general and temporal questions still honor a multi-token
     // title that is the query's subject. Not concept intent (Cat 13: a

@@ -53,6 +53,25 @@ describe('withSearchSettings', () => {
     expect(Connection.statementTimeoutChanges(statements[0]!.sql, statements[0]!.params)).toEqual([{ kind: 'set', local: true, ms: 8000 }]);
   });
 
+  test('top level: the read is sent behind the settings statement without waiting for its answer', async () => {
+    const sent: string[] = [];
+    let answer!: () => void;
+    const tx = { unsafe: (sql: string) => { sent.push(sql); return new Promise<unknown[]>(resolve => { answer = () => resolve([]); }); } } as never;
+    let readStarted = false;
+    const pending = withSearchSettings(tx, false, { jit: 'off' }, async () => { readStarted = true; return 'rows'; });
+    await Promise.resolve();
+    expect(readStarted).toBe(true);
+    expect(sent).toEqual(["SELECT set_config('jit', $1, true)"]);
+    answer();
+    expect(await pending).toBe('rows');
+  });
+
+  test('top level: a refused settings statement is the error raised, ahead of the read that failed behind it', async () => {
+    const tx = { unsafe: async () => { throw new Error('settings sentinel'); } } as never;
+    await expect(withSearchSettings(tx, false, { jit: 'off' }, async () => { throw new Error('current transaction is aborted'); })).rejects.toThrow('settings sentinel');
+    await expect(withSearchSettings(tx, false, { jit: 'off' }, async () => 'rows')).rejects.toThrow('settings sentinel');
+  });
+
   test("nested: reads the caller's values, sets its own, restores the caller's (fallback for an unloaded extension setting)", async () => {
     const { tx, statements } = recordingTx({ jit: 'on', 'hnsw.ef_search': null });
     let during = -1;
@@ -119,15 +138,16 @@ describe('PostgresEngine.searchKeyword: statements per search transaction', () =
     return { engine, transactions };
   }
 
-  test('strict attempt: settings then query; OR fallback: the same two, with enable_seqscan off in the one settings statement', async () => {
+  test('strict attempt: settings then query; OR fallback: the same two, with enable_seqscan off in the one settings statement (work_mem in both, GBRA-156)', async () => {
     const { engine, transactions } = recordingEngine();
     expect(await engine.searchKeyword('alpha beta', { orFallback: true })).toEqual([]);
     expect(transactions).toHaveLength(2);
     const [strict, relaxed] = transactions.map(statements => statements.map(s => s.sql.trim().split('\n')[0]!.slice(0, 60)));
     expect(strict).toEqual(["SELECT set_config('jit', $1, true), set_config('statement_ti", 'WITH ranked_chunks AS (']);
     expect(relaxed).toEqual(["SELECT set_config('jit', $1, true), set_config('statement_ti", 'WITH ranked_chunks AS (']);
-    expect(transactions[0]![0]!.params).toEqual(['off', '8000ms']);
-    expect(transactions[1]![0]!.sql).toBe("SELECT set_config('jit', $1, true), set_config('statement_timeout', $2, true), set_config('enable_seqscan', $3, true)");
-    expect(transactions[1]![0]!.params).toEqual(['off', '8000ms', 'off']);
+    expect(transactions[0]![0]!.sql).toBe("SELECT set_config('jit', $1, true), set_config('statement_timeout', $2, true), set_config('work_mem', $3, true)");
+    expect(transactions[0]![0]!.params).toEqual(['off', '8000ms', '32MB']);
+    expect(transactions[1]![0]!.sql).toBe("SELECT set_config('jit', $1, true), set_config('statement_timeout', $2, true), set_config('enable_seqscan', $3, true), set_config('work_mem', $4, true)");
+    expect(transactions[1]![0]!.params).toEqual(['off', '8000ms', 'off', '32MB']);
   });
 });

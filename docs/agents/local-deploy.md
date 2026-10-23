@@ -344,7 +344,17 @@ done
 <GBRAIN_CMD> config set pricing.overrides '{"litellm:<CHAT_ALIAS>": 0}'
 ```
 
-При настройке из разделов 4–5 это не нужно.
+Для фазы `dream synthesize_concepts` одного `pricing.overrides` мало.
+Она берёт цену из реестра цен и на неизвестной модели считает её по
+тарифу Sonnet. Лимит $1.50 тогда выбирается, а остаток концептов уходит в
+шаблонный fallback (`N over the $1.50 budget`). Локальная модель ничего не
+стоит, поэтому зарегистрируй ей цену 0:
+
+```bash
+<GBRAIN_CMD> pricing set litellm:<CHAT_ALIAS> --input 0 --output 0 --source local
+```
+
+Фазам из разделов 4–5 (`patterns`, `synthesize`) это не нужно.
 
 ## 8. Почему агентные фазы идут через `litellm` (задача #27)
 

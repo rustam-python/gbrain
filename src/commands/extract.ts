@@ -38,7 +38,8 @@
  * whole corpus through getPage.
  */
 
-import { readFileSync, readdirSync, lstatSync, existsSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
+import { classifyItemFailure } from '../core/item-failure.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { ATTENDANCE_REPAIR_HELP, isAttendanceRepairRequest } from './extract-attendance-repair.ts';
 import { join, relative, dirname } from 'path';
@@ -76,7 +77,8 @@ import { managedPersistenceEnabled } from '../core/persistence/ownership.ts';
 import { addProjectedTimelineBatch, addProjectedTimelineEntry } from '../core/trust/timeline-projection.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
-import { pathToSlug, slugifyPath, slugifySegment, pruneDir, isSyncable } from '../core/sync.ts';
+import { pathToSlug, slugifyPath, slugifySegment, readMetafilePagesMode, DEFAULT_METAFILE_PAGES_MODE, type MetafilePagesMode } from '../core/sync.ts';
+import { indexMarkdownTree, indexSlugPath, markdownWalk, withEndpointPageTypes, type MarkdownTree, type PageTypeLookup } from './extract-tree.ts';
 // v0.41.18.0: withRetry + isRetryableConnError + WithRetryOpts moved to
 // src/core/retry.ts as the canonical primitive. Engine methods
 // (addLinksBatch/addTimelineEntriesBatch/upsertChunks) now self-retry via
@@ -287,7 +289,7 @@ interface ExtractResult {
 
 // --- Shared walker ---
 
-export function walkMarkdownFiles(dir: string): { path: string; relPath: string }[] {
+export function walkMarkdownFiles(dir: string, metafilePages: MetafilePagesMode = DEFAULT_METAFILE_PAGES_MODE): { path: string; relPath: string }[] {
   // Descent-time pruning + emit-time isSyncable filter (closes #923, #202).
   // Pre-fix, this walker had only an ad-hoc dot-prefix exclusion and didn't
   // call isSyncable at all — so it descended into `node_modules/`, emitted
@@ -296,25 +298,7 @@ export function walkMarkdownFiles(dir: string): { path: string; relPath: string 
   // subtrees before recursion (saving IO), and isSyncable filters the emit
   // set against the canonical markdown-strategy rules.
   const files: { path: string; relPath: string }[] = [];
-  function walk(d: string) {
-    for (const entry of readdirSync(d)) {
-      const full = join(d, entry);
-      try {
-        const st = lstatSync(full);
-        if (st.isDirectory()) {
-          // v0.37.7.0 #1169: pass parentDir so pruneDir can detect git
-          // submodule pointers (`.git` as a file inside the candidate).
-          if (!pruneDir(entry, d)) continue;
-          walk(full);
-        } else if (entry.endsWith('.md') && !entry.startsWith('_')) {
-          const rel = relative(dir, full);
-          if (!isSyncable(rel, { strategy: 'markdown' })) continue;
-          files.push({ path: full, relPath: rel });
-        }
-      } catch { /* skip unreadable */ }
-    }
-  }
-  walk(dir);
+  for (const _ of markdownWalk(dir, dir, file => files.push(file), metafilePages)) { /* one directory done */ }
   return files;
 }
 
@@ -338,10 +322,7 @@ export function buildSlugPathIndex(
   files: ReadonlyArray<{ relPath: string }>,
 ): Map<string, string> {
   const index = new Map<string, string>();
-  for (const file of files) {
-    const slug = pathToSlug(file.relPath);
-    if (!index.has(slug) || file.relPath === `${slug}.md`) index.set(slug, file.relPath);
-  }
+  for (const file of files) indexSlugPath(index, pathToSlug(file.relPath), file.relPath);
   return index;
 }
 
@@ -527,7 +508,7 @@ async function loadSlugAliasTargets(engine: BrainEngine, sourceId: string, allSl
 export async function extractLinksFromFile(
   content: string, relPath: string, allSlugs: Set<string>,
   opts?: { includeFrontmatter?: boolean; globalBasename?: boolean; pack?: LinkExtractionPack | null;
-    pageTypes?: ReadonlyMap<string, string>; aliases?: ReadonlyMap<string, string>;
+    pageTypes?: PageTypeLookup; aliases?: ReadonlyMap<string, string>;
     lineGrammar?: { enabled?: boolean; allowUndeclaredTypes?: boolean } },
 ): Promise<ExtractedLink[]> {
   const links: ExtractedLink[] = [];
@@ -814,7 +795,7 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
   let stampRefs: Array<{ slug: string; source_id: string; extractedAt: string }> = [];
   if (!dryRun && opts.mode === 'all') {
     const stampSourceId = opts.sourceId ?? 'default';
-    const walkRefs = walkMarkdownFiles(opts.dir)
+    const walkRefs = walkMarkdownFiles(opts.dir, await readMetafilePagesMode(engine))
       .map(f => ({ slug: pathToSlug(f.relPath), source_id: stampSourceId }));
     stampRefs = refsWithSnapshotStamps(walkRefs, await snapshotStampTimes(engine, walkRefs));
   }
@@ -1355,7 +1336,7 @@ async function extractForSlugs(
   const lost = new LostWrites();
   const stdoutQuiet = jsonMode || quiet;
   // Build the full slug set for link resolution (fast: just readdir, no file reads)
-  const allFiles = walkMarkdownFiles(brainDir);
+  const allFiles = walkMarkdownFiles(brainDir, await readMetafilePagesMode(engine));
   // Same real-path resolution the sync hooks use (see buildSlugPathIndex).
   // Rebuilding `slug + '.md'` here made the cycle's incremental extract treat
   // every non-slug filename as a deleted file and skip it without a word.
@@ -1531,7 +1512,7 @@ async function extractLinksFromDir(
   lost: LostWrites = new LostWrites(),
 ): Promise<{ created: number; pages: number; processed: string[] }> {
   const stdoutQuiet = jsonMode || quiet;
-  const files = walkMarkdownFiles(brainDir);
+  const files = walkMarkdownFiles(brainDir, await readMetafilePagesMode(engine));
   const allSlugs = new Set(files.map(f => pathToSlug(f.relPath)));
   const quarantined = await quarantinedSlugs(engine, sourceId ?? 'default');
 
@@ -1621,7 +1602,7 @@ async function extractTimelineFromDir(
 ): Promise<{ created: number; pages: number; processed: string[] }> {
   const processed: string[] = [];
   const stdoutQuiet = jsonMode || quiet;
-  const files = walkMarkdownFiles(brainDir);
+  const files = walkMarkdownFiles(brainDir, await readMetafilePagesMode(engine));
   const quarantined = await quarantinedSlugs(engine, sourceId ?? 'default');
 
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
@@ -1725,15 +1706,15 @@ export async function extractLinksForSlugs(
   engine: BrainEngine,
   repoPath: string,
   slugs: string[],
-  opts?: { sourceId?: string; includeFrontmatter?: boolean },
+  opts?: { sourceId?: string; includeFrontmatter?: boolean; tree?: MarkdownTree },
 ): Promise<ExtractForSlugsResult> {
-  const allFiles = walkMarkdownFiles(repoPath);
+  const tree = opts?.tree ?? await indexMarkdownTree(repoPath, await readMetafilePagesMode(engine));
   // Resolve each requested slug to its REAL path (see buildSlugPathIndex).
   // The old reconstructed path missed any file whose name is not already a
   // slug: `existsSync` was false, the page was skipped in silence, and the
   // caller stamped it extracted anyway — so `extract --stale` never came
   // back for it and the edges were lost for good.
-  const slugToPath = buildSlugPathIndex(allFiles);
+  const slugToPath = tree.slugToPath;
   const allSlugs = new Set(slugToPath.keys());
   // Post-sync extract replaces each page's own markdown-derived edges in the
   // caller's source (the put_page contract); cross-source extraction would
@@ -1744,7 +1725,6 @@ export async function extractLinksForSlugs(
   const sourceId = opts?.sourceId ?? 'default';
   const pack = (await loadActivePackForLocalEngine(engine, { sourceId }))?.manifest ?? null;
   if (!pack) throw new Error('Cannot extract links: active schema pack is unavailable.');
-  const pageTypes = loadFsPageTypes(allFiles, pack);
   const aliases = await loadSlugAliasTargets(engine, sourceId, allSlugs);
   // #4999: resolved HERE, like isGlobalBasenameEnabled above, so every caller
   // (sync, GitHub/Google source inline extracts) honours the configured
@@ -1758,15 +1738,27 @@ export async function extractLinksForSlugs(
   // leaves the page stale and `extract --stale` picks it up next run.
   const processed: string[] = [];
   const errors: Array<{ slug: string; error: string }> = [];
-  const reads: Array<{ slug: string; relPath: string; content: string; links: LinkBatchInput[] }> = [];
+  const files: Array<{ slug: string; relPath: string; content: string } | { slug: string; error: string }> = [];
   for (const slug of slugs) {
     const relPath = quarantined.has(slug) ? undefined : resolveSlugRelPath(slugToPath, repoPath, slug);
     if (relPath === undefined) continue;
-    try {
-      // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- relPath comes from the slug→path index built by walkMarkdownFiles(repoPath) (repo-relative entries of that walk) or the validated-slug legacy fallback, never from a caller
-      const content = readFileSync(join(repoPath, relPath), 'utf-8');
-      reads.push({ slug, relPath, content, links: await extractLinksFromFile(content, relPath, allSlugs, { globalBasename, includeFrontmatter, pack, pageTypes, aliases }) });
-    } catch (e) { errors.push({ slug, error: e instanceof Error ? e.message : String(e) }); }
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- relPath comes from the slug→path index built by walkMarkdownFiles(repoPath) (repo-relative entries of that walk) or the validated-slug legacy fallback, never from a caller
+    try { files.push({ slug, relPath, content: readFileSync(join(repoPath, relPath), 'utf-8') }); }
+    catch (e) { files.push({ slug, error: e instanceof Error ? e.message : String(e) }); }
+  }
+  const extracted = await withEndpointPageTypes(repoPath, tree, pack, async (pageTypes) => {
+    const out: Array<{ slug: string; relPath: string; content: string; links: LinkBatchInput[] } | { slug: string; error: string }> = [];
+    for (const file of files) {
+      if ('error' in file) { out.push(file); continue; }
+      try { out.push({ ...file, links: await extractLinksFromFile(file.content, file.relPath, allSlugs, { globalBasename, includeFrontmatter, pack, pageTypes, aliases }) }); }
+      catch (e) { out.push({ slug: file.slug, error: e instanceof Error ? e.message : String(e) }); }
+    }
+    return out;
+  });
+  const reads: Array<{ slug: string; relPath: string; content: string; links: LinkBatchInput[] }> = [];
+  for (const entry of extracted) {
+    if ('error' in entry) errors.push(entry);
+    else reads.push(entry);
   }
   // A16: metadata for the changed pages and their link endpoints only; the
   // whole-brain load is deferred to the rare attendance (meeting) page.
@@ -1795,11 +1787,11 @@ export async function extractTimelineForSlugs(
   engine: BrainEngine,
   repoPath: string,
   slugs: string[],
-  opts?: { sourceId?: string },
+  opts?: { sourceId?: string; tree?: MarkdownTree },
 ): Promise<ExtractForSlugsResult> {
   // Real-path resolution, same as extractLinksForSlugs. Both halves come off
   // one `links_extracted_at` stamp, so both must agree on what was read.
-  const slugToPath = buildSlugPathIndex(walkMarkdownFiles(repoPath));
+  const slugToPath = (opts?.tree ?? await indexMarkdownTree(repoPath, await readMetafilePagesMode(engine))).slugToPath;
   // v0.18.0+ multi-source: source-qualify so timeline rows don't fan out
   // across every source containing the slug (the addTimelineEntry's
   // INSERT...SELECT-from-pages fan-out was Data R1's HIGH 2).
@@ -2223,6 +2215,7 @@ export async function extractStaleFromDB(
   // from a genuinely missing target.
   let skippedCrossSource = 0, skippedChanged = 0, skippedConcurrentWrite = 0;
   const unknownSource: UnknownSourceSkip[] = [];
+  const contentFailures: string[] = [];
 
   const wantedEnabled = await isWantedPagesEnabled(engine);
   const plannerTick = await plannerStatsForLinkDrain(engine, async () => totalStale);
@@ -2267,9 +2260,16 @@ export async function extractStaleFromDB(
             page.source_id, allSlugs, slugToSources, federatedSourceIds.has(page.source_id), { crossSource, defaultSourceId: linkDefaultSourceId });
           return !resolved.ok ? undefined : targetSlug === page.slug && resolved.toSourceId === page.source_id ? snapshot.page.type : targetMetadata.get(`${resolved.toSourceId}\0${targetSlug}`)?.type;
         } };
-        const extracted: Awaited<ReturnType<typeof extractSegmentedPageLinks>> = fullContent === null
-          ? await extractSegmentedPageLinks(engine, { ...withoutBody(snapshot.page), id: Number(snapshot.page.id), slug: page.slug, source_id: page.source_id }, resolver, { ...pageLinkOpts, temporal: true })
-          : await extractPageLinks(page.slug, fullContent, snapshot.page.frontmatter, snapshot.page.type, resolver, pageLinkOpts);
+        // #7357: a page whose own content the reader refuses (a run over the block bound) is reported and stays stale; the sweep goes on.
+        const extracted: Awaited<ReturnType<typeof extractSegmentedPageLinks>> | null = await (fullContent === null
+          ? extractSegmentedPageLinks(engine, { ...withoutBody(snapshot.page), id: Number(snapshot.page.id), slug: page.slug, source_id: page.source_id }, resolver, { ...pageLinkOpts, temporal: true })
+          : extractPageLinks(page.slug, fullContent, snapshot.page.frontmatter, snapshot.page.type, resolver, pageLinkOpts)).catch((error: unknown) => {
+          const f = classifyItemFailure(error);
+          if (f.scope !== 'item' || f.class !== 'content') throw error;
+          contentFailures.push(`${page.source_id}:${page.slug}: ${f.code}: ${f.message.slice(0, 500)}`);
+          return null;
+        });
+        if (!extracted) continue;
         if (!extracted.attendanceComplete) {
           skippedAttendanceIncomplete++;
           attendanceBlocked.push({ slug: page.slug, source_id: page.source_id, revision: snapshot.revision });
@@ -2363,6 +2363,7 @@ export async function extractStaleFromDB(
     if (skippedChanged) log(settingsChangedSkipLine(skippedChanged));
     if (skippedConcurrentWrite) log(concurrentWriteSkipLine(skippedConcurrentWrite));
     if (unknownSource.length) log(unknownSourceSkipLine(unknownSource));
+    if (contentFailures.length) log(`${contentFailures.length} page(s) failed link extraction and stay stale; the other pages were derived:\n  ${contentFailures.slice(0, 20).join('\n  ')}`);
     if (skippedMissingTarget > 0) {
       log(`Skipped ${skippedMissingTarget} candidate(s) whose target page doesn't exist (references to non-pages are never persisted).`);
     }
@@ -2381,10 +2382,11 @@ export async function extractStaleFromDB(
       ...(skippedAttendanceIncomplete ? { skipped_attendance_incomplete: skippedAttendanceIncomplete } : {}), ...(skippedChanged ? { skipped_changed: skippedChanged } : {}),
       ...(skippedConcurrentWrite ? { skipped_concurrent_write: skippedConcurrentWrite } : {}),
       ...(unknownSource.length ? { skipped_unknown_source: unknownSource.length, unknown_source_pages: unknownSource.slice(0, 20) } : {}), ...mentionJsonFields(mentions), ...counts,
+      ...(contentFailures.length ? { failed: contentFailures.length, failures: contentFailures.slice(0, 20) } : {}),
     }) + '\n');
   }
   return { linksCreated, timelineCreated, pagesProcessed, staleRemaining, skippedMissingTarget, skippedCrossSource,
-    ...(skippedAttendanceIncomplete ? { skippedAttendanceIncomplete } : {}), ...(skippedChanged ? { skippedChanged } : {}), ...(skippedConcurrentWrite ? { skippedConcurrentWrite } : {}), ...(unknownSource.length ? { skippedUnknownSource: unknownSource.length } : {}), mentions };
+    ...(skippedAttendanceIncomplete ? { skippedAttendanceIncomplete } : {}), ...(skippedChanged ? { skippedChanged } : {}), ...(skippedConcurrentWrite ? { skippedConcurrentWrite } : {}), ...(unknownSource.length ? { skippedUnknownSource: unknownSource.length } : {}), ...(contentFailures.length ? { linkFailed: contentFailures.length } : {}), mentions };
 }
 
 /**
