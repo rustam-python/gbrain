@@ -1,6 +1,7 @@
 import { throwIfHeld } from '../trust/gate-outcomes.ts';
 import { guardRemoteForget, remoteForgetRaced, supersessionGuarded } from '../trust/supersede-handlers.ts';
 import { randomUUID } from 'node:crypto';
+import { slugifyText } from '../cjk.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import type { BrainEngine } from '../engine.ts';
 import { opError, OperationError, verbError } from '../ops/contract.ts';
@@ -266,7 +267,7 @@ async function resolveRememberEntity(ctx: OperationContext, sourceId: string, en
     not_entity: `entity "${entity}" names a page that is not a person, company or other entity.`,
     no_page: `No page is named "${entity}".`,
   }[strict.miss];
-  const example = candidates[0] ?? `people/${entity.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`;
+  const example = candidates[0] ?? `people/${slugifyText(entity, 80)}`;
   const error = verbError('invalid_params', `${what}${named} Nothing was saved.`,
     `Pass entity as the page slug with its folder, e.g. entity: "${example}". A slug with a folder saves under that page, even one not written yet; a name without one must match exactly one page.`);
   error.reason = `entity_${strict.miss}`;
