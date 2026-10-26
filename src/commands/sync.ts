@@ -21,6 +21,8 @@ export interface SyncResult {
   managedWrite?: import('../core/persistence/sync-run.ts').ManagedSyncWriteDiagnostic;
   /** #6643: the request a rediscovery that retries a recorded failure waits for (its producer and slug), instead of a silent no-op. */
   retryWait?: import('../core/persistence/sync-run.ts').RetryWait;
+  /** #7167: a managed dry run's read of the source's writer: open write requests (queued, running or recovering) and the oldest one's age. */
+  writer?: import('../core/persistence/sync-dry-run-writer.ts').DryRunWriterState;
   /** #6712 PR 1: another drainer holds (or took) the source's drain lease; `resumable`, nothing admitted by this run. */
   leaseHeld?: import('../core/persistence/sync-lease.ts').DrainLeaseHeld;
   /**
@@ -200,6 +202,12 @@ export interface SyncOpts {
   /** #6696: a runtime paid-work constraint (the cost gate deferred this run's embedding); never a processing option, never lifted by cursor adoption. */
   embedDeferred?: boolean;
   /**
+   * G8 (persistence/git-conversion.ts): the conversion apply's strict-equivalent full pass, run before the source row says
+   * `canonical: git`. Internal: no CLI flag or MCP parameter sets it, it refuses a remote caller, and it cannot reach
+   * working-tree mode (resolveManagedSyncContext refuses `--working-tree` for a strict-classified pass).
+   */
+  canonicalOverride?: 'git';
+  /**
    * v0.18.0 Step 5 — sync a specific named source. When set, sync reads
    * local_path + last_commit from the sources table (not the global
    * config.sync.* keys) and writes last_commit + last_sync_at back to
@@ -362,7 +370,7 @@ export interface SyncOpts {
    * breadcrumbs already cover that surface).
    */
   onProgress?: (p: { phase: string; bankedFiles?: number; total?: number; waived?: boolean; group?: number;
-    /** #5984 lanes (phase `managed_sync.lanes`). */ lanes?: { effective: number; stepDown: string | null; overlapped: number; fallbacks: number } }) => void;
+    /** #5984 lanes (phase `managed_sync.lanes`). */ lanes?: { effective: number; stepDown: string | null; overlapped: number; fallbacks: number }; /** #7243: a pass round (`managed_sync.round_level`, `managed_sync.round_admit`). */ round?: { round: number; target: string; paths: number; read_ms?: number; imports?: number; deletes?: number; in_flight?: number } }) => void;
   /**
    * #5984: managed sync only. Re-enter the single-pass managed sync until the
    * cursor is done, the caller's signal/deadline stops it, or it is blocked
