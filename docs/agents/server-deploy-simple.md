@@ -567,48 +567,46 @@ bun install
 (Windows: вместо `$HOME\gbrain` и `%USERPROFILE%\gbrain`), хэш для отчёта бери оттуда.
 Ошибка `Module not found ".../src/cli.ts"` значит, что в обёртке путь не от этой машины.
 
-## Шаг 8. Создай файл или переменные окружения
+## Шаг 8. Создай файл `~/.gbrain/.env`
 
-Покажи пользователю содержимое и жди «да».
+gbrain сам читает этот файл при каждом запуске, в любом окне и в любой сессии. Поэтому
+переменные пользователя, `export` и `$env:` перед командами не нужны, и в команды ничего
+подставлять не надо. Переменная, заданная прямо в окне, важнее файла.
 
-**Linux.** Для русских заметок:
+В файл идёт:
+
+* `GBRAIN_FTS_LANGUAGE=russian`, только если заметки на русском (вопрос 7).
+* `OPENROUTER_API_KEY=<ключ из <KEY_FILE>>`. Имя переменной такое, даже если провайдер не OpenRouter.
+
+Адрес базы в файл не пиши: `gbrain init --url` в шаге 10 сам запишет его в `~/.gbrain/config.json`.
+Ключ не показывай в чате: берёшь его из файла командой, а не копируешь руками.
+
+Покажи пользователю, какие имена переменных запишешь (без значений), и жди «да».
+
+**Linux:**
 
 ```bash
 umask 077
-cat > ~/.gbrain-env <<'EOF'
-GBRAIN_FTS_LANGUAGE=russian
-EOF
+mkdir -p ~/.gbrain
+printf 'OPENROUTER_API_KEY=%s\n' "$(cat <KEY_FILE>)" > ~/.gbrain/.env
+printf 'GBRAIN_FTS_LANGUAGE=russian\n' >> ~/.gbrain/.env   # только для русских заметок
 ```
 
-Для нерусских заметок оставь файл пустым (`: > ~/.gbrain-env`).
+Должно быть: `ls -l ~/.gbrain/.env` показывает `-rw-------`.
 
-Только для Postgres (PGLite пропусти) добавь в файл строку с базой, не показывая её в чате:
-
-```bash
-printf 'GBRAIN_DATABASE_URL=%s\n' "$(cat ~/.gbrain-database-url)" >> ~/.gbrain-env
-```
-
-Должно быть: `ls -l ~/.gbrain-env` показывает `-rw-------`.
-
-**Windows.** Файла окружения нет, вместо него переменные пользователя. Для русских заметок:
+**Windows:**
 
 ```powershell
-[Environment]::SetEnvironmentVariable('GBRAIN_FTS_LANGUAGE', 'russian', 'User')
-$env:GBRAIN_FTS_LANGUAGE = 'russian'
+New-Item -ItemType Directory -Force "$HOME\.gbrain" | Out-Null
+$key = (Get-Content "<KEY_FILE>" -Raw).Trim()
+Set-Content -Path "$HOME\.gbrain\.env" -Encoding ascii -Value "OPENROUTER_API_KEY=$key"
+Add-Content -Path "$HOME\.gbrain\.env" -Encoding ascii -Value "GBRAIN_FTS_LANGUAGE=russian"   # только для русских заметок
 ```
 
-Для нерусских заметок эти две строки пропусти. Только для Postgres (PGLite пропусти) адрес базы, не показывая его в чате:
+Должно быть: файл существует, в нём одна или две строки вида `ИМЯ=значение`. Значения не печатай:
+`(Get-Content "$HOME\.gbrain\.env") -replace '=.*','=***'`.
 
-```powershell
-$url = (Get-Content "$HOME\.gbrain-database-url" -Raw).Trim()
-[Environment]::SetEnvironmentVariable('GBRAIN_DATABASE_URL', $url, 'User')
-$env:GBRAIN_DATABASE_URL = $url
-```
-
-Должно быть (Postgres): `[Environment]::GetEnvironmentVariable('GBRAIN_DATABASE_URL','User') -ne $null` печатает `True`.
-Новые окна `pwsh` увидят переменные сами, текущее окно уже их видит (вторая строка в каждом блоке).
-
-Важно: `GBRAIN_FTS_LANGUAGE` должна быть задана ДО шага 10 (`init`). После init
+Важно: `GBRAIN_FTS_LANGUAGE` должна быть в файле ДО шага 10 (`init`). После init
 сменить язык просто так нельзя.
 
 ## Шаг 9. Создай обёртку для запуска
@@ -619,9 +617,6 @@ $env:GBRAIN_DATABASE_URL = $url
 mkdir -p ~/.local/wrappers
 cat > ~/.local/wrappers/gbrain <<'EOF'
 #!/bin/sh
-set -a
-. "$HOME/.gbrain-env"
-set +a
 exec bun "$HOME/gbrain/src/cli.ts" "$@"
 EOF
 chmod +x ~/.local/wrappers/gbrain
@@ -630,7 +625,7 @@ gbrain --version
 ```
 
 **Windows.** Нужен файл `.cmd`: gbrain находит свою команду на Windows только среди
-`.exe`, `.com`, `.cmd` и `.bat`. Файл не читает окружение: переменные взяты из шага 8.
+`.exe`, `.com`, `.cmd` и `.bat`. Обёртка только запускает Bun. Настройки gbrain читает сам из `~/.gbrain/.env` (шаг 8).
 
 ```powershell
 New-Item -ItemType Directory -Force "$HOME\.local\wrappers" | Out-Null
@@ -654,16 +649,12 @@ gbrain --version
 
 ## Шаг 10. Инициализация gbrain
 
-Для проверки эмбеддингов init нужен ключ провайдера в переменной
-`OPENROUTER_API_KEY` (даже если провайдер не OpenRouter). Не пиши ключ в чат.
+Для проверки эмбеддингов init нужен ключ провайдера. Он уже в `~/.gbrain/.env` (шаг 8),
+ничего экспортировать не надо. Не пиши ключ в чат.
+
+Запусти init. Подставь значения из шага 1:
 
 **Linux:**
-
-```bash
-export OPENROUTER_API_KEY="$(cat <KEY_FILE>)"
-```
-
-Потом запусти init. Подставь значения из шага 1:
 
 ```bash
 gbrain init --url "$(cat ~/.gbrain-database-url)" --non-interactive \
@@ -675,7 +666,6 @@ gbrain init --url "$(cat ~/.gbrain-database-url)" --non-interactive \
 **Windows:**
 
 ```powershell
-$env:OPENROUTER_API_KEY = (Get-Content "<KEY_FILE>" -Raw).Trim()
 $url = (Get-Content "$HOME\.gbrain-database-url" -Raw).Trim()
 gbrain init --url $url --non-interactive `
   --embedding-model "openrouter:<EMBED_MODEL>" --embedding-dimensions <EMBED_DIMS> `
@@ -791,11 +781,12 @@ PowerShell 5 ещё и добавляет BOM, из-за которого фай
 
 `gbrain init` эти ключи не создаёт. На новой базе их надо поставить вручную.
 
-Перед серией `config set` проверь, что в этой сессии заданы переменные из шага 8
-(`GBRAIN_DATABASE_URL` для Postgres). Без них `config set` может завершиться с кодом 1
-без всякого сообщения, и настройки не запишутся. Запускай `gbrain` через функцию или
-обёртку из шага 9, не вызывай `bun src/cli.ts` напрямую. Проверь код возврата после
-первой же записи (`$?` в bash, `$LASTEXITCODE` в PowerShell) и прочитай значение обратно.
+Переменные в команды подставлять не надо: адрес базы gbrain берёт из `~/.gbrain/config.json`,
+остальное из `~/.gbrain/.env`. Если `config set` завершился с кодом 1 без сообщения и
+значение не записалось, проверь, что оба файла на месте и в `config.json` есть `database_url`
+(для Postgres). Не собирай переменные в строку вызова и не вызывай `bun src/cli.ts`
+напрямую: запускай `gbrain` через функцию или обёртку из шага 9. Проверь код возврата
+после первой же записи (`$?` в bash, `$LASTEXITCODE` в PowerShell) и прочитай значение обратно.
 
 ### 12.1. Прочитай текущие значения
 
