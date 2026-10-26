@@ -20,7 +20,7 @@
  *             coherent?" question.
  *
  * Why this matters: the doctor's legacy `health_score` ( 100 − 20×fails −
- * 5×warns ) weights every check equally. A skill routing miss costs the same
+ * 5×warns, over the checks that finished: #7276 ) weights every check equally. A skill routing miss costs the same
  * as a corrupt embedding column. With categorization, the doctor surfaces a
  * brain_checks_score and category_scores so operators see signal-to-noise on
  * the question they're actually asking.
@@ -62,6 +62,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'captured_facts_active',
   // #7125: facts whose stored text holds a pre-fix sanitizer redaction marker (doctor/checks/facts-redaction-marker.ts).
   'facts_redaction_marker',
+  // #7247: a calendar day holding a bulk-loaded share of a source's facts as their valid_from (doctor/checks/fact-bulk-dates.ts).
+  'fact_bulk_dates',
   'conversation_label_facts',
   'conversation_outcomes_stale',
   'connector_checkpoints',
@@ -70,6 +72,7 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'fence_integrity',
   // GBRA-161: derived items live generations retired in the restore window, and results held instead of published (doctor/checks/generations.ts).
   'generation_held',
+  'generation_pending',
   'generation_retirements',
   // #5575: stored trust tier counts, the legacy-row backfill, scan and source claims.
   'trust_tiers',
@@ -133,6 +136,10 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'extract_health',
   // Large pages A7: page extractions that read only part of their input.
   'extraction_input_truncated',
+  // PR 4 (Wave B incremental derivation, transcripts): conversation pages held because no format is detected over them.
+  'conversation_detection_ambiguous',
+  // PR 4 (Wave B incremental derivation, transcripts): segmented derivations held back by a model without a price.
+  'derivation_unpriced_model',
   'facts_embedding_width_consistency',
   'facts_extraction_health',
   'facts_health',
@@ -166,6 +173,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'parked_effects',
   // #6741: managed purges parked after repeated failures (doctor/checks/purge-parks.ts).
   'purge_parked_pages',
+  // Wave B PR 4: fact purge sweeps of stored derivation results still pending or stalled (doctor/checks/derivation-purge-sweeps.ts).
+  'derivation_purge_sweeps',
   'partial_embedding',
   'pglite_scratch_probe',
   'quarantined_pages',
@@ -205,6 +214,10 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'unlinked_facts',
   // #7160: title-prefixed person pages that likely duplicate an unprefixed page (preview only).
   'person_title_duplicates',
+  // Git-canonical G1: the database compared with the commit at HEAD per source, informational (doctor/checks/db-ahead-of-git.ts).
+  'db_ahead_of_git',
+  // Git-canonical G3: how far each strict source's index trails HEAD (doctor/checks/git-index-lag.ts).
+  'git_index_lag',
   'edge_validity',
   'text_projection_readiness',
   'timeline_coverage',
@@ -304,6 +317,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'google_api_access',
   'google_oauth',
   'home_dir_in_worktree',
+  // GBRA-108: cron commands that run gbrain without GBRAIN_HOME (doctor/checks/cron-gbrain-home.ts).
+  'cron_gbrain_home',
   'index_audit',
   'npm_squat',
   'oauth_client_scope_health',
@@ -341,6 +356,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'serve_build_drift',
   // #7245: serve, the jobs supervisor, worker parents and job children on different builds (doctor/checks/runtime-build-skew.ts).
   'runtime_build_skew',
+  // GBRA-156: the warm CLI socket refused CLI calls by identity part in the last 24 h (doctor/checks/cli-socket-refusals.ts).
+  'cli_socket_refusals',
   'stale_embedding_effects',
   'vector_plan',
   'keyword_plan',

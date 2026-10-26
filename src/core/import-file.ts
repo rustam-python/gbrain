@@ -12,6 +12,7 @@ import { basename, extname, resolve } from 'path';
 import { createHash } from 'crypto';
 import type { BrainEngine, FileSpec } from './engine.ts';
 import { classifyImportHold, parseMarkdown, resolveParsedSubtype, type ParseOpts, type ParsedMarkdown } from './markdown.ts';
+import { alignWithStored } from './persistence/align-stored.ts';
 import { CODE_FILE_MAX_BYTES, isLargePageBytes } from './page-size-policy.ts';
 import { importSizeLimit, MAX_FILE_SIZE, screenImportContent, settleContentDisposition, stripGateOwnedMarkers, type ContentRefusal, type FenceScreen } from './import-screen.ts';
 import type { WriteGateAssessment, WriteGateInput } from './write-gate.ts';
@@ -371,7 +372,7 @@ export async function importFromContent(
     return { slug, status: screen.refusal.code === 'file_too_large' ? 'skipped' : 'error', chunks: 0, error: screen.refusal.message, refusal: screen.refusal, skip_reason: screen.refusal.code };
   }
   const parsed = (screen as { parsed: ParsedMarkdown }).parsed;
-  if (!opts.prepare) await assertUnmanagedCanonicalWriter(engine, 'direct content import');
+  if (!opts.prepare) await assertUnmanagedCanonicalWriter(engine, 'direct content import', { sourceId: sourceId ?? 'default' });
   // Canonicalize only free-prose fields before protected-fence parsing, hidden
   // row merging, hashing and indexing. Frontmatter identities stay untouched.
   parsed.title = sanitizeText(parsed.title);
@@ -480,11 +481,9 @@ export async function importFromContent(
   // means "preserve the stored type", not "re-infer". Pre-fix, a round-trip
   // put (get_page → edit body → put_page without `type:`) silently regressed
   // a curated type to the path-inferred default ('concept' for bare slugs).
-  // Explicit frontmatter type stays an override; new pages still infer.
-  if (parsed.typeExplicit !== true && existing) {
-    parsed.type = existing.type;
-  }
-  resolveParsedSubtype(parsed, existing);
+  // Explicit frontmatter type stays an override; new pages still infer. The stored subtype and grandfather stamp are kept too.
+  if (existing) alignWithStored(parsed, existing, false);
+  else resolveParsedSubtype(parsed, existing);
   // Alias-footgun visibility: an explicit frontmatter `type:` that is an
   // ALIAS of a canonical pack type (or entirely undeclared) is stored
   // literally and never re-normalized — different agents can silently file
@@ -1237,7 +1236,7 @@ export async function importCodeFile(
   opts: { noEmbed?: boolean; force?: boolean; sourceId?: string;
     prepare?: (prepared: import('./persistence/prepared-import.ts').PreparedContentImport) => Promise<ImportResult> } = {},
 ): Promise<ImportResult> {
-  if (!opts.prepare) await assertUnmanagedCanonicalWriter(engine, 'direct file import');
+  if (!opts.prepare) await assertUnmanagedCanonicalWriter(engine, 'direct file import', { sourceId: opts.sourceId ?? 'default' });
   if (opts.prepare && !opts.noEmbed) throw new Error('Coordinated code import requires provider-free preparation.');
   const slug = slugifyCodePath(relativePath);
   const lang = detectCodeLanguage(relativePath) || 'unknown';
@@ -1871,7 +1870,7 @@ export async function importImageFile(
   relativePath: string,
   opts: ImportImageOptions = {},
 ): Promise<ImportResult> {
-  if (!opts.prepare) await assertUnmanagedCanonicalWriter(engine, 'direct file import');
+  if (!opts.prepare) await assertUnmanagedCanonicalWriter(engine, 'direct file import', { sourceId: opts.sourceId ?? 'default' });
   // Defense-in-depth: reject symlinks before reading bytes.
   const lstat = lstatSync(filePath);
   if (lstat.isSymbolicLink()) {

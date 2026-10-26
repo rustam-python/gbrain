@@ -41,7 +41,8 @@ import { deliverEvidence, effectivePlan, resolveEvidencePlan, EVIDENCE_BLOCK_CHA
 import { startThinkDecide, thinkAbstainResult, type ThinkAbstention } from './decide.ts';
 import { classifyIntent } from './intent.ts';
 import { slugifyText } from '../cjk.ts';
-import { deriveTrust, derivedMaintenanceTransaction, type TaintRef } from '../trust/taint.ts';
+import { deriveTrust, type TaintRef } from '../trust/taint.ts';
+import { publishSinglePage, THINK_SYNTHESIS_KIND } from '../generations/adapters/single-page.ts';
 
 /** Anthropic Messages client interface — same shape used by subagent.ts so test stubs can be shared. */
 export interface ThinkLLMClient {
@@ -245,6 +246,8 @@ export interface ThinkResult {
   unverified_quotes?: Array<{ text: string; reason: string }>;
   /** What `persistSynthesis` saves: the raw answer with every claim unit carrying an unverified quote removed, and those units. */
   persist?: { answer: string; unverified_claims: Array<{ text: string; reason: string; detail: string }> };
+  /** The synthesis page as the run found it before gathering (GBRA-161 PR 5): `persistSynthesis` binds its write to this revision. */
+  persist_base?: { sourceId: string; slug: string; revision: string | null };
   /** Diagnostics for `--explain` callers (CLI surface for v0.29). */
   diagnostics: {
     pagesFromHybrid: number;
@@ -281,11 +284,14 @@ const THINKING_DEFAULT_MAX_OUTPUT_TOKENS = 16000;
 // OpenAI reasoning models spend output budget on internal reasoning tokens
 // the same way — reasoning tokens are billed as output and count against
 // `max_tokens` — so they get the same headroom. Deliberately scoped to the
-// gpt-5 family and the numbered o-series only; anything else (gpt-4o, the
-// non-reasoning `*-chat` snapshots like gpt-5-chat-latest, other providers'
-// reasoning models routed through their own recipes) keeps the conservative
-// 4000 default.
-const OPENAI_REASONING_MODEL_RE = /^openai[:/](?:gpt-5|o[0-9]+)(?:[.-]|$)/i;
+// gpt-5-and-later families and the numbered o-series only; anything else
+// (gpt-4o, the non-reasoning `*-chat` snapshots like gpt-5-chat-latest, other
+// providers' reasoning models routed through their own recipes) keeps the
+// conservative 4000 default. #7421: matched behind any provider-prefix chain
+// (`openai:`, `litellm:`, `openrouter:openai/`), like the Claude regexes,
+// because the proxy route does not change how the model bills reasoning; an
+// opaque proxy alias (`litellm:my-reasoner`) still cannot be recognized.
+const OPENAI_REASONING_MODEL_RE = /[:/](?:gpt-[5-9]|o[0-9]+)(?:[.-]|$)/i;
 const OPENAI_CHAT_SNAPSHOT_RE = /-chat(?:-|$)/i; // gpt-5-chat-latest, gpt-5.2-chat-latest
 // #4375: the default deep tier (anthropic:claude-opus-4-7) routinely needs
 // more than 4000 tokens for the synthesis JSON envelope; at 4000 the envelope
@@ -635,6 +641,10 @@ export async function runThink(
       );
     }
   }
+
+  const persistSlug = synthesisSlug(opts.question, new Date().toISOString().slice(0, 10));
+  const persistBase = { sourceId: opts.sourceId ?? 'default', slug: persistSlug,
+    revision: (await engine.readPageSnapshot(persistSlug, { sourceId: opts.sourceId ?? 'default', includeDeleted: true }))?.revision ?? null };
 
   // Optional question embedding — caller decides whether to pay the embedder; an opted-out brain never does.
   const questionEmbedding = await embedThinkQuestion(engine, opts, warnings);
@@ -1041,6 +1051,7 @@ export async function runThink(
     },
     temporal: { reference_date: temporal.referenceDate, time_zone: temporal.timeZone },
     ...windowMeta,
+    persist_base: persistBase,
   };
 }
 
@@ -1114,7 +1125,9 @@ export function synthesisSlug(question: string, date: string): string {
 
 /**
  * Persist a synthesis page + its evidence. Returns the saved slug.
- * Synthesis pages are written under `synthesis/<slugified-question>-<date>.md`.
+ * Synthesis pages are written under `synthesis/<slugified-question>-<date>.md` as a single-item `think_synthesis`
+ * generation (GBRA-161 PR 5): bound to the revision the run found before gathering (`persist_base`, else read now), so a
+ * page that changed meanwhile is fenced (`generation_fenced`), and the page it replaces is versioned first.
  */
 export async function persistSynthesis(
   engine: BrainEngine,
@@ -1143,8 +1156,11 @@ export async function persistSynthesis(
   ].filter(Boolean).join('\n');
 
   const derivation = await deriveTrust(engine, result.taint_refs ?? [], { channel: 'derive:think' });
-  const page = await derivedMaintenanceTransaction(engine, derivation, async tx => {
-    const written = await tx.putPage(slug, {
+  const sourceId = scope.sourceId ?? 'default';
+  const base = result.persist_base;
+  const expectedRevision = base && base.slug === slug && base.sourceId === sourceId ? base.revision
+    : (await engine.readPageSnapshot(slug, { sourceId, includeDeleted: true }))?.revision ?? null;
+  const { pageId } = await publishSinglePage(engine, { kind: THINK_SYNTHESIS_KIND, sourceId, slug, expectedRevision, derivation, page: {
     title: result.question.slice(0, 200),
     type: 'synthesis',
     compiled_truth: body,
@@ -1157,11 +1173,9 @@ export async function persistSynthesis(
       takes_gathered: result.takesGathered,
       ...(result.persist?.unverified_claims.length ? { unverified_claims: result.persist.unverified_claims.map(c => ({ ...c, sources: ['think evidence'], detected_at: today })) } : {}),
     },
-  }, scope.sourceId ? { sourceId: scope.sourceId } : undefined);
-    return { result: written, rows: [{ table: 'pages' as const, id: written.id, sourceId: scope.sourceId ?? 'default' }] };
-  });
+  } });
 
-  const persisted = await persistCitations(engine, page.id, result.citations, scope);
+  const persisted = await persistCitations(engine, pageId!, result.citations, scope);
   return { slug, evidenceInserted: persisted.inserted, warnings: persisted.warnings };
 }
 

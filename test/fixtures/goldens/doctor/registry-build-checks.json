@@ -191,6 +191,10 @@
       },
       {
         "category": "ops",
+        "name": "cron_gbrain_home"
+      },
+      {
+        "category": "ops",
         "name": "graduation_interrupted"
       },
       {
@@ -346,6 +350,10 @@
         "name": "pglite_scale"
       },
       {
+        "category": "brain",
+        "name": "derived_visibility"
+      },
+      {
         "category": "ops",
         "name": "rls"
       },
@@ -440,10 +448,6 @@
       {
         "category": "brain",
         "name": "timeline_history"
-      },
-      {
-        "category": "brain",
-        "name": "derived_visibility"
       },
       {
         "category": "brain",
@@ -555,6 +559,10 @@
       },
       {
         "category": "brain",
+        "name": "generation_pending"
+      },
+      {
+        "category": "brain",
         "name": "extractor_facts_expired"
       },
       {
@@ -572,6 +580,10 @@
       {
         "category": "brain",
         "name": "facts_redaction_marker"
+      },
+      {
+        "category": "brain",
+        "name": "fact_bulk_dates"
       },
       {
         "category": "brain",
@@ -910,12 +922,24 @@
         "name": "runtime_build_skew"
       },
       {
+        "category": "ops",
+        "name": "cli_socket_refusals"
+      },
+      {
         "category": "brain",
         "name": "extract_atoms_held_failed"
       },
       {
         "category": "brain",
+        "name": "conversation_detection_ambiguous"
+      },
+      {
+        "category": "brain",
         "name": "extraction_input_truncated"
+      },
+      {
+        "category": "brain",
+        "name": "derivation_unpriced_model"
       },
       {
         "category": "brain",
@@ -936,6 +960,10 @@
       {
         "category": "brain",
         "name": "purge_parked_pages"
+      },
+      {
+        "category": "brain",
+        "name": "derivation_purge_sweeps"
       },
       {
         "category": "brain",
@@ -964,6 +992,14 @@
       {
         "category": "brain",
         "name": "person_title_duplicates"
+      },
+      {
+        "category": "brain",
+        "name": "db_ahead_of_git"
+      },
+      {
+        "category": "brain",
+        "name": "git_index_lag"
       },
       {
         "category": "brain",
