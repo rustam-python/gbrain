@@ -382,11 +382,10 @@ async function reconcileFullSyncDeletes(
   engine: BrainEngine,
   opts: SyncOpts,
   input: { company: ReturnType<typeof currentCompanyBrainSync>; gitContextRoot: string; syncScopeRoot: string; slugRoot: string | undefined;
-    metafilePages: MetafilePagesMode; previousCommit: string | null; twinSlugIndex?: () => ReturnType<typeof trackedSlugIndex> },
+    metafilePages: MetafilePagesMode; previousCommit: string | null; twinSlugIndex: () => ReturnType<typeof trackedSlugIndex> },
 ): Promise<number> {
-  const { company, gitContextRoot, syncScopeRoot, slugRoot, metafilePages, previousCommit } = input;
-  // #6: reuse the import's already-built index when this is the same full sync.
-  const twinSlugIndex = input.twinSlugIndex ?? (() => trackedSlugIndex(gitContextRoot, undefined, gitPathUnder(gitContextRoot, slugRoot ?? syncScopeRoot)));
+  // twinSlugIndex is the file-slug index performFullSync built for the import, reused here so the full sync lists the tree once.
+  const { company, gitContextRoot, syncScopeRoot, slugRoot, metafilePages, previousCommit, twinSlugIndex } = input;
   // #1970 (F-A): runImport is import-only — it never purges pages whose backing
   // file was deleted since the last sync. A full re-import is authoritative for
   // the whole tree, so reconcile deletes here too (this is what makes the
