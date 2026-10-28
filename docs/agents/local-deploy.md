@@ -391,3 +391,89 @@ done
   (режим поиска, `facts.extraction_prompt_appendix`, настройки
   `dream.synthesize.*`) не выравнивай с основной без просьбы
   пользователя.
+
+## 10. Схема `gbrain-thebrain` (иерархия заметок TheBrain)
+
+Своя схема пользователя. Она берёт `gbrain-everything` и добавляет типы
+связей `child_of` и `parent_of`. Страницы типа `note` с полями
+`thebrain_parents` и `thebrain_children` во frontmatter получают по ним
+рёбра графа: список слагов в `thebrain_parents` даёт `child_of`, в
+`thebrain_children` — `parent_of`. Файл лежит в
+`~/.gbrain/schema-packs/gbrain-thebrain/pack.yaml`:
+
+```yaml
+api_version: gbrain-schema-pack-v1
+name: gbrain-thebrain
+version: 1.0.0
+description: "gbrain-everything with TheBrain parent/child hierarchy edges from frontmatter."
+gbrain_min_version: 0.41.0
+extends: gbrain-everything
+
+# borrow_from, phases и calibration_domains через extends не наследуются,
+# поэтому повторены из gbrain-everything (иначе активация отключит их).
+borrow_from:
+  - pack: gbrain-creator
+    types: [atom]
+  - pack: gbrain-engineer
+    types: [learning]
+
+page_types: []
+
+phases:
+  - extract_atoms
+  - synthesize_concepts
+
+calibration_domains:
+  - name: concept_themes
+    aggregator: cluster_summary
+    page_types: [concept]
+  - name: deal_success
+    aggregator: scalar_brier
+    page_types: [deal]
+  - name: founder_evaluation
+    aggregator: scalar_brier
+    page_types: [person]
+  - name: market_call
+    aggregator: weighted_brier
+    page_types: [thesis]
+  - name: architecture_calls
+    aggregator: scalar_brier
+    page_types: [code, learning]
+  - name: effort_estimates
+    aggregator: weighted_brier
+    page_types: [project]
+  - name: risk_assessment
+    aggregator: scalar_brier
+    page_types: [project]
+
+link_types:
+  - name: child_of
+    inverse: parent_of
+  - name: parent_of
+    inverse: child_of
+
+frontmatter_links:
+  - page_type: note
+    fields: [thebrain_parents]
+    link_type: child_of
+  - page_type: note
+    fields: [thebrain_children]
+    link_type: parent_of
+```
+
+Включить схему:
+
+```bash
+<GBRAIN_CMD> schema use gbrain-thebrain
+```
+
+**Обязательный параметр.** Чтобы рёбра из frontmatter строились, включи:
+
+```bash
+<GBRAIN_CMD> config set autopilot.incremental_extract_include_frontmatter true
+```
+
+По умолчанию он выключен: `extract links` и синхронизация тогда берут
+связи только из тела страницы, а `child_of` и `parent_of` не появятся.
+Для разового запуска вместо настройки подойдёт флаг
+`extract links --include-frontmatter`.
