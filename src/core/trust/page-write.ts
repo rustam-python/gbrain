@@ -29,7 +29,7 @@ import { OWNER_TIER_FLOOR, compareTrust, effectiveWriteTrust, minTrust, storedTr
 
 /** Page writes that only edit a gbrain-managed fence (or strike a row) and keep the page's tier. */
 const FENCE_EDIT_OPERATIONS = ['remember', 'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve', 'takes_remove',
-  'decide_proposal', 'loops_close', 'relink_facts', 'add_timeline_entry', 'add_link', 'remove_link'];
+  'decide_proposal', 'loops_close', 'relink_facts', 'add_timeline_entry', 'add_link', 'remove_link', 'trust_release'];
 /** Page writes whose caller supplies the page content: they stamp the marker and can lower the page (CEO-12). */
 const CONTENT_OPERATIONS = ['put_page', 'capture', 'edit_page', 'append_page', 'revert_version', 'restore_page'];
 
@@ -67,10 +67,14 @@ export async function storedPageTier(engine: BrainEngine, sourceId: string, slug
  * #6550: a stored `unknown` means "not classified yet", not "known unverified", so it does not lower the
  * marker: the marker names the writer's tier and the row keeps min(writer, stored) until the backfill
  * classifies it. An explicit `trust_tier: unknown` already in the frontmatter still caps (stampTrustMarker).
+ * #7873: an unclassified page's own lowering markers (`storedFrontmatter`, the page before the write) still cap the
+ * marker, so a write that removes one (a `ingested_via: webhook` stamp) cannot raise the page when it is re-derived.
  */
-export function stampPageTrustMarker(row: Pick<WriteRequest, 'operation'>, frontmatter: Record<string, unknown>, trust: WriteTrust | undefined, stored: TrustTier | null): void {
+export function stampPageTrustMarker(row: Pick<WriteRequest, 'operation'>, frontmatter: Record<string, unknown>, trust: WriteTrust | undefined, stored: TrustTier | null,
+  storedFrontmatter?: Record<string, unknown> | null): void {
   if (!trust || !CONTENT_OPERATIONS.includes(row.operation)) return;
-  const tier = stored && stored !== 'unknown' ? minTrust(trust.tier, stored) : trust.tier;
+  const prior = stored && stored !== 'unknown' ? [stored] : frontmatterTrustCaps(storedFrontmatter);
+  const tier = minTrust(trust.tier, ...prior);
   const stamped = stampTrustMarker(frontmatter, tier);
   if (stamped !== frontmatter) frontmatter.trust_tier = stamped.trust_tier;
 }
