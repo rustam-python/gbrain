@@ -33,3 +33,21 @@ page whose title does not match its body defeats the point of the page.
 - If cross-language inputs ever appear, merging the two Concept pages is the
   job of a separate layer, in the manner of **Alias**. It does not bring the
   English key back.
+
+## Divergence from upstream
+
+This rule exists only in this fork. Upstream (checked against 0.60.545.0) asks
+for ASCII slugs ("lowercase alphanumeric and hyphens only"), a "plain English"
+Concept summary, and slugs the transcript basename through an ASCII
+`sanitizeForSlug`. It has no `cycle/source-language.ts`. The wording is spliced
+into five prompts, so a merge can drop it from one and leave the rest working.
+
+Files to compare on every upstream merge: `cycle/source-language.ts`,
+`cycle/synthesize.ts`, `cycle/synthesize-concepts.ts`, `cycle/extract-atoms.ts`,
+`cycle/extract-atoms-parse.ts`, `cycle/patterns.ts`,
+`minions/handlers/subagent-oneshot.ts` (the default synthesize path) and
+`minions/tools/brain-allowlist.ts` (the `put_page` slug description).
+
+`test/concept-label-language.test.ts` pins the shared wording and checks that
+each of those prompts still carries it. The rule itself is prompt-only, so no
+test proves what a model writes; the test proves the prompt asks for it.
