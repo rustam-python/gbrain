@@ -121,3 +121,28 @@ Page slugs re-key on one `gbrain sync --full`, with no manual steps:
   one `петр-иванов` page) separate: each gets its own page.
 
 The version bumps whenever an existing file could slug differently.
+
+### Divergence from upstream
+
+This rule exists only in this fork. Upstream (checked against 0.60.545.0) still
+strips every U+0300–U+036F mark, so it slugs "российской" as "россиискои", has no
+`foldSlugText`, `SLUG_MARK_STRIP_RE` or `SLUG_GRAMMAR_VERSION`, and its
+`normalizeAlias` does not fold `ё` or the stress mark. Upstream has no ADR
+directory. The decision stands; the cost is that a merge can silently revert it.
+
+Files to compare on every upstream merge:
+
+* `src/core/cjk.ts` — the fold and the grammar version
+* `src/core/sync.ts` (`slugifySegment`), `src/core/enrichment-service.ts`
+  (`slugifyEntity`), `src/core/entities/resolve.ts` (`slugify`),
+  `src/core/link-extraction.ts` (`normalizeBasename`) — upstream inlines its own
+  `normalize('NFD')` plus a `U+0300–U+036F` strip in each; a conflict resolved in
+  upstream's favour brings it back
+* `src/core/search/alias-normalize.ts` — the `ё`→`е` and stress folds, and
+  `aliasListValues`
+* `src/core/sync-twins.ts` — writes its own `slug_aliases` redirect through
+  `insertAliasRow`; upstream's `recordRenameAlias` and `slug_rename_history`
+  (v285) cover page renames only and do not touch it
+
+`test/cyrillic-slug-grammar.test.ts` catches a revert of the slug and alias fold in these files. Run it after
+every upstream merge, before trusting the merge.
