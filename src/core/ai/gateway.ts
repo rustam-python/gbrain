@@ -110,6 +110,17 @@ const AI_EMBED_TIMEOUT_MS = resolveAiTimeoutMs('GBRAIN_AI_EMBED_TIMEOUT_MS', 60_
 const AI_MULTIMODAL_TIMEOUT_MS = resolveAiTimeoutMs('GBRAIN_AI_MULTIMODAL_TIMEOUT_MS', 60_000);
 
 /**
+ * Bun's `fetch` carries its own ~360 s wall-clock timeout that no AbortSignal can
+ * raise, so a slow local model (long prefill + thinking, non-streaming) dies with
+ * "The operation timed out." long before `GBRAIN_AI_CHAT_TIMEOUT_MS`. Chat and
+ * expansion calls are bounded by `withDefaultTimeout` instead, so switch Bun's off.
+ */
+function withoutBunFetchTimeout(inner?: typeof fetch): typeof fetch {
+  const base = inner ?? fetch;
+  return ((input: any, init?: any) => base(input, { ...init, timeout: false })) as typeof fetch;
+}
+
+/**
  * Compose a caller signal with a default wall-clock timeout. When the caller
  * supplies its own (Fix 3's 6s query deadline, the facts queue's shutdown abort,
  * a budget signal), `AbortSignal.any` makes whichever fires FIRST win — so a
@@ -2416,7 +2427,7 @@ function instantiateExpansion(recipe: Recipe, modelId: string, cfg: AIGatewayCon
       return createOpenAICompatible({
         name: recipe.id,
         baseURL: compat.baseURL,
-        ...(compat.fetch ? { fetch: compat.fetch } : {}),
+        fetch: withoutBunFetchTimeout(compat.fetch),
         ...auth,
         supportsStructuredOutputs: recipeSupportsStructuredOutputs(recipe),
       }).languageModel(modelId);
@@ -3345,7 +3356,7 @@ function instantiateChat(recipe: Recipe, modelId: string, cfg: AIGatewayConfig):
       return createOpenAICompatible({
         name: recipe.id,
         baseURL: compat.baseURL,
-        ...(compat.fetch ? { fetch: compat.fetch } : {}),
+        fetch: withoutBunFetchTimeout(compat.fetch),
         ...auth,
         supportsStructuredOutputs: recipeSupportsStructuredOutputs(recipe),
       }).languageModel(modelId);
