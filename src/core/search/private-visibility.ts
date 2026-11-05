@@ -22,9 +22,10 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { BrainEngine } from '../engine.ts';
+import { embeddedKey, embeddedKeyInScope, unscopedWithOpenEmbeddedEngines } from '../engine-scope-store.ts';
 import { requestConfigRows } from '../config-snapshot.ts';
 import { isValidSourceId } from '../source-id.ts';
-import { hasReaders, normalizePrincipal, readersAllow, validIdentity } from '../access/principals.ts';
+import { ACCESS_ID_RE, hasReaders, MEMBER_PAGE_PREFIX, normalizePrincipal, readersAllow, validIdentity } from '../access/principals.ts';
 import { validPrefix, validQualifiedRuleId } from '../access/folder-rules.ts';
 
 export const REMOTE_PRIVATE_PAGES_KEY = 'search.remote_private_pages';
@@ -213,6 +214,11 @@ export interface CallerAccess {
    */
   audience: readonly string[] | null;
   audienceIdentities: readonly (readonly string[])[];
+  /**
+   * GST-359 C1: the attested actor (a trusted system named the person; access/actor.ts), or null. Its audience is that
+   * one member and its privacy is never relaxed. Queued writes and agent jobs carry it and re-resolve it live.
+   */
+  actor?: Readonly<{ system: string; external_id: string; member: string }> | null;
   /** GBRA-218 (A2): the source-qualified folder-rule ids (`<source>:<rule>`) the identity satisfies, from the applied rulebook. */
   satisfiedRuleIds: readonly string[];
   /** GBRA-218 (A2): prefixes that read as nobody (a narrowing being stamped, an invalid policy file); prefix '' is the whole source. */
@@ -229,7 +235,7 @@ const callerAccessStore = new AsyncLocalStorage<CallerAccess>();
 
 /** The current read's caller-access record (see CallerAccess). */
 export function currentCallerAccess(): CallerAccess {
-  return callerAccessStore.getStore() ?? { identity: [], audience: null, audienceIdentities: [], satisfiedRuleIds: [], folderCoverage: [], privateReadableSources: [], hidePrivate: !processPrivacyRelaxed(), applyRemoteReadPolicy: false, restricted: true, remotePolicy: null };
+  return callerAccessStore.getStore() ?? { identity: [], audience: null, audienceIdentities: [], actor: null, satisfiedRuleIds: [], folderCoverage: [], privateReadableSources: [], hidePrivate: !processPrivacyRelaxed(), applyRemoteReadPolicy: false, restricted: true, remotePolicy: null };
 }
 
 /** Runs `fn` under `access` merged over the current record; an invalid identity or source id empties that set (fail closed). */
@@ -242,12 +248,14 @@ export function withCallerAccess<T>(access: Partial<CallerAccess>, fn: () => T):
   const audienceIdentities = (access.audienceIdentities ?? (fresh ? [] : base.audienceIdentities))
     .map(id => id.length && validIdentity(id) ? Object.freeze([...new Set(id)].sort()) : Object.freeze([] as string[]));
   const audience = access.audience !== undefined ? access.audience : fresh ? null : base.audience;
+  const actor = access.actor !== undefined ? access.actor : fresh ? null : base.actor ?? null;
   const satisfiedOk = validIds || audienceIdentities.some(id => id.length > 0);
   const satisfied = satisfiedOk ? access.satisfiedRuleIds ?? (fresh ? [] : base.satisfiedRuleIds) : [];
   return callerAccessStore.run(Object.freeze({
     identity: validIds && audienceIdentities.length <= 1 ? Object.freeze([...new Set(identity)].sort()) : Object.freeze([]),
     audience: audience && audience.every(validAudienceEntry) ? Object.freeze([...audience]) : audience ? Object.freeze([GUEST_ENTRY]) : null,
     audienceIdentities: Object.freeze(audienceIdentities.length > 1 ? audienceIdentities : []),
+    actor: actor ? Object.freeze({ system: actor.system, external_id: actor.external_id, member: actor.member }) : null,
     satisfiedRuleIds: satisfied.length && satisfied.every(validQualifiedRuleId) ? Object.freeze([...new Set(satisfied)].sort()) : Object.freeze([]),
     folderCoverage: Object.freeze([...(access.folderCoverage ?? base.folderCoverage)].map(c => Object.freeze({ source_id: c.source_id, prefix: c.prefix }))),
     privateReadableSources: sources.length && sources.every(isValidSourceId) ? Object.freeze([...new Set(sources)]) : Object.freeze([]),
@@ -488,20 +496,39 @@ export function privacyAliasSql(alias: string): string {
  */
 const honorAliasEngines = new Set<BrainEngine>();
 const aliasOptOutEngines = new Set<BrainEngine>();
+/**
+ * An engine opened from settings keeps its own policy here instead (keyed by engineKey, so it goes with the engine and a
+ * per-call engine is never retained): inside its scope its own setting decides, and it never sways the process sets.
+ */
+let embeddedPolicy = new WeakMap<object, { honorAliases?: boolean; expose?: boolean }>();
+const embeddedPolicyOf = (key: object) => {
+  let policy = embeddedPolicy.get(key);
+  if (!policy) embeddedPolicy.set(key, policy = {});
+  return policy;
+};
 const ALIAS_OPT_OUT_VALUES = ['false', '0', 'off', 'no'];
 function honorAliases(): boolean {
+  const scoped = embeddedKeyInScope();
+  if (scoped) return embeddedPolicy.get(scoped)?.honorAliases ?? true;
+  if (unscopedWithOpenEmbeddedEngines()) return true;
   return honorAliasEngines.size > 0 || aliasOptOutEngines.size === 0;
 }
 
-/** Reads this brain's `visibility.honor_aliases` into the process setting; true unless it is false/0/off/no. Unreadable keeps the last value. */
+/** Reads this brain's `visibility.honor_aliases` into the process setting (an embedded engine's: its own); true unless it is false/0/off/no. Unreadable keeps the last value. */
 export async function readHonorAliases(engine: BrainEngine): Promise<boolean> {
   try {
     const optOut = ALIAS_OPT_OUT_VALUES.includes((await engine.getConfig(HONOR_ALIASES_KEY))?.trim().toLowerCase() ?? '');
+    const embedded = embeddedKey(engine);
+    if (embedded) {
+      embeddedPolicyOf(embedded).honorAliases = !optOut;
+      return !optOut;
+    }
     (optOut ? aliasOptOutEngines : honorAliasEngines).add(engine);
     (optOut ? honorAliasEngines : aliasOptOutEngines).delete(engine);
     return !optOut;
   } catch {
-    return !aliasOptOutEngines.has(engine);
+    const embedded = embeddedKey(engine);
+    return embedded ? embeddedPolicy.get(embedded)?.honorAliases ?? true : !aliasOptOutEngines.has(engine);
   }
 }
 
@@ -617,11 +644,18 @@ export function privateTimelineEventFilterForCaller(timelineAlias: string): stri
  * always applies (a world fact held in or extracted from a page that names readers stays hidden from every remote
  * caller, as with the plain fragment); the privacy part is dropped when an operator relaxed privacy for this remote
  * read, which is what the hatches did to these reads before member access (`excludePrivate` was false then).
- * Outside a remote record nothing relaxes it.
+ * Outside a remote record nothing relaxes it. GST-359 C2: a fact on the caller's own member page
+ * (`memory/members/<member>`, one attested or bound member) alone is judged as the caller, so its member reads it back;
+ * every other page, other members' pages included, keeps the empty identity.
  */
 export function privateProvenanceFilterUnderPolicy(factAlias: string): string {
-  return `NOT EXISTS (SELECT 1 FROM pages pp WHERE pp.source_id = ${factAlias}.source_id ` +
-    `AND pp.slug = ${factAlias}.source_markdown_slug AND NOT ${readPolicyFragment('pp', [], !callerRelaxesPrivacy())})`;
+  const access = currentCallerAccess();
+  const hide = !callerRelaxesPrivacy();
+  const member = access.actor?.member ?? (access.audienceIdentities.length ? null : access.identity.find(p => p.startsWith('member:'))?.slice('member:'.length));
+  const policy = member && ACCESS_ID_RE.test(member)
+    ? `CASE WHEN pp.slug = '${MEMBER_PAGE_PREFIX}${member}' THEN ${readPolicyFragment('pp', access.identity, hide, access.satisfiedRuleIds)} ELSE ${readPolicyFragment('pp', [], hide)} END`
+    : readPolicyFragment('pp', [], hide);
+  return `NOT EXISTS (SELECT 1 FROM pages pp WHERE pp.source_id = ${factAlias}.source_id AND pp.slug = ${factAlias}.source_markdown_slug AND NOT (${policy}))`;
 }
 
 /** True only inside a remote caller record whose read an operator relaxed (the env hatch or the config opt-out). */
@@ -701,9 +735,15 @@ const strictEngines = new Set<BrainEngine>();
 /** GBRA-218: set once a page names readers or a member exists (sticky; a trigger and `gbrain access` write it). */
 export const ACCESS_RESTRICTIONS_KEY = 'access.restrictions_present';
 
+/** @internal exported for tests: engines the process-wide policy sets hold. */
+export function __aliasPolicyEngineCountForTests(): number {
+  return honorAliasEngines.size + aliasOptOutEngines.size + exposeEngines.size + strictEngines.size;
+}
+
 /** Test helper: drop the per-engine config cache. */
 export function __resetPrivateVisibilityCacheForTests(): void {
   cache = new WeakMap();
+  embeddedPolicy = new WeakMap();
   honorAliasEngines.clear();
   aliasOptOutEngines.clear();
   exposeEngines.clear();
@@ -716,7 +756,11 @@ export function __resetPrivateVisibilityCacheForTests(): void {
  * strict (the same lean-private rule as visibility.honor_aliases).
  */
 function processPrivacyRelaxed(): boolean {
-  return process.env.GBRAIN_REMOTE_PRIVATE_PAGES === '1' || (exposeEngines.size > 0 && strictEngines.size === 0);
+  if (process.env.GBRAIN_REMOTE_PRIVATE_PAGES === '1') return true;
+  const scoped = embeddedKeyInScope();
+  if (scoped) return embeddedPolicy.get(scoped)?.expose === true;
+  if (unscopedWithOpenEmbeddedEngines()) return false;
+  return exposeEngines.size > 0 && strictEngines.size === 0;
 }
 
 /**
@@ -739,6 +783,11 @@ export async function remotePrivacyRelaxed(engine: BrainEngine): Promise<boolean
   }
   await readHonorAliases(engine);
   cache.set(engine, { at: Date.now(), expose });
+  const embedded = embeddedKey(engine);
+  if (embedded) {
+    embeddedPolicyOf(embedded).expose = expose;
+    return expose;
+  }
   (expose ? exposeEngines : strictEngines).add(engine);
   (expose ? strictEngines : exposeEngines).delete(engine);
   return expose;

@@ -976,6 +976,12 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // column order; no blob statement or index reads it, and the DCR insert falls
   // back to the unmarked insert while the column is missing.
   'oauth_clients.registered_via',
+  // GBRA-217 page change reasons (v289 page_change_reasons): migration-only so
+  // fresh and upgraded brains share column ordinals; no blob statement or index
+  // reads them, and only post-migration writers and readers name them.
+  'page_versions.change_reason',
+  'page_versions.successor_pruned',
+  'pages.version_history_gap_at',
   // GBRA-156 access_tokens/oauth_clients.private_pages (migration
   // principal_private_pages): migration-only like min_trust, so fresh and
   // upgraded catalogs keep the same column order; no blob statement or index
@@ -1208,6 +1214,15 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   'access_tokens.may_act_for',
   'oauth_clients.member_id',
   'oauth_clients.may_act_for',
+  // GST-359 C1 (migration v286) - the attest right and the issuing grant. Same posture as v282: absent from both schema
+  // blobs, so fresh and upgraded brains share their ordinals; no index or function in either blob references them.
+  // Readers treat a missing column as no right (attestRightOf catches, verifiers read to_jsonb(row)), and token
+  // issuance writes grant_type only when the locked client row shows v286 ran, so such tokens never attest.
+  'access_tokens.attest_actor',
+  'access_tokens.attest_ops',
+  'oauth_clients.attest_actor',
+  'oauth_clients.attest_ops',
+  'oauth_tokens.grant_type',
   // GBRA-218 A2 (migration v283) - folder rules. Same posture as v282: absent from both schema blobs; the migration
   // creates the folder_rule_ids trigger and functions itself, and no index or function in either blob references it.
   'pages.folder_rule_ids',
