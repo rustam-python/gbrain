@@ -8,7 +8,7 @@
  * doctor's hook_session_cwd and post-upgrade's log lines both read it.
  */
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { classifyHarnessHook } from '../bootstrap/hooks.ts';
 import { codexHookCensus } from '../bootstrap/codex-hooks.ts';
 import { readCodexTomlTable } from '../bootstrap/codex-toml.ts';
@@ -78,7 +78,7 @@ function state(launcher: string | null): { reason: LauncherLaneFinding['reason']
 export function setupRerunArgv(harness: 'claude-code' | 'codex', receipt: Pick<ClaudeSetupReceipt, 'name' | 'consent' | 'source_id'> & Partial<Pick<ClaudeSetupReceipt, 'launcher'>>, projectDir?: string): string[] {
   return ['gbrain', 'setup', harness, ...(receipt.name === 'gbrain' ? [] : ['--name', receipt.name]), ...(projectDir ? ['--scope', 'project'] : []),
     ...(receipt.consent.wiring_scope.value.hooks === 'none' ? ['--no-hooks'] : []), ...(receipt.source_id ? ['--source', receipt.source_id] : []),
-    ...(receipt.launcher?.startsWith('/') && existsSync(receipt.launcher) ? ['--gbrain-bin', receipt.launcher] : [])];
+    ...(receipt.launcher && isAbsolute(receipt.launcher) && existsSync(receipt.launcher) ? ['--gbrain-bin', receipt.launcher] : [])];
 }
 
 function mcpFindings(): LauncherLaneFinding[] {

@@ -31,7 +31,7 @@
  * inspect command when it does not.
  */
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { bunSpawnSync } from '../spawn.ts';
 import { ownedEntryFingerprint } from '../bootstrap/adopted-connections.ts';
 import { codexHookCensus, codexHookGroupRuns, codexHookTrustHash, codexSetupHookGroup, codexSetupTrustEntry, writeCodexSetupHooks, type CodexHookGroup } from '../bootstrap/codex-hooks.ts';
@@ -131,7 +131,7 @@ export function syncTurnRuleHook(opts: { harness: TurnRuleHarness; gbrainBin: st
   const paths = opts.paths ?? {};
   const where = opts.harness === 'codex' ? codexPaths(paths).hooks : claudePath(paths);
   const print = (why: string): TurnHookOutcome => ({ harness: opts.harness, action: 'print', path: where, detail: `per-turn rule hook not installed: ${why}`, next: opts.rerun });
-  if (!opts.gbrainBin || !opts.gbrainBin.startsWith('/')) return print('no absolute gbrain binary was found (harnesses inherit no PATH); install gbrain globally or pass --gbrain-bin');
+  if (!opts.gbrainBin || !isAbsolute(opts.gbrainBin)) return print('no absolute gbrain binary was found (harnesses inherit no PATH); install gbrain globally or pass --gbrain-bin');
   try {
     const launcher = paths.hookLauncher ?? hookLauncherPath();
     // The launcher goes down first: a hook that names it must find it.
