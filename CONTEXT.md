@@ -75,3 +75,44 @@ _Avoid_: "source language" — **Source** already means a set of pages.
 **Alias**:
 An alternative spelling that leads to the same Entity. The layer where
 different spellings of one name merge, without touching the Slug.
+
+## Model benchmark
+
+**Fact (benchmark)**:
+One row of the facts table: free text `fact`, the person it is about
+(`entity_slug`) and the date it holds from (`valid_from`). Not an Atom.
+
+**Reference fact**:
+A fact planted in a benchmark dialogue on purpose, with a known person, value
+and date. The ground truth the benchmark scores against.
+
+**Completeness**:
+The share of reference facts that the model extracted. A reference fact is
+counted only if, in an extracted row of the same dialogue, the value appears in
+the `fact` text (case and whitespace normalised, a Russian inflected ending
+tolerated), `valid_from` equals the reference date, and the person is named
+correctly. The extractor leaves `entity_slug` empty on conversation facts, so
+the person is read from the names in the `fact` text. A row with no name at
+all ("я переехал в Казань") is Anonymous, not counted as complete.
+
+**Anonymous fact**:
+An extracted fact with the right value and date but no person that can be
+told from the row. Reported apart; it has its own completeness figure.
+
+**Garbage**:
+An extracted fact that matches no reference fact and is neither an
+attribution error nor a duplicate. Facts taken from chatter or hypothetical
+reasoning are garbage. The `EXTRACTION_COMPLETE` marker row gbrain writes per
+page is counted apart as a service row.
+
+**Attribution error**:
+An extracted fact with a correct value attached to the wrong person. Counted
+separately from Garbage.
+
+**Duplicate**:
+A second extracted fact that matches an already counted reference fact.
+Counted separately from Garbage.
+
+**Model config**:
+One model plus the launch script and reasoning setting it runs under. The
+benchmark compares configs, not bare models.

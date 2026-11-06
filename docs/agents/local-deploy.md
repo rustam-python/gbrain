@@ -202,6 +202,9 @@ Bearer-токен на чат-сервер. llama-server без `--api-key` ег
 # Прочее
 <GBRAIN_CMD> config set conversation_parser.llm_fallback_enabled false
 <GBRAIN_CMD> config set chunk_strategy semantic
+
+# Извлечение атомов: по умолчанию 50000 символов, длинные страницы режутся
+<GBRAIN_CMD> config set cycle.extract_atoms.max_input_chars 150000
 ```
 
 Только если заметки на русском (вопрос 9). Подставь `<OWNER_NAME>` и

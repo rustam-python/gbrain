@@ -845,10 +845,12 @@ gbrain config set dream.propose_takes.max_tokens 3000
 gbrain config set dream.propose_takes.retry_max_tokens 6000
 gbrain config set conversation_parser.llm_fallback_enabled false
 gbrain config set chunk_strategy semantic
+gbrain config set cycle.extract_atoms.max_input_chars 150000
 ```
 
 * `agent.use_gateway_loop true`: без него агентные задачи падают на любой модели, кроме Anthropic.
-* Последние пять ключей (`facts…`, `dream.propose_takes…`, `conversation_parser…`, `chunk_strategy`) значения взяли из локального runbook. Не меняй их числа.
+* Предыдущие пять ключей (`facts…`, `dream.propose_takes…`, `conversation_parser…`, `chunk_strategy`) значения взяли из локального runbook. Не меняй их числа.
+* `cycle.extract_atoms.max_input_chars 150000`: по умолчанию 50000, и длинные страницы (чаты, транскрипты) режутся, а `extract_atoms` пропускает их хвост. Значение 150000 не меняй. Ставь ключ до первого прогона `dream`: если поднять предел позже, ранее обрезанные страницы перечитаются с вызовами модели, а на платном провайдере это стоит денег.
 
 ### 12.3. Только если чат-модель умеет вызывать инструменты (вопрос 9 = да)
 
