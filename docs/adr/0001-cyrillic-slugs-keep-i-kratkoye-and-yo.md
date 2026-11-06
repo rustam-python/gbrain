@@ -71,7 +71,9 @@ nearest non-mark character before them is Cyrillic — so a stress mark sitting
 between the letter and its breve (`и` + U+0301 + U+0306) still yields `й`. The
 Cyrillic acute (U+0301, the dictionary stress mark) folds like an ordinary
 accent, so a stressed and a bare spelling stay one slug (and one alias key).
-Ukrainian `ї` and Belarusian `ў` decompose through U+0308/U+0306 and survive too.
+Ukrainian `ї`, Belarusian `ў` and any other Cyrillic letter that decomposes
+through U+0308/U+0306 (Moldovan `ӂ`, for one) survive too: the carve-out is two
+marks, not two letters.
 
 The rule protects a letter by the mark it gets under NFD, not by being a
 letter. Macedonian `ѓ` (U+0453) and `ќ` (U+045C) decompose through U+0301 and
@@ -89,6 +91,8 @@ letter fold shared by all four slug grammars: `sync.ts:slugifySegment`,
 (#4985): if the two fold marks differently, a page's slug and its basename
 index key diverge and every `[[wikilink]]` to a name with `й` or `ё` stops
 resolving. Pinned by `test/cyrillic-slug-grammar.test.ts`.
+`resolve.slugify` also runs NFKD first, so compatibility forms (`ﬁ`) fold before
+the shared fold sees them; the other three grammars do not.
 
 `entities/resolve.ts:slugify` moved from `[^a-z0-9]` to the shared keep-set as
 part of this. That affects every non-Latin script, not only Cyrillic: before,
@@ -116,7 +120,13 @@ Page slugs re-key on one `gbrain sync --full`, with no manual steps:
   derives to its slug: a live page can keep a stale `source_path` after a
   rename, and sharing a path with another page does not make it a twin.
   Retirement runs on source-scoped full syncs only, like every reconcile
-  delete; a sync with no source leaves twins in place.
+  delete; a sync with no source leaves twins in place. The origin index allows
+  one live page per file, so a full sync's import retires the twin of the file
+  it is about to write just before that write (same rules, same transaction
+  for delete and redirect). If the import then fails, the redirect points at a
+  page that does not exist yet: the file is still there, so the next full sync
+  writes it and the redirect lands. A failed retirement is logged and leaves
+  the twin live.
 * Two files the old grammar collided (`Пётр Иванов.md` / `Петр Иванов.md` →
   one `петр-иванов` page) separate: each gets its own page.
 
