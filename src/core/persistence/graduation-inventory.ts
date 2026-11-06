@@ -31,6 +31,7 @@ export const GRADUATION_INVENTORY: Inventory = {
   entries: [
     carry('access_group_members', 'security', 'Group membership behind readable_by group:<id> grants; without it carried pages would resolve readers differently.'),
     carry('access_groups', 'security', 'Access groups that readable_by names; carried so grants keep meaning the same people.'),
+    carry('access_member_links', 'security', 'Links from attested outside identities (QM actors) to brain members; dropping them would unlink every attested person.'),
     carry('access_members', 'security', 'Brain members that readable_by member:<id> names; carried so per-page readers stay the same people.'),
     carry('access_pending_coverage', 'security', 'Prefixes that read as nobody while a narrowing stamps or a policy file is invalid; dropping them would reveal pages.'),
     carry('access_policy_migrations', 'operational', 'In-flight folder-policy store switches (git and database) and their receipts.'),
@@ -168,6 +169,7 @@ export const GRADUATION_INVENTORY: Inventory = {
     }),
     carry('question_evidence', 'user_data', 'Per-sentence evidence pointers of pinned answers; without them every answer reads stale.'),
     carry('raw_data', 'user_data', 'Raw source payloads per page.'),
+    carry('reason_purge_tombstones', 'user_data', 'Text-free (commit, path) pairs a purge found a change reason in; dropping them would let a later sync bring the purged reason back.'),
     carry('retrieval_event_links', 'operational', 'Typed edges each recorded answer used; keeps recent answers rateable.'),
     carry('retrieval_event_pages', 'operational', 'Pages and revisions each recorded answer used; keeps recent answers rateable.'),
     carry('retrieval_events', 'operational', 'Recorded answers (answer_id, client, op) within the retention window.'),

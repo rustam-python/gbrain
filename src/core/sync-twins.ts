@@ -95,7 +95,12 @@ export async function retireOriginTwinsForImport(
   let retired = 0;
   for (const row of rows) {
     if (!isRetiredTwin(row, imported)) continue;
-    try { if (await retireTwin(engine, sourceId, row.slug, imported.slug)) retired++; } catch { /* the origin guard reports it */ }
+    try {
+      if (await retireTwin(engine, sourceId, row.slug, imported.slug)) retired++;
+    } catch (err) {
+      // The twin stays live and the origin guard refuses the import, which a later full sync retries.
+      process.stderr.write(`[sync] could not retire old-slug page ${row.slug} (-> ${imported.slug}); kept: ${(err as Error).message}\n`);
+    }
   }
   return retired;
 }

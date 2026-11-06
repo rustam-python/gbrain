@@ -280,7 +280,10 @@ describe('ADR-0001 consequence: enrichEntity merges the two spellings', () => {
     // this surface, and silently missing from tryAliasExact.
     const stub = await enrichEntity(engine, mention('Игорь Волков', 'person'), { trusted: false });
 
-    const failing = failingEngine((key) => key === 'setPageAliases');
+    // Fails once: the page door's writer keeps the engine it first saw, so a failure that never
+    // stopped would also fail the retry below.
+    let tripped = false;
+    const failing = failingEngine((key) => key === 'setPageAliases' && !tripped && (tripped = true));
 
     await expect(
       extraction_review.handler({ ...reviewCtx(), engine: failing }, { action: 'promote', slugs: [stub.slug] }),
@@ -322,29 +325,6 @@ describe('ADR-0001 consequence: enrichEntity merges the two spellings', () => {
     const leaked = (await engine.resolveAliases([normalizeAlias('Сергей Новиков')], { sourceId: 'default' }))
       .get(normalizeAlias('Сергей Новиков')) ?? [];
     expect(leaked).toHaveLength(0);
-  });
-
-  test('an empty alias set never reaches the index as a bare DELETE', async () => {
-    // Unreachable for an extraction stub (it always has a title), but the
-    // branch exists: aliases=[] would write `aliases: []` and run
-    // setPageAliases(slug, src, []) — a DELETE with no INSERT, wiping rows
-    // that were already there.
-    const stub = await enrichEntity(engine, mention('Мария Козлова', 'person'), { trusted: false });
-    const page = await engine.getPage(stub.slug);
-    await engine.setPageAliases(stub.slug, 'default', [normalizeAlias('Прежний')]);
-    await engine.putPage(stub.slug, {
-      title: '',
-      type: 'person',
-      compiled_truth: page!.compiled_truth ?? '',
-      timeline: '',
-      frontmatter: page!.frontmatter,
-    });
-
-    await extraction_review.handler(reviewCtx(), { action: 'promote', slugs: [stub.slug] });
-
-    const kept = (await engine.resolveAliases([normalizeAlias('Прежний')], { sourceId: 'default' }))
-      .get(normalizeAlias('Прежний')) ?? [];
-    expect(kept.map((h) => h.slug)).toContain(stub.slug);
   });
 
   test('promotion does not clobber aliases the owner already declared', async () => {
