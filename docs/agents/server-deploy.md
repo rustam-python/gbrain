@@ -256,6 +256,16 @@ gbrain config set cycle.extract_atoms.max_input_chars 150000   # по умолч
 На платном провайдере это стоит денег, поэтому ключ ставь вместе с
 остальными, до первого прогона, а не после.
 
+Каталог корпуса сессий читают фаза синтеза в `dream` и команда
+`gbrain repair agent-session-facts` (без него она не находит файлы сессий и
+считает все факты неклассифицируемыми):
+
+```bash
+gbrain config set dream.synthesize.session_corpus_dir "$HOME/.gbrain/transcripts/corpus"
+```
+
+Откат: `gbrain config unset dream.synthesize.session_corpus_dir`.
+
 Для русских заметок добавь подсказку извлечения фактов (имя владельца в
 именительном падеже) — текст и условия в `docs/agents/local-deploy.md`, раздел 5.
 Если в базе уже есть своё `facts.extraction_prompt_appendix`, не затирай его.
