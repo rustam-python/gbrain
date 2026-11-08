@@ -611,6 +611,10 @@
       },
       {
         "category": "brain",
+        "name": "unwithdrawn_facts"
+      },
+      {
+        "category": "brain",
         "name": "conversation_label_facts"
       },
       {
@@ -886,6 +890,10 @@
         "name": "quarantined_changes"
       },
       {
+        "category": "brain",
+        "name": "foreign_writers"
+      },
+      {
         "category": "ops",
         "name": "decide_health"
       },
@@ -912,6 +920,10 @@
       {
         "category": "brain",
         "name": "facts_drain"
+      },
+      {
+        "category": "ops",
+        "name": "wakeshift"
       },
       {
         "category": "brain",
@@ -1060,6 +1072,10 @@
       {
         "category": "brain",
         "name": "git_index_lag"
+      },
+      {
+        "category": "brain",
+        "name": "local_edit_adoptions"
       },
       {
         "category": "brain",
