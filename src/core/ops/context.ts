@@ -200,7 +200,7 @@ export function validateUploadPath(filePath: string, root: string, strict = true
  * semantics. Compose with the `u` flag — see SLUG_WORD_CHARS.
  */
 const OP_PAGE_SLUG_SEG = `${STORED_PAGE_SLUG_SEG}(?::${STORED_PAGE_SLUG_SEG})*`;
-const OP_PAGE_SLUG_RE = new RegExp(`^${OP_PAGE_SLUG_SEG}(\/${OP_PAGE_SLUG_SEG})*$`, 'iu');
+const OP_PAGE_SLUG_RE = new RegExp(`^${OP_PAGE_SLUG_SEG}(\\/${OP_PAGE_SLUG_SEG})*$`, 'iu');
 
 /**
  * Allowlist validator for page slugs. Rejects URL-encoded traversal, backslashes,
@@ -219,7 +219,7 @@ export function validatePageSlug(slug: string): void {
   // required for the \p{...} classes in OP_PAGE_SLUG_SEG, built on cjk.ts's
   // STORED_PAGE_SLUG_SEG). Shape rules (word-char lead, dot/underscore/hyphen
   // continuation, optional colon-separated namespace parts) preserved.
-  if (!new RegExp(`^${OP_PAGE_SLUG_SEG}(\\/${OP_PAGE_SLUG_SEG})*$`, 'iu').test(slug)) {
+  if (!OP_PAGE_SLUG_RE.test(slug)) {
     throw opError('invalid_params', `Invalid page_slug: ${slug} (allowed: letters/numbers in any script, with '.', '_', '-' after the first character of a part, optional colon-separated namespace parts, and forward-slash separated segments)`,
       'Use a slug shaped like people/alice-example or notes/v1.0.0: no spaces, backslashes, percent-encoding or dot-led segments.');
   }

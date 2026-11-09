@@ -154,8 +154,7 @@ export function legacyAsciiEntitySlug(name: string, type: 'person' | 'company'):
     // gbrain-allow-ascii-class: deliberately reproduces the pre-Unicode ASCII-only slugifier
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
-  const prefix = type === 'person' ? 'people' : 'companies';
-  return `${prefix}/${slug}`;
+  return `${entityNamespace(type)}/${slug}`;
 }
 
 /** Get the brain page path for an entity. */
@@ -208,7 +207,7 @@ async function planEntity(
   opts?: EnrichmentTrustOptions,
 ): Promise<EnrichmentResult | ManagedEntity> {
   const base = entitySlugBase(request.entityName);
-  const prefix = request.entityType === 'person' ? 'people' : 'companies';
+  const prefix = entityNamespace(request.entityType);
   const candidateSlug = `${prefix}/${entitySegment(base, request.entityType, false)}`;
   const sourceId = opts?.sourceId ?? 'default';
   // ADR-0001: two spellings of one name slug apart on purpose; the alias layer
