@@ -76,7 +76,7 @@ const file_upload: Operation = {
 
     // A relative path means the session directory a launcher-started serve records, the same root it is confined to (#8426).
     const filePath = resolve(hookSessionCwd(), p.path as string);
-    const pageSlug = (p.page_slug as string) || null;
+    const pageSlug = (p.page_slug as string)?.normalize('NFC') || null;
 
     // Fix 1 / B5 / H5 / M4: validate path, slug, filename before any filesystem read.
     // Remote callers (MCP, agent) are confined to cwd (strict). Local CLI callers
@@ -85,7 +85,10 @@ const file_upload: Operation = {
     const strict = ctx.remote !== false;
     validateUploadPath(filePath, hookSessionCwd(), strict);
     if (pageSlug) validatePageSlug(pageSlug);
-    const filename = basename(filePath);
+    // NFC (page slug above too) so the NFD (macOS) and NFC (Windows) spellings
+    // of one visible name share one storage_path and the content_hash +
+    // storage_path dedupe holds.
+    const filename = basename(filePath).normalize('NFC');
     validateFilename(filename);
 
     const stat = statSync(filePath);

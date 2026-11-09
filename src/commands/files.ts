@@ -172,7 +172,9 @@ async function listFiles(engine: BrainEngine, slug?: string) {
 
 async function uploadFile(engine: BrainEngine, args: string[]) {
   const filePath = args.find(a => !a.startsWith('--'));
-  const pageSlug = args.find((a, i) => args[i - 1] === '--page') || null;
+  // NFC: the NFD (macOS) and NFC (Windows) spellings of one visible name must
+  // build one storage_path, or the hash + storage_path dedupe stores it twice.
+  const pageSlug = args.find((a, i) => args[i - 1] === '--page')?.normalize('NFC') || null;
 
   if (!filePath || !existsSync(filePath)) {
     console.error('Usage: gbrain files upload <file> --page <slug>');
@@ -186,7 +188,7 @@ async function uploadFile(engine: BrainEngine, args: string[]) {
 
   const stat = statSync(filePath);
   const hash = fileHash(filePath);
-  const filename = basename(filePath);
+  const filename = basename(filePath).normalize('NFC');
   const storagePath = pageSlug ? `${pageSlug}/${filename}` : `unsorted/${hash.slice(0, 8)}-${filename}`;
   const mimeType = getMimeType(filePath);
 
@@ -236,7 +238,8 @@ async function uploadFile(engine: BrainEngine, args: string[]) {
  */
 async function uploadRaw(engine: BrainEngine, args: string[]) {
   const filePath = args.find(a => !a.startsWith('--'));
-  const pageSlug = args.find((a, i) => args[i - 1] === '--page') || null;
+  // NFC for the same reason as uploadFile: one storage_path per visible name.
+  const pageSlug = args.find((a, i) => args[i - 1] === '--page')?.normalize('NFC') || null;
   const fileType = args.find((a, i) => args[i - 1] === '--type') || null;
   const noPointer = args.includes('--no-pointer');
 
@@ -342,7 +345,10 @@ async function uploadRaw(engine: BrainEngine, args: string[]) {
   const { createStorage } = await import('../core/storage.ts');
   const storage = await createStorage(config.storage as any);
   const hash = fileHash(filePath);
-  const storagePath = pageSlug ? `${pageSlug}/${filename}` : `unsorted/${hash.slice(0, 8)}-${filename}`;
+  // The cloud key is NFC; the git branch above keeps the on-disk spelling
+  // because it copies the real file and compares paths byte-for-byte.
+  const cloudName = filename.normalize('NFC');
+  const storagePath = pageSlug ? `${pageSlug}/${cloudName}` : `unsorted/${hash.slice(0, 8)}-${cloudName}`;
   const bucket = (config.storage as any).bucket || 'brain-files';
 
   const method = stat.size >= SIZE_THRESHOLD ? 'TUS resumable' : 'standard';
@@ -383,7 +389,7 @@ async function uploadRaw(engine: BrainEngine, args: string[]) {
        size_bytes = EXCLUDED.size_bytes,
        mime_type = EXCLUDED.mime_type,
        ${FILES_METADATA_MERGE_SQL}`,
-    [pageSlug, filename, storagePath, mimeType, stat.size, 'sha256:' + hash],
+    [pageSlug, cloudName, storagePath, mimeType, stat.size, 'sha256:' + hash],
     [{ storage: (config.storage as StorageConfig).backend, ...(fileType ? { type: fileType } : {}), upload_method: method }],
   );
 
@@ -445,13 +451,15 @@ async function syncFiles(engine: BrainEngine, dir?: string) {
 
   for (let i = 0; i < files.length; i++) {
     const filePath = files[i];
-    const relativePath = relative(dir, filePath);
+    // NFC: a macOS (NFD) and a Windows (NFC) checkout of one folder must build
+    // the same storage_path, filename and inferred page slug.
+    const relativePath = relative(dir, filePath).normalize('NFC');
 
     progress.tick(1);
 
     const stat = statSync(filePath);
     const hash = fileHash(filePath);
-    const filename = basename(filePath);
+    const filename = basename(relativePath);
     const storagePath = relativePath.replace(/\\/g, '/');
     const mimeType = getMimeType(filePath);
 
