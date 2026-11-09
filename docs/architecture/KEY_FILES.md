@@ -26,15 +26,15 @@ link it here; never raise the cap.
 | [Canonical reconciliation](key-files/canonical-reconciliation.md) | Exact-page repair, retained originals, [derived generations](key-files/generations.md), sync discovery and the origin rule; [rows behind the checkpoint](key-files/canonical-reconciliation-continued.md) |
 | [Company-brain ingestion](key-files/company-brain.md) | Inspection, admission, receipts, derived relationships and schema; [operator guide](../guides/company-brain-ingestion.md) |
 | [Agent operator contract](key-files/agent-contract.md) | `agent-output.ts`, error registry + docs, notice ledger, `isCallable`, `--json` guard, contract scanner |
-| [Commands (1/6)](key-files/commands-1.md) | `src/commands/agent-logs.ts` through `db-repair.ts` |
+| [Commands (1/6)](key-files/commands-1.md) | `agent-logs.ts` to `db-repair.ts` |
 | [Commands (2/6)](key-files/commands-2.md) | `src/commands/doctor.ts` and `src/commands/doctor/` |
 | [Commands (2/6, continued)](key-files/commands-2-continued.md) | `doctor/checks/routing-federation.ts`, `git-convergence.ts`, `keyword-plan.ts`, `dream-retriage.ts` to `embed.ts` |
 | [Commands (3/6)](key-files/commands-3.md) | `src/commands/engine-status.ts` through `extract.ts` |
 | [Commands (3/6, continued)](key-files/commands-3-continued.md) | `src/commands/extract-timeline-db.ts` through `frontmatter-install-hook.ts` |
 | [Commands (4/6)](key-files/commands-4.md) | `src/commands/frontmatter.ts` through `pages-status.ts` |
 | [Commands (4/6, continued)](key-files/commands-4-continued.md) | `persistence-admin.ts` to `reindex-search-vector.ts`, `init-mode-picker.ts`, `core/embedding-migration-cli.ts` |
-| [Commands (5/6)](key-files/commands-5.md) | `src/commands/reindex.ts` through `storage.ts` |
-| [Commands (6/6)](key-files/commands-6.md) | `src/commands/sync.ts` through `whoknows.ts` |
+| [Commands (5/6)](key-files/commands-5.md) | `repair.ts` to `skillpack.ts`; [continued](key-files/commands-5-continued.md) |
+| [Commands (6/6)](key-files/commands-6.md) | `sync.ts` to `whoknows.ts` |
 | [Core Ai](key-files/core-ai.md) | `src/core/ai/` gateway, embedding, dims, errors, fallbacks |
 | [Core Ai (continued)](key-files/core-ai-continued.md) | `src/core/ai/providers/*`, `recipes/*`, `voyage-gateway.ts` |
 | [Core Decide](key-files/core-decide.md) | `src/core/ai/decide/*`, `src/core/search/decide-stage.ts`, `gbrain decide`, `decide_health` (System One) |
@@ -43,7 +43,7 @@ link it here; never raise the cap.
 | [Core Cycle (continued)](key-files/core-cycle-continued.md) | synthesis postprocess |
 | [Core Cycle (patterns)](key-files/core-cycle-patterns.md) | patterns, drift, synthesis |
 | [Core Minions (1/2)](key-files/core-minions-1.md) | `src/core/minions/` through `src/core/minions/protected-names.ts` |
-| [Core Minions (2/2)](key-files/core-minions-2.md) | `src/core/minions/queue.ts` through `src/core/minions/worker.ts` |
+| [Core Minions (2/2)](key-files/core-minions-2.md) | `minions/queue.ts` to `worker.ts`; [Wakeshift](key-files/wakeshift.md) |
 | [Core Persistence](key-files/core-persistence.md) | `src/core/persistence/` journal, coordinator, effects, managed sync |
 | [Core Persistence (continued)](key-files/core-persistence-continued.md) | connectors, holds, receipts; [Git writer](key-files/core-persistence-git.md); [fence repair](key-files/core-fence-repair.md) |
 | [Persistence capacity](key-files/core-persistence-capacity.md) | write caps, true-up; [history](key-files/page-history.md), [as_of](key-files/valid-time.md) |

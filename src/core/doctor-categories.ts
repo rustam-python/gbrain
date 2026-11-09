@@ -100,6 +100,7 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   // GBRA-231: shared agents (doctor/checks/shared-agent-access.ts).
   'access_may_act_for_wildcard',
   'extractor_facts_expired',
+  'unwithdrawn_facts',
   'loop_facts_drift',
   'ontology_facts_fenced',
   'orphan_persistence_bindings',
@@ -229,6 +230,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'dirty_age',
   'commits_outside_source_root',
   'quarantined_changes',
+  // PR B: commits in a source checkout that gbrain's commit ledger does not name, and page files left uncommitted (doctor/checks/foreign-writers.ts).
+  'foreign_writers',
   'takes_count',
   'takes_weight_grid',
   // #5836: active facts with no entity (invisible to entity recall and the conflict sweep).
@@ -239,6 +242,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'db_ahead_of_git',
   // Git-canonical G3: how far each strict source's index trails HEAD (doctor/checks/git-index-lag.ts).
   'git_index_lag',
+  // GST-1601: local edits adopted in the last 24 h per source (doctor/checks/local-edit-adoptions.ts).
+  'local_edit_adoptions',
   'edge_validity',
   'text_projection_readiness',
   'timeline_coverage',
@@ -406,6 +411,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'pool_budget',
   'progressive_batch_audit_health',
   'queue_health',
+  // Wakeshift PR 1: report-back key, enabled state and dead/id_reused watches (doctor/checks/wakeshift.ts).
+  'wakeshift',
   // #4578: brain-wide maintenance jobs dying at their deadline.
   'global_maintenance_timeouts',
   // GBRA-130 C-6: no completed brain-wide pass while jobs fail or a phase keeps blocking it.
