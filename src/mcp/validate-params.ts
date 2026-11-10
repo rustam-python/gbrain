@@ -229,7 +229,7 @@ export function findUnknownParams(op: Operation, params: Record<string, unknown>
   const warnings: UnknownParamWarning[] = [];
   for (const key of Object.keys(params)) {
     if (declaredSet.has(key) || UNKNOWN_PARAM_ALLOWLIST.has(key)) continue;
-    const alias = aliases?.[key] ?? SOURCE_PARAM_ALIASES[key.toLowerCase().replace(/[^a-z]/g, '')];
+    const alias = aliases?.[key] ?? SOURCE_PARAM_ALIASES[key.toLowerCase().replace(/[^a-z]/g, '')]; // gbrain-allow-ascii-class: MCP parameter-name folding, ASCII identifier
     const nearest = alias && declaredSet.has(alias) ? alias : suggestNearest(key, declared);
     warnings.push({ code: 'unknown_param', param: key, ...(nearest ? { suggestion: nearest } : {}) });
   }
@@ -243,7 +243,7 @@ const NARROWING_FAMILIES: readonly RegExp[] = [
 ];
 
 function narrowingFamily(name: string): RegExp | undefined {
-  const normalized = name.toLowerCase().replace(/[^a-z]/g, '');
+  const normalized = name.toLowerCase().replace(/[^a-z]/g, ''); // gbrain-allow-ascii-class: MCP parameter-name folding, ASCII identifier
   return NARROWING_FAMILIES.find(family => family.test(normalized));
 }
 

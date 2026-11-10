@@ -11,7 +11,7 @@ import { gbrainPath } from '../core/config.ts';
 import type { PrivateLabelsLedger, PrivateLabelsLedgerLine } from '../core/repair/private-labels.ts';
 
 export function privateLabelsLedger(brainId: string): PrivateLabelsLedger {
-  const path = gbrainPath('repair', 'private-labels', `${brainId.replace(/[^A-Za-z0-9._-]/g, '_')}.jsonl`);
+  const path = gbrainPath('repair', 'private-labels', `${brainId.replace(/[^A-Za-z0-9._-]/g, '_')}.jsonl`); // gbrain-allow-ascii-class: brain id as an ASCII file name, not slug text
   const lines: PrivateLabelsLedgerLine[] = [];
   let unreadable = 0;
   for (const text of existsSync(path) ? readFileSync(path, 'utf8').split('\n') : []) {
