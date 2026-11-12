@@ -121,9 +121,13 @@ export function isNonBrainRef(href: string): boolean {
  */
 export function normalizeToSlug(href: string): string | null {
   let s = href.trim();
-  // Editors percent-encode non-ASCII file names (#24). A malformed escape
-  // keeps the raw href, whose `%` then fails the slug grammar.
-  try { s = decodeURIComponent(s); } catch { /* keep raw */ }
+  // Editors percent-encode non-ASCII file names (#24). Only runs of non-ASCII
+  // bytes (%80-%FF) decode: an encoded `/`, `.` or `\` stays encoded, so it
+  // cannot turn into a path separator. A malformed run keeps its raw text,
+  // whose `%` then fails the slug grammar.
+  s = s.replace(/(?:%[89A-Fa-f][0-9A-Fa-f])+/g, (run) => {
+    try { return decodeURIComponent(run); } catch { return run; }
+  });
   // Strip repeated leading relative-path components (./, ../, multiple levels).
   while (/^\.\.?\/+/.test(s)) s = s.replace(/^\.\.?\/+/, '');
   // Strip leading slashes
