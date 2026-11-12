@@ -71,6 +71,15 @@ nearest non-mark character before them is Cyrillic — so a stress mark sitting
 between the letter and its breve (`и` + U+0301 + U+0306) still yields `й`. The
 Cyrillic acute (U+0301, the dictionary stress mark) folds like an ordinary
 accent, so a stressed and a bare spelling stay one slug (and one alias key).
+
+Known limit, accepted: the alias key does not merge a name whose stress mark
+sits between the base letter and its breve or diaeresis (`е` + U+0301 + U+0308,
+`и` + U+0301 + U+0306). `normalizeAlias` runs NFKC before it drops U+0301, and
+NFKC composes `ё` and `й` only from adjacent marks, so such a spelling keeps a
+loose mark and gets a different key from the bare one. Slugs are not affected.
+The Brain's owner writes no stress marks, so the fix is not made. It would drop
+U+0301 before NFKC and change three things together: `normalizeAlias`, its SQL
+copy and `test/cyrillic-slug-grammar.test.ts`, then run `gbrain reindex --aliases`.
 Ukrainian `ї`, Belarusian `ў` and any other Cyrillic letter that decomposes
 through U+0308/U+0306 (Moldovan `ӂ`, for one) survive too: the carve-out is two
 marks, not two letters.
