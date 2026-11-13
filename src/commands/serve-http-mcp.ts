@@ -21,8 +21,9 @@ import { httpInstructionTools } from '../mcp/initialize-context.ts';
 import { installCapabilitiesResource, mcpAdministrationGuidance } from '../mcp/capabilities.ts';
 import { createSkillResources } from '../mcp/skill-resources.ts';
 import { resolveAuthCapabilities } from '../core/harness/capabilities.ts';
-import { ambientOptsFrom, type WritebackConfig } from '../core/facts/writeback-config.ts';
+import { ambientOptsFrom, writebackCaller, type WritebackConfig } from '../core/facts/writeback-config.ts';
 import { resolveAgentWriteback } from '../core/facts/writeback-settings.ts';
+import { OWNER_MEMBER_KEY } from '../core/search/private-visibility.ts';
 import { hasScope, operationScopesAllowed } from '../core/scope.ts';
 import { summarizeMcpParams, dispatchToolCall, requestLogStatusForResult, requestMetaSessionId, hotMemoryOffIn, acceptedPendingReceipt, unknownToolEnvelope, errorResult, dispatchRenderContext, grantBlockedNotices, admitNotices, audienceRefusal, type ToolResult } from '../mcp/dispatch.ts';
 import { toAgentError } from '../core/agent-output.ts';
@@ -202,7 +203,7 @@ export function mountMcp(app: Express, ctx: ServeHttpContext): void {
     const state: McpRequestState = { authInfo, agentName, startTime, mcpOperations, surface, surfaceCeiling, surfaceAllowedOps, resultRows, thinClient,
       onBehalfOfHeader: req.get(ON_BEHALF_OF_HEADER), actorHeader: req.get(ACTOR_HEADER), audienceHeader: req.get(QM_AUDIENCE_HEADER),
       userAgent: req.get('user-agent'), agentLabel: parseAgentLabel(req.get(AGENT_LABEL_HEADER)) };
-    const server = createMcpRequestServer(ctx, state, writeback);
+    const server = createMcpRequestServer(ctx, state, writeback, writeback?.enabled ? await engine.getConfig(OWNER_MEMBER_KEY).catch(() => null) : null);
     await serveMcpRequest(server, req, res);
   }
 }
@@ -211,6 +212,7 @@ function createMcpRequestServer(
   ctx: ServeHttpContext,
   state: McpRequestState,
   writeback: WritebackConfig | null,
+  ownerMember: string | null,
 ): Server {
   const { engine, config, mcpResourceUrl } = ctx;
   const { authInfo, mcpOperations, surface, surfaceCeiling, surfaceAllowedOps } = state;
@@ -226,6 +228,7 @@ function createMcpRequestServer(
     writebackOpts = ambientOptsFrom(writeback, {
       remember: rememberOp !== undefined && opAllowedForBoundClient(authInfo, rememberOp),
       extractFacts: extractFactsOp !== undefined && opAllowedForBoundClient(authInfo, extractFactsOp),
+      ...writebackCaller(authInfo, ownerMember),
     });
   }
   const server = new Server(
@@ -350,7 +353,7 @@ async function callMcpTool(ctx: ServeHttpContext, state: McpRequestState, reques
   if (statusMode && hasScope(authInfo.scopes, 'read')) return statusToolResult(statusMode, 'http');
   const op = mcpOperations.find(o => o.name === name);
   if (!op) {
-    return qmMemoryToolResult(name, await rejectUnknownMcpOperation(ctx, state, name, requestMetaSessionId(request.params)));
+    return qmMemoryToolResult(name, await rejectUnknownMcpOperation(ctx, state, name, requestMetaSessionId(request.params)), state.actorHeader != null);
   }
 
   // Scope enforcement (v0.28: hasScope replaces exact-string-match so
@@ -366,7 +369,7 @@ async function callMcpTool(ctx: ServeHttpContext, state: McpRequestState, reques
   // denial first would tell the operator to widen the grant for nothing.
   const scopeSatisfied = op.cliOnly !== undefined || operationScopesAllowed(authInfo.scopes, op);
   if (!scopeSatisfied) {
-    return qmMemoryToolResult(name, await rejectInsufficientMcpScope(ctx, state, name, requiredScope, requestMetaSessionId(request.params)));
+    return qmMemoryToolResult(name, await rejectInsufficientMcpScope(ctx, state, name, requiredScope, requestMetaSessionId(request.params)), state.actorHeader != null);
   }
 
   // F8: redact request payload by default (declared keys only via the

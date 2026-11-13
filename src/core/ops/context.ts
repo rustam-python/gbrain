@@ -16,12 +16,13 @@ import { OperationError, opError } from './contract.ts';
 import type { AuthInfo, Operation, OperationContext } from './contract.ts';
 import type { Action } from '../agent-output.ts';
 import { hostFix, invalidParam, paramUse, readFix } from './op-fix.ts';
-import { CASED_WORD_CHARS, CJK_SLUG_CHARS, STORED_PAGE_SLUG_SEG } from '../cjk.ts';
+import { CASED_WORD_CHARS, CJK_SLUG_CHARS } from '../cjk.ts';
+import { isOpPageSlug, OP_PAGE_SLUG_RE } from '../page-slug-grammar.ts';
 import { validateSlug } from '../utils.ts';
 import { ALL_SOURCES, NO_SOURCES, isValidSourceId } from '../source-id.ts';
 import { encodeDeepResearchId } from '../deep-research-id.ts';
 import { isSearchMode } from '../search/mode.ts';
-import { stampEvidence } from '../search/evidence.ts';
+import { stampEvidence, type EvidenceOpts } from '../search/evidence.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
 import type { SearchResult, HybridSearchMeta, PageReadScope, PageReadPolicy } from '../types.ts';
 import { resolveExcludePrivatePages, isPrivatePage } from '../search/private-visibility.ts';
@@ -187,20 +188,6 @@ export function validateUploadPath(filePath: string, root: string, strict = true
   return real;
 }
 
-/**
- * Op-boundary page-slug segment (#4665/#5032): STORED_PAGE_SLUG_SEG (cjk.ts)
- * widened LOCALLY so a colon separates individually valid parts inside a path
- * segment, preserving existing integration slugs such as `calendar:event-id`
- * without admitting empty or dot-led parts (`calendar:../x` remains invalid).
- * The lead char of each part stays a word char, so dot-LED segments remain
- * impossible — `..` traversal and every H5 rejection (backslash, %2e/%2f
- * encodings, control chars, RTL overrides, spaces) still fail. Deliberately
- * NOT widened in cjk.ts: cite-render, SlugRegistry's SLUG_RE, and the
- * dream-cycle SUMMARY_SLUG_RE consume the shared grammar with different
- * semantics. Compose with the `u` flag — see SLUG_WORD_CHARS.
- */
-const OP_PAGE_SLUG_SEG = `${STORED_PAGE_SLUG_SEG}(?::${STORED_PAGE_SLUG_SEG})*`;
-const OP_PAGE_SLUG_RE = new RegExp(`^${OP_PAGE_SLUG_SEG}(\\/${OP_PAGE_SLUG_SEG})*$`, 'iu');
 
 /**
  * Allowlist validator for page slugs. Rejects URL-encoded traversal, backslashes,
@@ -225,10 +212,7 @@ export function validatePageSlug(slug: string): void {
   }
 }
 
-/** True when `slug` passes validatePageSlug's op-boundary grammar. */
-export function isOpPageSlug(slug: string): boolean {
-  return typeof slug === 'string' && slug.length > 0 && slug.length <= 255 && OP_PAGE_SLUG_RE.test(slug);
-}
+export { isOpPageSlug };
 
 /**
  * #6212: a slug an older gbrain stored that today's grammar refuses (a space,
@@ -1232,8 +1216,8 @@ export function resolvePerCallMode(ctx: OperationContext, raw: unknown, opName =
 }
 
 /** T4 — stamp evidence/create_safety on a result set, fail-soft. */
-export function stampEvidenceSafe(results: SearchResult[]): void {
-  try { stampEvidence(results); } catch { /* non-fatal */ }
+export function stampEvidenceSafe(results: SearchResult[], opts?: EvidenceOpts): void {
+  try { stampEvidence(results, opts); } catch { /* non-fatal */ }
 }
 
 export function stampDeepResearchIds(results: SearchResult[]): void {

@@ -37,12 +37,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  HARNESS_EVALS_PIN: 0a5246d1678e6773c5f39d40c9eecc65c369e09d
+  HARNESS_EVALS_PIN: 7e8d872edb6d121cc7376b1ce415bd04ad1f3bfe
 
 jobs:
   # Event parity: docs/ci-event-parity.md#classification (harness-check.yml): a fork head is refused, a missing token skips.
   keyless:
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - name: Refuse a fork head; skip without HARNESS_EVALS_READ_TOKEN

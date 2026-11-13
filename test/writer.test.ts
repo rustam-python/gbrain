@@ -571,6 +571,12 @@ describe('link validator', () => {
     expect(normalizeToSlug('people/alice%20smith.md')).toBeNull();
   });
 
+  test('normalizeToSlug never decodes an ASCII escape into a path separator', () => {
+    expect(normalizeToSlug('people%2Falice.md')).toBeNull();
+    expect(normalizeToSlug('people/%2e%2e/alice.md')).toBeNull();
+    expect(normalizeToSlug('people/%D0%B0%2F%D0%B1.md')).toBeNull();
+  });
+
   test('checks dotted and percent-encoded page links; an image link stays a warning', async () => {
     await engine.putPage('notes/v1.0.0', { type: 'note', title: 'v1', compiled_truth: 'x', frontmatter: {} });
     const findings = await linkValidator.validate({

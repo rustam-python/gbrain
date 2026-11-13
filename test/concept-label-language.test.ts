@@ -21,6 +21,7 @@ import {
 
 const CYCLE = join(import.meta.dir, '..', 'src', 'core', 'cycle');
 const MINIONS = join(import.meta.dir, '..', 'src', 'core', 'minions');
+// test-reads-source-ok[prompt-byte]: the prompt builders are not exported, so the wiring checks pin the rule wording in the prompt files.
 const read = (file: string) => readFileSync(join(CYCLE, file), 'utf8');
 
 describe('ADR-0002: Concept labels follow the Исходный язык', () => {
@@ -81,12 +82,14 @@ describe('ADR-0002: Concept labels follow the Исходный язык', () => 
     });
 
     test('oneshot synthesize (the default path): slug rules', () => {
+      // test-reads-source-ok[prompt-byte]: the prompt builders are not exported, so the wiring checks pin the rule wording in the prompt files.
       const src = readFileSync(join(MINIONS, 'handlers', 'subagent-oneshot.ts'), 'utf8');
       expect(src).toContain('${SLUG_CHARS_RULE}');
       expect(src).toContain('${SLUG_LANGUAGE_RULE}');
     });
 
     test('put_page tool description: slug characters', () => {
+      // test-reads-source-ok[prompt-byte]: the prompt builders are not exported, so the wiring checks pin the rule wording in the prompt files.
       const src = readFileSync(join(MINIONS, 'tools', 'brain-allowlist.ts'), 'utf8');
       expect(src).toContain('${SLUG_CHARS_RULE}');
     });
