@@ -147,6 +147,8 @@ jobs:
           esac
           args=(plan --candidate "$candidate" --profile "$profile" --out upgrade-matrix-plan.json)
           if [ -n "${INPUT_FROM:-}" ]; then args+=(--from "$INPUT_FROM"); fi
+          # Release and stable tags live upstream; the candidate SHA is already local.
+          git remote set-url origin https://github.com/garrytan/gbrain.git
           bun scripts/upgrade-matrix.ts "${args[@]}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
