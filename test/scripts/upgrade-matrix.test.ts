@@ -218,14 +218,21 @@ describe('GitHub fixture', () => {
     }
   }, 120_000);
 
-  test('compareInstalledTree finds an installed file that differs from the commit, and one that is missing', () => {
+  test('compareInstalledTree finds changed and missing files without mistaking a quoted Unicode path for a missing one', () => {
     const src = gitRepo(), installed = mkdtempSync(join(tmpdir(), 'um-inst-'));
+    const unicode = 'gbrain — сравнение Gemma и Qwen (2026-09-28).md';
     try {
-      execFileSync('sh', ['-c', 'git -C "$0" archive ' + src.second + ' | tar -x -C "$1"', src.dir, installed]);
-      expect(compareInstalledTree(src.dir, src.second, installed)).toEqual({ checked: 2, mismatches: [], missing: [] });
+      writeFileSync(join(src.dir, unicode), 'benchmark\n');
+      execFileSync('git', ['-C', src.dir, 'add', '--', unicode]);
+      execFileSync('git', ['-C', src.dir, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'unicode']);
+      src.second = execFileSync('git', ['-C', src.dir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      for (const path of ['VERSION', 'package.json', unicode]) {
+        writeFileSync(join(installed, path), execFileSync('git', ['-C', src.dir, 'show', `${src.second}:${path}`], { encoding: 'utf8' }));
+      }
+      expect(compareInstalledTree(src.dir, src.second, installed)).toEqual({ checked: 3, mismatches: [], missing: [] });
       expect(compareInstalledTree(src.dir, src.first, installed).mismatches).toEqual(['VERSION']);
       unlinkSync(join(installed, 'package.json'));
-      expect(compareInstalledTree(src.dir, src.second, installed)).toEqual({ checked: 1, mismatches: [], missing: ['package.json'] });
+      expect(compareInstalledTree(src.dir, src.second, installed)).toEqual({ checked: 2, mismatches: [], missing: ['package.json'] });
     } finally {
       rmSync(installed, { recursive: true, force: true }); rmSync(src.dir, { recursive: true, force: true });
     }

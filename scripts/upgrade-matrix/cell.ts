@@ -370,10 +370,10 @@ function dedupe<T extends { host: string; action: string }>(rows: T[]): T[] {
 
 /** Every blob in the candidate's tree compared with the installed package (git hash-object), skipping paths Bun does not install. */
 export function compareInstalledTree(repo: string, sha: string, installed: string): { checked: number; mismatches: string[]; missing: string[] } {
-  const listing = execFileSync('git', ['-C', repo, 'ls-tree', '-r', '--full-tree', sha], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
+  const listing = execFileSync('git', ['-C', repo, 'ls-tree', '-z', '-r', '--full-tree', sha], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
   const mismatches: string[] = [], missing: string[] = [];
   const paths: string[] = [], expected: string[] = [];
-  for (const line of listing.split('\n')) {
+  for (const line of listing.split('\0')) {
     const m = /^(\d+) blob ([0-9a-f]+)\t(.+)$/.exec(line);
     if (!m || m[1] === '120000' || m[1] === '160000') continue;
     const path = m[3]!;
