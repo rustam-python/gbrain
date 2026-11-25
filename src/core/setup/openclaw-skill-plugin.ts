@@ -33,7 +33,7 @@
  */
 import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmdirSync, rmSync, unlinkSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { atomicWriteTextFile } from '../bootstrap/atomic-write.ts';
 import { bunSpawnSync } from '../spawn.ts';
@@ -255,7 +255,7 @@ export async function syncOpenclawSkillPlugin(opts: OpenclawSkillSyncOptions): P
   if (!bin && !existsSync(openclawStateDir())) {
     return fail({ code: 'skill_resolver_host_not_local', message: `No openclaw on PATH and no OpenClaw state directory at ${openclawStateDir()}, so this is not the OpenClaw host. The plugin runs inside the gateway and needs this gbrain home, library and bin on the same machine.` });
   }
-  if (!opts.gbrainBin.startsWith('/')) return fail({ code: 'skill_resolver_setup_incomplete', message: 'No absolute gbrain binary was found for the plugin (the gateway inherits no PATH); pass --gbrain-bin. Nothing was written.' });
+  if (!isAbsolute(opts.gbrainBin)) return fail({ code: 'skill_resolver_setup_incomplete', message: 'No absolute gbrain binary was found for the plugin (the gateway inherits no PATH); pass --gbrain-bin. Nothing was written.' });
 
   const prior = readOpenclawSkillState(home);
   const roster = openclawRoster();

@@ -36,7 +36,7 @@ function evaluate(expression: string, context: Context): unknown {
       event: { action: context.action, label: { name: context.label }, pull_request: context.pr ?? {} } },
     inputs: context.inputs ?? {},
     needs: { changes: { outputs, result: context.changes ?? 'success' }, 'prepare-e2e': { outputs }, 'dynamic-ci': { outputs: context.verdicts ?? {} } },
-  }, { timeout: 100 });
+  }, { timeout: 1000 });
 }
 const template = (value: string, context: Context) => value.replace(/\$\{\{(.*?)\}\}/g, (_, expression) => String(evaluate(expression.trim(), context)));
 const runs = (w: Workflow, context: Context) =>

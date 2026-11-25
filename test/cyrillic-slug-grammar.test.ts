@@ -10,6 +10,7 @@ import { operations } from '../src/core/operations.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import { isUnverifiedExtraction } from '../src/core/extraction-review.ts';
 import { PAGE_SLUG_SEG } from '../src/core/cjk.ts';
+import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 
 /**
  * Pins ADR-0001 (docs/adr/0001-cyrillic-slugs-keep-i-kratkoye-and-yo.md).
@@ -325,6 +326,7 @@ describe('ADR-0001 consequence: enrichEntity merges the two spellings', () => {
     const leaked = (await engine.resolveAliases([normalizeAlias('Сергей Новиков')], { sourceId: 'default' }))
       .get(normalizeAlias('Сергей Новиков')) ?? [];
     expect(leaked).toHaveLength(0);
+    await disposePersistenceConsumer(failing);
   });
 
   test('promotion does not clobber aliases the owner already declared', async () => {

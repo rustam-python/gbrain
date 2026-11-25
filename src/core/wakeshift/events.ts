@@ -86,6 +86,7 @@ export function wakeshiftManifestHash(): string {
 /** A cron name as gbrain stores it: lowercased, any run of other characters folded to '-', at most 64 characters; null when nothing is left. */
 export function cronName(raw: unknown): string | null {
   if (typeof raw !== 'string') return null;
+  // gbrain-allow-ascii-class: cron names are machine identifiers
   const name = raw.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64);
   return name || null;
 }

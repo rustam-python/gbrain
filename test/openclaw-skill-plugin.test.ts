@@ -130,7 +130,7 @@ describe.skipIf(!NODE)('gbrain setup openclaw --skill-loading', () => {
   test('shadow installs once; a flip to live runs no OpenClaw command and keeps the plugin files', async () => {
     const b = box();
     const first = await setup(b, ['--skill-loading', 'shadow']);
-    expect(first.exitCode).toBe(0);
+    expect(first.exitCode, JSON.stringify({ error: first.resolver?.error, stderr: first.stderr })).toBe(0);
     expect(first.resolver.error).toBeUndefined();
     expect(first.resolver.steps.map((s: any) => s.step)).toEqual(['catalog', 'library', 'state', 'plugin', 'install', 'verify', 'self-test']);
     expect(calls(b)).toEqual([
