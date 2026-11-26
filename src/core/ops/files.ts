@@ -77,7 +77,8 @@ const file_upload: Operation = {
 
     // A relative path means the session directory a launcher-started serve records, the same root it is confined to (#8426).
     const filePath = resolve(hookSessionCwd(), p.path as string);
-    const pageSlug = (p.page_slug as string)?.normalize('NFC') || null;
+    const requestedPageSlug = (p.page_slug as string) || null;
+    const pageSlug = requestedPageSlug?.normalize('NFC') || null;
 
     // Fix 1 / B5 / H5 / M4: validate path, slug, filename before any filesystem read.
     // Remote callers (MCP, agent) are confined to cwd (strict). Local CLI callers
@@ -86,7 +87,7 @@ const file_upload: Operation = {
     const strict = ctx.remote !== false;
     validateUploadPath(filePath, hookSessionCwd(), strict);
     (await import('../owned-folder/paths.ts')).assertNotOwnedRoot(filePath, 'file_upload refuses');
-    if (pageSlug) validatePageSlug(pageSlug);
+    if (requestedPageSlug) validatePageSlug(requestedPageSlug);
     // NFC (page slug above too) so the NFD (macOS) and NFC (Windows) spellings
     // of one visible name share one storage_path and the content_hash +
     // storage_path dedupe holds.
@@ -133,7 +134,7 @@ const file_upload: Operation = {
     const sourceId = ctx.sourceId ?? 'default';
     if (!(await ctx.engine.executeRaw('SELECT 1 FROM sources WHERE id = $1', [sourceId])).length) throw opError('unknown_source',
       `No source "${sourceId}", so nothing was uploaded.`, 'Upload under a registered source (gbrain sources list).');
-    const [page] = pageSlug ? await ctx.engine.executeRaw<{ id: number }>('SELECT id FROM pages WHERE slug = $1 AND source_id = $2', [pageSlug, sourceId]) : [];
+    const [page] = requestedPageSlug ? await ctx.engine.executeRaw<{ id: number }>('SELECT id FROM pages WHERE slug = $1 AND source_id = $2', [requestedPageSlug, sourceId]) : [];
 
     const { executeRawJsonb, FILES_METADATA_MERGE_SQL } = await import('../sql-query.ts');
     const [owner] = await ctx.engine.executeRaw<{ source_id: string; page_id: number | null; content_hash: string }>(
