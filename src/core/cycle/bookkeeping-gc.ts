@@ -5,12 +5,16 @@ import type { PhaseResult } from '../cycle.ts';
  * GBRA-438 — bookkeeping GC, split out of purge with the same functions and
  * retentions: op_checkpoints and brainstorm checkpoints (7 days), batch-retry
  * audit files (30 days), volunteer events (90 days), decision receipts,
- * applied captures and retrieval feedback (their own retention settings). It
- * never deletes a page, so unattended upkeep may run it (decision C1).
+ * applied captures and retrieval feedback (their own retention settings), and
+ * GST-2988's publish-redaction upkeep (git/redact-finish.ts: spooled secret
+ * originals into the store, pending redactions, backup refs past 7 days, Git
+ * pushes parked on publish_secret_found retried). It never deletes a page, so unattended upkeep may run it (decision C1).
  */
 export async function runPhaseBookkeepingGc(engine: BrainEngine, dryRun: boolean): Promise<PhaseResult> {
   if (dryRun) {
-    return { phase: 'bookkeeping_gc', status: 'ok', duration_ms: 0, summary: 'dry-run: skipped bookkeeping GC', details: { dry_run: true } };
+    const rechecks = await heldWriteRechecks(engine, true);
+    return { phase: 'bookkeeping_gc', status: 'ok', duration_ms: 0, summary: 'dry-run: skipped bookkeeping GC',
+      details: { dry_run: true, ...(rechecks ? { held_write_rechecks: rechecks } : {}) } };
   }
   // v0.36+ folded scope item +C: GC stale op_checkpoints rows.
   // 7-day TTL is deliberately generous; any reasonable long-running op
@@ -60,13 +64,19 @@ export async function runPhaseBookkeepingGc(engine: BrainEngine, dryRun: boolean
   const purgedAppliedCaptures = await (await import('../ingestion/applied-captures.ts')).purgeStaleAppliedCaptures(engine);
   let purgedFeedback = { events: 0, weights: 0 };
   try { purgedFeedback = await (await import('../feedback/store.ts')).pruneRetrievalFeedback(engine, (await (await import('../feedback/settings.ts')).loadFeedbackSettings(engine)).eventRetentionDays); } catch { /* pre-v207 brain */ }
+  let secretPublish: Record<string, number> = {};
+  try { secretPublish = await (await import('../git/redact-finish.ts')).secretPublishMaintenance(engine); } catch { /* never fatal */ }
+  const rechecks = await heldWriteRechecks(engine, false);
+  // A sweep that failed or could not see its evidence leaves held text it owes; the phase says so instead of ok.
+  const sweepOwed = rechecks?.status === 'fail' || rechecks?.status === 'unknown';
   return {
     phase: 'bookkeeping_gc',
-    status: 'ok',
+    status: sweepOwed ? 'warn' : 'ok',
     duration_ms: 0,
     summary:
       `${purgedCheckpoints} stale op_checkpoint(s), ${purgedBrainstormCheckpoints} stale brainstorm checkpoint(s), ` +
-      `${purgedBatchRetryAuditFiles} stale batch-retry audit file(s) and ${purgedVolunteerEvents} stale volunteer event(s)`,
+      `${purgedBatchRetryAuditFiles} stale batch-retry audit file(s) and ${purgedVolunteerEvents} stale volunteer event(s)` +
+      (sweepOwed ? `; the held-write recheck did not run to the end (${rechecks!.status}${rechecks!.reason ? `: ${String(rechecks!.reason)}` : ''})` : ''),
     details: {
       purged_checkpoints_count: purgedCheckpoints,
       purged_brainstorm_checkpoints_count: purgedBrainstormCheckpoints,
@@ -75,6 +85,25 @@ export async function runPhaseBookkeepingGc(engine: BrainEngine, dryRun: boolean
       ...(purgedDecisionReceipts > 0 ? { purged_decision_receipts_count: purgedDecisionReceipts } : {}),
       ...(purgedAppliedCaptures > 0 ? { purged_applied_captures_count: purgedAppliedCaptures } : {}),
       ...(purgedFeedback.events + purgedFeedback.weights > 0 ? { purged_retrieval_feedback_events_count: purgedFeedback.events, purged_retrieval_weights_count: purgedFeedback.weights } : {}),
+      ...secretPublish,
+      ...(rechecks ? { held_write_rechecks: rechecks } : {}),
     },
   };
+}
+
+/**
+ * Held writes a purge kept for another page, checked again (write-gate-recheck.ts): the ones no page row is left for are
+ * deleted with their receipts. Reported only when it found notes, was switched off, or could not run; a failure is reported,
+ * never thrown, so the rest of the phase's upkeep stands.
+ */
+async function heldWriteRechecks(engine: BrainEngine, dryRun: boolean): Promise<Record<string, unknown> | null> {
+  try {
+    const { orphanSweepEnabled, sweepHoldRechecks } = await import('../write-gate-recheck.ts');
+    if (!await orphanSweepEnabled(engine)) return { status: 'skipped', reason: 'disabled' };
+    const result = await sweepHoldRechecks(engine, { dryRun });
+    if (result.status === 'skipped' && result.reason === 'pre_schema') return null;
+    return result.status === 'ok' && result.checked === 0 && !result.would_check ? null : { ...result };
+  } catch (e) {
+    return { status: 'fail', error: e instanceof Error ? e.message : String(e) };
+  }
 }

@@ -32,10 +32,14 @@ one `surface_env_invalid` info notice naming the surface actually served.
 `serve --http` ignores `GBRAIN_SURFACE` (its ceiling widens only through an
 explicit `--surface` restart; `GBRAIN_MCP_FORCE_SURFACE` narrows it).
 
-**Registrations.** Every stdio registration gbrain writes pins `starter`
-(`REGISTRATION_SURFACE` in `src/core/mcp-registration.ts`): readiness's
-`harness_wiring` fix, `gbrain init`'s quickstart line, `gbrain bootstrap
-hooks` for Claude Code, Codex and opencode, and the plugins.
+**Registrations.** Every stdio registration gbrain writes takes its surface
+from `registrationProfile(harness)` in `src/core/mcp-registration.ts`: Codex
+pins `full`; Claude Code, opencode and other hosts pin `starter` listing the
+memory verbs (`--advertise verbs`). That covers readiness's `harness_wiring`
+fix, `gbrain init`'s quickstart line and `gbrain bootstrap hooks` for Claude
+Code, Codex and opencode; the Claude Code and Codex plugins pin `full`.
+`gbrain config set mcp.default_surface_<claude_code|codex|hermes> full|starter`
+turns one harness's default (`config unset` restores the shipped one).
 `gbrain init --surface` and `gbrain bootstrap hooks --surface` pick another.
 `bootstrap hooks` never narrows an existing install: a matching registration
 is kept untouched, and a replaced one keeps its form (a pinned `--surface x`
@@ -52,10 +56,31 @@ that `starter` lacks, with their CLI equivalents:
 
 A call to either on a starter session gets the hidden-tool hint below.
 
+**Parameters follow the surface.** A narrower surface hides some parameters of the
+tools it lists (to keep the starter list small), and dispatch refuses them too: a
+starter caller that passes one, such as `include_deleted` on `get_page` or
+`list_pages`, gets `param_not_on_surface` and nothing runs. Its fix is the same
+widen as for a hidden tool (`request_tools {"surface":"full"}`) where the
+connection may widen, and otherwise asks the user, because only the operator widens
+a pinned client. `STARTER_CALLABLE_PARAMS` in `src/mcp/surface.ts` lists the few
+hidden parameters a starter caller may still pass, each with its reason (page
+windows, the shared-skill follower, the thin client's source binding, the
+connection check, `remember` `valid_from` (already accepted inside `items`), a delegating client's `submit_agent` `queue`, `model` and
+`allowed_slug_prefixes`, `list_pages` paging with `offset`). An agent job (`submit_agent`)
+records the surface of the connection that submitted it, and its tool calls are refused
+the same way; a job queued before the surface was recorded keeps the full surface until
+it finishes. A queued or running job keeps the surface it was submitted under even if the
+operator later narrows the client; cancelling the job or withdrawing the grant stops it. `request_tools {tools}` describes only the parameters the caller's surface
+may pass. Structured fixes never name a parameter the caller's
+surface refuses (`page_not_found` offers a search instead of `include_deleted`);
+plain-text suggestions may still name one.
+
 **Session widening.** On the owner's stdio pipe, `request_tools {surface}`
 widens this session's tool set (never past `--access read-only` or
 `GBRAIN_MCP_FORCE_SURFACE`), sends `tools/list_changed`, and returns the new
-tools' schemas so a client that ignores `list_changed` can call them by name.
+tools' schemas. Codex and OpenClaw never take a new tool in the turn that asked
+for it ([client behaviour](../protocol/AGENT_OPERATOR_v1.md#tool-catalog-changes-toolslist_changed)),
+so for those clients the note says so and names the lasting route instead.
 Nothing is written; a new session starts at the registered surface. Each widen
 writes a `surface_widened from=<x> to=<y> op=request_tools` line on stderr.
 `gbrain config set mcp.allow_session_widen false` turns widening off; the
@@ -227,6 +252,11 @@ the database before limits and aggregate calculations. A gated page reads exactl
 like a missing one (no existence oracle), and link/graph output never
 enumerates private slugs.
 
+Facts are separate: a fact stamped `private` (as every fact was before
+`facts.default_visibility` became `world`) stays hidden from remote callers
+that are not the owner until the operator opens it with
+`gbrain repair open-facts` (docs/guides/repair.md); no remote path opens it.
+
 Single-user brains where every connected agent is equally trusted can opt
 out:
 
@@ -242,7 +272,39 @@ restores enforcement on the same schedule. Resolver:
 "not opted out" (enforce).
 
 Page-visibility opt-outs do not change protected-body filtering: remote page
-and history bodies retain only world Facts and omit every Takes fence. History
+and history bodies retain only world Facts and omit every Takes fence. The
+exception is a direct remote call from a credential bound to the brain owner,
+speaking for itself, with no room declared (dispatch switches it on there and
+nowhere else): `get_page` and `fetch_page` give it the Facts fence as stored,
+and the Takes fence as stored when the credential has no holders list
+(GST-3058). A credential with a holders list gets no Takes fence in `get_page`
+and reads its takes through `takes_list`; its graph hops skip evidence pages
+that hold takes. The `get_page` read view (windows, lines, bytes, section,
+grep) is the same text for every caller, the local CLI included; the owner reads
+the private rows of a large or segmented page through `view: 'markdown'` (a
+segmented page only when the credential has no holders list). With no holders
+list it also reads every holder wherever a read filters takes by holder, among
+them `takes_list`, `takes_search`, `takes_scorecard`, `takes_calibration`,
+`search`, `query`, `recall`, `delta`, `think` and `synthesize`;
+`synthesize` reads world takes only for a non-owner with no list. Known
+limits: agent jobs and group chats (a declared room) read as before this PR
+until GST-3066, as do stdio, on-behalf-of audiences and attested actors; an
+agent job reads its client's stored takes holders list, else world takes. A
+remote `put_page`, the owner's included, restores the stored private rows its
+content leaves out and keeps a reworded one beside the new text (a cleanly
+parsed fence only); the owner withdraws or replaces a claim with
+`forget_fact` and a new row with a different statement (GST-3064;
+[remote writes and private fact rows](../guides/memory-boundaries.md#remote-writes-private-facts)). With a room declared, a
+`get_page` whole-body read or `view: 'markdown'` whose returned body carries
+rows a world-only read strips (private rows, held rows, takes) is marked
+`room_access: {readable: false, reason: 'private_label'}`; the mark is per
+page, so a page with one such row is marked whole. Held rows inside read-view
+windows and in a segmented page's markdown view are not marked, as before this
+PR. The local CLI's `--room` marks
+pages the same way. The mark is judged with the caller's own fact grant, so a
+caller with a private-facts grant gets the same mark as before this PR for held
+rows it can read (GST-3066). Owner tokens minted with `gbrain auth create` store
+`['world']`, so they read world takes unless the list is changed. History
 also checks snapshot visibility while page privacy is enforced. Malformed
 protected sections are omitted; unterminated or interleaved sections discard
 the remaining tail. Restricted salience counts only permitted active takes and
@@ -331,7 +393,9 @@ Post-deploy checks, in order:
    `SELECT token_name, params->>'tool_count' FROM mcp_request_log WHERE operation='tools/list' ORDER BY created_at DESC LIMIT 10;`
 2. **Empty-query probe shows the degraded block** — call `search` with a
    nonsense query; the empty result must carry a second content block
-   ("0 results. … retrieval healthy …" or degraded stages) + `_meta.retrieval`.
+   ("0 results. … retrieval healthy …", on a brain keyless on purpose
+   "… keyword-only because embeddings are off on this brain on purpose …",
+   or degraded stages) + `_meta.retrieval`.
 3. **Workerless submit warns** — `submit_agent` while no worker runs must
    still succeed and carry `queue_state.warning` (worker_alive false).
 4. **put_page lint fields present** — put an uncited page; the response

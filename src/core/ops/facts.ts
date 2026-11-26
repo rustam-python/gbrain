@@ -1,6 +1,7 @@
 import { searchAnswerFeedback } from '../feedback/record.ts';
 import { recordFunnelEvent, recordRecallOutcome } from '../funnel.ts';
 import { parseRelationalPlan } from '../search/relational-plan.ts';
+import { RECALL_TELEMETRY_MODE, recordLookupTelemetry } from '../search/telemetry.ts';
 import { loadSearchModeConfig, resolveSearchMode } from '../search/mode.ts';
 import { WRITE_REQUEST_PARAM } from '../persistence/params.ts';
 import { parseWriteRequestId } from '../persistence/preconditions.ts';
@@ -57,7 +58,8 @@ import type { TrustTier } from '../trust/tier.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
 import { parseSinceParam } from '../facts/since-parse.ts';
 import { callerSessionKey } from '../access/member-facts.ts';
-import { groupFactsByEntity, parseQuestionParam, questionRecallNotices, rankFactsByQuestion, recallHintNotice, unlinkedNamesakes, type EntityCandidate, type QuestionRecall } from '../facts/question-recall.ts';
+import { applySlotEnds } from '../search/slot-ends.ts';
+import { groupFactsByEntity, parseQuestionParam, questionRecallNotices, rankFactsByQuestion, recallHintNotice, namesakesOrMerge, unlinkedNamesakes, type EntityCandidate, type QuestionRecall } from '../facts/question-recall.ts';
 
 // ============================================================
 // v0.31 — Hot memory ops: extract_facts / recall / forget_fact
@@ -370,6 +372,7 @@ const recall: Operation = {
     const visibility = worldOnly ? ['world'] as ('private' | 'world')[] : undefined;
     const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote); // #4352: fact and page arms alike
     const eligibility = await resolveReadEligibility(ctx, { minTrust: p.min_trust }); // #5575 floor + quarantine/rederive hiding
+    const factScope = { sourceIds: factSources, worldOnly, excludePrivate, minTrust: eligibility.floor, suppressFlagged: eligibility.suppressFlagged };
 
     type FactRows = Array<Awaited<ReturnType<typeof ctx.engine.listFactsByEntity>>[number] & { entity_slugs?: string[]; collapsed_count?: number; quoted?: 'transcript' }>;
     type FactRowItem = FactRows[number];
@@ -400,7 +403,7 @@ const recall: Operation = {
     const byEventTime = (rec: Record<string, unknown>) => rec.valid_from ?? rec.created_at;
 
     let rows: FactRows = [];
-    let ambiguousEntity: EntityCandidate[] | null = null;
+    let ambiguousEntity: EntityCandidate[] | null = null, mergedSources: [string, string] | null = null;
 
     // `since` is parsed once, up front, and a value that does not parse is
     // rejected instead of silently widening the window: a caller that asked
@@ -422,17 +425,15 @@ const recall: Operation = {
     // audit exclusion all filter at the ENGINE level, before each source's
     // LIMIT, so a hidden newest row never consumes a slot).
     const listOpts = {
-      activeOnly: !includeExpired,
-      limit: MAX_SEARCH_LIMIT,
+      activeOnly: !includeExpired, limit: MAX_SEARCH_LIMIT,
       visibility, excludePrivate,
       grep: grep ?? undefined,
       excludeAuditRows: true, eligibility,
     };
 
     if (question !== null && !readsNoSource) {
-      ranking = await rankFactsByQuestion(ctx, { question, params: p, factSources, limit, entity: entityParam, sessionId: sessionParam, since, grep, includeExpired,
-        scope: { sourceIds: factSources, worldOnly, excludePrivate, minTrust: eligibility.floor, suppressFlagged: eligibility.suppressFlagged } });
-      ({ rows, ambiguousEntity } = ranking);
+      ranking = await rankFactsByQuestion(ctx, { question, params: p, factSources, limit, entity: entityParam, sessionId: sessionParam, since, grep, includeExpired, scope: factScope });
+      ({ rows, ambiguousEntity } = ranking); mergedSources = ranking.mergedSources ?? null;
       for (const notice of questionRecallNotices(ranking, ctx.brainId)) ctx.emitNotice?.(notice);
     } else if (p.supersessions === true) {
       // Visibility filters at the ENGINE level (before each source's LIMIT),
@@ -460,7 +461,7 @@ const recall: Operation = {
           s => ctx.engine.listFactsSince(src, since, { ...listOpts, eventTime: true, entitySlug: s, sessionId: sessionParam ?? undefined }));
         return { slug: entitySlug, rows };
       }));
-      ambiguousEntity = entityParam ? await unlinkedNamesakes(ctx.engine, resolvedLists.map(l => l.rows.map(r => ({ ...r, entity_slug: l.slug ?? r.entity_slug })))) : null;
+      ({ ambiguousEntity, mergedSources } = await namesakesOrMerge(ctx, entityParam ? await unlinkedNamesakes(ctx.engine, resolvedLists.map(l => l.rows.map(r => ({ ...r, entity_slug: l.slug ?? r.entity_slug })))) : null));
       rows = ambiguousEntity ? [] : mergeNewest(resolvedLists.map(l => l.rows), byEventTime);
     } else if (entityParam) {
       const { resolveEntitySlug } = await import('../entities/resolve.ts');
@@ -468,7 +469,7 @@ const recall: Operation = {
         const slug = (await resolveEntitySlug(ctx.engine, src, entityParam)) ?? entityParam;
         return { slug, rows: await readEntityFacts(ctx, src, slug, MAX_SEARCH_LIMIT, s => ctx.engine.listFactsByEntity(src, s!, { ...listOpts, sessionId: sessionParam ?? undefined })) };
       }));
-      ambiguousEntity = await unlinkedNamesakes(ctx.engine, resolvedLists.map(l => l.rows.map(r => ({ ...r, entity_slug: l.slug }))));
+      ({ ambiguousEntity, mergedSources } = await namesakesOrMerge(ctx, await unlinkedNamesakes(ctx.engine, resolvedLists.map(l => l.rows.map(r => ({ ...r, entity_slug: l.slug }))))));
       rows = ambiguousEntity ? [] : mergeNewest(resolvedLists.map(l => l.rows), (rec) => rec.valid_from ?? rec.created_at);
     } else if (sessionParam) {
       rows = mergeNewest(
@@ -494,6 +495,7 @@ const recall: Operation = {
     // engines, keyed on `source` not `fact` text) — this client-side
     // filter is belt-and-braces defense in depth, not the primary guard.
     rows = rows.filter((r) => !(AUDIT_ROW_SOURCES as readonly string[]).includes(r.source));
+    if (p.supersessions !== true && !ranking) rows = await applySlotEnds(ctx.engine, factScope, rows, { activeOnly: !includeExpired, entities: entityParam ? factSources.map(src => ({ source_id: src, slugs: [...new Set(rows.flatMap(r => (r.source_id === src && r.entity_slug ? [r.entity_slug] : [])))] })) : undefined }); // GST-3170: read-time slot ends
 
     // Engines apply grep in SQL (pre-limit). This client-side pass stays only
     // as the filter for the supersessions branch, which bypasses FactListOpts.
@@ -535,6 +537,7 @@ const recall: Operation = {
     if (queryText && question === null && !entityParam && !sessionParam && !since && p.supersessions !== true) ctx.emitNotice?.(recallHintNotice(p, queryText));
     let searchResults: SearchResult[] = [];
     let searchDegraded: string | undefined;
+    let pageSearchCounted = false;
     let delivery: DeliveryMeta | undefined;
     const evidencePlan = queryText ? await recallEvidencePlan(ctx, p) : null;
     const rankCutOpts: Pick<HybridSearchOpts, 'pageRankCut'> = evidencePlan?.rankCut ? { pageRankCut: evidencePlan.rankCut } : {};
@@ -547,11 +550,11 @@ const recall: Operation = {
       const searchScope = { ...scope, ...(eligibility.floor ? { minTrust: eligibility.floor } : {}) };
       // #4352 — recall's page-search arm enforces `visibility: private` for
       // untrusted callers with the excludePrivate resolved above.
-      ({ rows: searchResults, keywordOnly: searchDegraded } = await recallPageRows(ctx, queryText, limit, excludePrivate, searchScope, rankCutOpts));
+      ({ rows: searchResults, keywordOnly: searchDegraded, searched: pageSearchCounted } = await recallPageRows(ctx, queryText, limit, excludePrivate, searchScope, rankCutOpts));
       bumpLastRetrievedAt(ctx.engine, searchResults.map(r => r.page_id));
       const applied = recallDeliveryPlan(effectivePlan(evidencePlan, searchResults), p.budget_policy, queryText, budgetTokens, rows);
       if (applied) ({ results: searchResults, delivery } = await deliverEvidence(ctx.engine, searchResults, applied, { ...searchScope, excludePrivate, requireSafeChunks: ctx.remote !== false }));
-      searchResults = await stampPageTrust(ctx.engine, searchResults, eligibility.floor);
+      searchResults = await stampPageTrust(ctx.engine, searchResults, eligibility.floor, undefined, worldOnlyFacts(ctx.remote));
     }
 
     // Pack what is delivered: results redacted for all; facts for remote only (localVerbatim).
@@ -592,6 +595,7 @@ const recall: Operation = {
     const grouped = ranking?.groupByEntity ? groupFactsByEntity(packedFacts, ranking, p, ctx.emitNotice) : null; if (grouped) packedFacts = grouped.rows; // #2953: reorders delivered facts only
     const budgetPacking = recallBudgetPacking(p.budget_policy, queryText, budgetTokens, { rows, packedFacts, searchResults, packedResults }, recallResultCost(delivery)), contested: ContestedLookup = {};
 
+    let observedUnavailable = false;
     const out = {
       facts: await withDecideContested(ctx.engine, await withFactDateHeaders(ctx.engine, await stampRowTrust(ctx.engine, 'facts', packedFacts.map(r => ({ // #5575 A6 trust labels; GBRA-216 dp contested
         id: r.id,
@@ -625,12 +629,14 @@ const recall: Operation = {
         provenance: r.source, ...(r.attributed_to ? { attributed_to: r.attributed_to } : {}), ...(r.quoted ? { quoted: r.quoted } : {}), ...recallClaimColumns(r),
         ...(r.entity_slugs ? { entity_slugs: r.entity_slugs } : {}), ...(r.collapsed_count ? { collapsed_count: r.collapsed_count } : {}),
         ...(ranking ? { relevance: ranking.relevance.get(r.id), ...(ranking.weighting ? { rank_score: ranking.weighting.rank.get(r.id), confidence_factor: ranking.weighting.factor.get(r.id) } : {}) } : {}),
-      })), f => f.id)), { remote: ctx.remote !== false, excludePrivate, eligibility }, contested),
+      })), f => f.id), { excludePrivate, minTrust: eligibility.floor, suppressFlagged: eligibility.suppressFlagged }, () => { observedUnavailable = true; }), { remote: ctx.remote !== false, excludePrivate, eligibility }, contested),
       total: packedFacts.length,
       facts_order: ranking ? 'relevance' : 'newest',
-      ...(quoted.withheld ? { facts_degraded: { reason: 'saved_facts_withheld' } } : ranking?.degraded || contested.degraded ? { facts_degraded: { ...contested.degraded, ...ranking?.degraded } } : {}),
+      ...(quoted.withheld ? { facts_degraded: { reason: 'saved_facts_withheld' } } : ranking?.degraded || contested.degraded || observedUnavailable
+        ? { facts_degraded: { ...(observedUnavailable ? { reason: 'fact_observed_date_unavailable' } : {}), ...contested.degraded, ...ranking?.degraded } } : {}),
       ...(ranking?.calibration ? { facts_calibration: ranking.calibration } : {}), ...(ranking?.belowFloor ? { facts_below_floor: ranking.belowFloor } : {}),
       ...grouped?.fields, ...(ambiguousEntity ? { ambiguous_entity: { candidates: ambiguousEntity, suggestion: AMBIGUOUS_ENTITY_SUGGESTION } } : {}),
+      ...(mergedSources ? { merged_sources: mergedSources } : {}), // GST-2898 D3-B: the facts carry each source_id
       ...(pending_consolidation_count !== undefined ? { pending_consolidation_count } : {}),
       // MEMORY_VERBS v1 envelope (G1B superset — additive on every response).
       protocol_version: MEMORY_VERBS_VERSION,
@@ -660,6 +666,7 @@ const recall: Operation = {
       ...(delivery ? { delivery } : {}),
     };
     recordRecallOutcome(out);
+    if (!pageSearchCounted) recordLookupTelemetry(ctx.engine, RECALL_TELEMETRY_MODE);
     return maxChars === null ? out : boundRecallChars(out, maxChars);
   },
 };
@@ -730,6 +737,8 @@ const context_pack: Operation = {
     entity_refs: { type: 'array', items: { type: 'object', properties: { source_id: { type: 'string' }, slug: { type: 'string' } } },
       description: 'Source-qualified entities: [{"source_id":"wiki","slug":"people/alice-example"}].', fullSurfaceOnly: true },
     prefer_source_id: { type: 'string', description: 'Source to try first (thin clients send .gbrain-source here); never narrows.', fullSurfaceOnly: true },
+    profile: { type: 'boolean', description: 'true: add your own profile (facets, constraints, relationships, preferences).', fullSurfaceOnly: true },
+    include_rules: { type: 'boolean', description: 'true: add your confirmed standing rules (rules field).', fullSurfaceOnly: true, actsWhenTrue: true },
   },
   scope: 'read',
   verb: true,
@@ -795,7 +804,7 @@ const context_pack: Operation = {
     // `default` plus this source, inside the caller's grant; it packs first.
     const { loadCoreBlock } = await import('../core-memory.ts');
     const allowed = named ? [sourceId] : ctx.auth?.allowedSources?.length ? ctx.auth.allowedSources : null;
-    const core = await loadCoreBlock(ctx.engine, { sessionSourceId: sourceId, allowedSources: allowed, excludePrivate: !includePrivate, forCaller: true, eligibility })
+    const core = await loadCoreBlock(ctx.engine, { sessionSourceId: sourceId, allowedSources: allowed, excludePrivate: !includePrivate, forCaller: true, eligibility, remote: ctx.remote })
       .catch(() => null);
     const coreText = core?.text ?? '';
     const coreTokens = estimateTokens(coreText);
@@ -844,10 +853,11 @@ const context_pack: Operation = {
     const threadsOf = (c: (typeof cards)[number]) =>
       (c.open_threads ?? []).filter((t) => !since || (t.date !== null && isAfter(t.date, since)));
     let droppedCount: number | undefined;
+    const profilePack = p.profile === true ? await (await import('../profile/read.ts')).contextPackProfile(ctx, walk.sources, budgetTokens === null ? null : budgetTokens - packHeaderCost() - coreTokens - (pullBrief?.text ? estimateTokens(pullBrief.text) : 0), eligibility) : null;
     if (budgetTokens !== null) {
       // #4761: reserve the envelope + headers, then price each card as its
       // rendered line plus its rendered (since-filtered) thread lines.
-      const itemBudget = budgetTokens - packHeaderCost() - coreTokens - (pullBrief?.text ? estimateTokens(pullBrief.text) : 0);
+      const itemBudget = budgetTokens - packHeaderCost() - coreTokens - (pullBrief?.text ? estimateTokens(pullBrief.text) : 0) - (profilePack?.used ?? 0);
       const cardCost = (c: (typeof cards)[number]) =>
         lineCost(renderCardLine(c, walk.home, ctx.remote !== false)) + threadsOf(c).reduce((n, t) => n + lineCost(renderThreadLine(t)), 0);
       const cardPack = itemBudget > 0 ? packToBudget(cards, cardCost, itemBudget) : dropAll(cards);
@@ -888,7 +898,7 @@ const context_pack: Operation = {
     const recordLines = cards.flatMap(renderRecordLines);
     const basePack = entities.length === 0 ? '' : budgetTokens !== null ? renderPack(cards, open_threads, facts, undefined, walk.home, entityFacts, ctx.remote !== false) : res.text;
     const packText = recordLines.length ? [basePack, ['', RECORDS_HEADER, ...recordLines].join('\n')].filter(Boolean).join('\n') : basePack;
-    const text = [coreText, pullBrief?.text ?? '', packText].filter(Boolean).join('\n\n');
+    const text = [coreText, pullBrief?.text ?? '', profilePack?.text ?? '', packText].filter(Boolean).join('\n\n');
     const budgetUsed = budgetTokens !== null ? estimateTokens(text) : undefined;
 
     return {
@@ -935,7 +945,7 @@ const context_pack: Operation = {
         ...(f.trust_tier ? { trust_tier: f.trust_tier, origin: f.origin } : {}),
         ...(f.quoted ? { quoted: f.quoted } : {}),
       })),
-      text,
+      text, ...(profilePack ? { profile: profilePack.block } : {}),
       ...(pullBrief ? { brief: pullBrief.view } : {}),
       ...(withheld ? { suppressed: suppressionSummary(withheld) } : {}),
       ...(core && core.enabled ? { core: { text: core.text, chars_used: core.chars_used, chars_limit: core.chars_limit, pages: core.pages,
@@ -947,6 +957,8 @@ const context_pack: Operation = {
       // C4: optional pinned answers (fresh sentences) and the withheld count (src/core/questions/service.ts).
       ...(await (await import('../questions/service.ts')).pinnedAnswersForPack(ctx, (res.cards ?? []).map((c) => ({ source_id: c.entity.source_id, slug: c.entity.slug })))
         .catch(() => null)),
+      ...(await (await import('../policy/check.ts')).policyStateForPack(ctx.engine, ctx.remote !== false).catch(() => null)),
+      ...(p.include_rules === true ? await (await import('../rules/section.ts')).rulesForPack(ctx, p.source_id).catch(() => ({ rules_error: 'rules_unavailable' })) : {}),
     };
   },
 };
@@ -1231,7 +1243,7 @@ const delta: Operation = {
     // structured arrays reflect — the assembler's render predates both.
     let text = renderDelta(pages, facts, threads, effectiveSince);
     const diff = p.beliefs === true ? await (await import('../belief/changes.ts')).deltaBeliefs(ctx.engine, { sourceId, since: effectiveSince, until: horizon,
-      remote: !includePrivate, takesHolders: readHolders(ctx), entities: parseEntityList(p.entities) }, budgetTokens !== null ? beliefBudget : null, text, TURN_CONTEXT_ENVELOPE) : null;
+      remote: !includePrivate, worldOnly: (await import('../search/private-visibility.ts')).worldOnlyFacts(ctx.remote), takesHolders: readHolders(ctx), entities: parseEntityList(p.entities) }, budgetTokens !== null ? beliefBudget : null, text, TURN_CONTEXT_ENVELOPE) : null;
     if (diff) text = diff.text;
     const budgetUsed = budgetTokens !== null ? estimateTokens(text) : undefined;
 
@@ -1447,38 +1459,29 @@ async function recallKeywordOnlyReason(ctx: OperationContext): Promise<string | 
 async function recallPageRows(
   ctx: OperationContext, queryText: string, limit: number, excludePrivate: boolean,
   searchScope: { sourceId?: string; sourceIds?: string[]; minTrust?: TrustTier }, rankCutOpts: Pick<HybridSearchOpts, 'pageRankCut'>,
-): Promise<{ rows: SearchResult[]; keywordOnly?: string }> {
+): Promise<{ rows: SearchResult[]; keywordOnly?: string; searched: boolean }> {
   const keywordOnly = await recallKeywordOnlyReason(ctx);
   const stages: DegradedStageEntry[] = [];
-  const rows = keywordOnly
-    ? await keylessRecallRows(ctx, queryText, limit, excludePrivate, searchScope, rankCutOpts, stages)
-    : await hybridSearchCached(ctx.engine, queryText, {
+  const searched = !keywordOnly || await keylessChainQuestion(ctx, queryText);
+  const rows = searched
+    ? await hybridSearchCached(ctx.engine, queryText, {
       limit, expansion: false, excludePrivate, requireSafeChunks: ctx.remote !== false,
       takesHoldersAllowList: readHolders(ctx), ...searchScope, ...rankCutOpts,
       onMeta: m => { stages.push(...(m.degraded ?? [])); },
-    });
+    })
+    : await keylessKeywordRows(ctx, queryText, limit, excludePrivate, searchScope, stages);
   if (stages.length) ctx.emitResponseMeta?.('retrieval', { degraded: stages });
-  return { rows, ...(keywordOnly ? { keywordOnly } : {}) };
+  return { rows, searched, ...(keywordOnly ? { keywordOnly } : {}) };
 }
 
 /**
- * Keyless recall's page arm: direct keyword FTS, except that a planned
- * multi-relation question (planner on) goes through hybridSearch's keyless
- * path, which runs keyword + title + the relational chain (zero LLM).
+ * Keyless recall's page arm for a question that is not a planned multi-relation chain (a chain, planner on, goes
+ * through hybridSearch's keyless path above, which records its own search telemetry): direct keyword FTS.
  */
-async function keylessRecallRows(
+async function keylessKeywordRows(
   ctx: OperationContext, queryText: string, limit: number, excludePrivate: boolean,
-  searchScope: { sourceId?: string; sourceIds?: string[]; minTrust?: TrustTier },
-  rankCutOpts: Pick<HybridSearchOpts, 'pageRankCut'> = {},
-  stages: DegradedStageEntry[] = [],
+  searchScope: { sourceId?: string; sourceIds?: string[]; minTrust?: TrustTier }, stages: DegradedStageEntry[],
 ): Promise<SearchResult[]> {
-  if (await keylessChainQuestion(ctx, queryText)) {
-    return hybridSearchCached(ctx.engine, queryText, {
-      limit, expansion: false, excludePrivate, requireSafeChunks: ctx.remote !== false,
-      takesHoldersAllowList: readHolders(ctx), ...searchScope, ...rankCutOpts,
-      onMeta: m => { stages.push(...(m.degraded ?? [])); },
-    });
-  }
   const rows = dedupResults(await ctx.engine.searchKeyword(queryText, { limit, excludePrivate, requireSafeChunks: ctx.remote !== false, ...searchScope,
     onKeywordIncomplete: reason => { stages.push({ stage: 'keyword_candidates_incomplete', reason }); } }));
   // #3783 — direct FTS path: every row is a keyword hit by construction.

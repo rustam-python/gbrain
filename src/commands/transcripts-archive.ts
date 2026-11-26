@@ -3,9 +3,10 @@
  *
  *   run                          archive the last few local days from every readable harness
  *   backfill --from D [--to D]   archive a date range, newest first, capped per run; embedding held for approval
- *   status                       readers, pinned timezone, archived and held days
+ *   status                       readers as of the last run, pinned timezone, archived and held days (reads no session)
  *   adopt-legacy --dir <folder>  list the days an old archive folder covers (--apply records them so backfill skips them)
  *   on | off                     turn the archive on or off for this brain
+ *   setup-import ...             the history import gbrain setup offers on a new personal install (transcripts-archive-setup-import.ts)
  *
  * Core: src/core/transcripts/archive.ts. Trusted local CLI only; no MCP operation.
  */
@@ -20,6 +21,7 @@ const HELP = `Usage:
   gbrain transcripts archive status [--source S] [--json]
   gbrain transcripts archive adopt-legacy --dir <folder> [--dry-run | --apply] [--source S] [--json]
   gbrain transcripts archive on | off [--json]
+  gbrain transcripts archive setup-import receipt|preview|run|decline|card ...   (the history import gbrain setup offers; --help)
 
 Writes one redacted page per conversation per local day (conversations/<harness>/<day>/...) plus a day index
 (conversations/days/<day>) into the archive source (default "conversations"). On by default on a personal brain,
@@ -40,6 +42,11 @@ export async function runTranscriptsArchive(engine: BrainEngine, args: string[],
   const out = (doc: unknown, human: () => void) => { if (json) console.log(JSON.stringify(doc, null, 2)); else human(); };
   const archive = await import('../core/transcripts/archive.ts');
 
+  if (sub === 'setup-import') {
+    const { runSetupImport } = await import('./transcripts-archive-setup-import.ts');
+    return runSetupImport(engine, rest, dispatch);
+  }
+
   if (!sub || sub === '--help' || sub === '-h' || rest.includes('--help') || rest.includes('-h')) {
     console.log(HELP);
     if (sub && sub !== '--help' && sub !== '-h' && !rest.includes('--help') && !rest.includes('-h')) setCliExitVerdict(2);
@@ -56,13 +63,22 @@ export async function runTranscriptsArchive(engine: BrainEngine, args: string[],
 
   if (sub === 'status') {
     const status = await archive.archiveStatus(engine, { sourceId });
+    const { resolveArchiveEnabled } = await import('../core/transcripts/archive-default.ts');
+    const { loadConfig } = await import('../core/config.ts');
+    const why = json ? null : await resolveArchiveEnabled(engine, { config: (() => { try { return loadConfig(); } catch { return null; } })() }).then(e => e.reason, () => null);
+    const upkeepOff = !json && status.enabled && !await (await import('../core/maintenance/run.ts')).upkeepEnabled(engine);
     out(status, () => {
       console.log('conversation archive: ' + (status.enabled ? 'on' : 'off') + ' (source: ' + status.source_id + ', timezone: ' + (status.timezone ?? status.configured_timezone + ', pinned at the first run') + ')');
-      for (const h of status.harnesses) console.log('  ' + h.reader.padEnd(18) + ' ' + (h.info ?? (h.conversations + ' conversation(s), newest session day ' + (h.newest_session_day ?? '-') + ', newest archived day ' + (h.newest_archived_day ?? '-'))));
+      if (why) console.log('  why: ' + why);
+      for (const h of status.harnesses) {
+        const read = h.read_at ? h.conversations + ' conversation(s) read by the last ' + (h.read_mode ?? 'run') + ' (' + h.read_at + '), newest session day ' + (h.newest_session_day ?? '-') : 'not read by an archive run yet';
+        console.log('  ' + h.reader.padEnd(18) + ' ' + (h.info ?? read + ', newest archived day ' + (h.newest_archived_day ?? '-')));
+      }
       console.log('  archived days: ' + status.archived_days + (status.legacy_days ? ', covered by a legacy archive: ' + status.legacy_days : ''));
       for (const h of status.held) console.log('  held: ' + h.harness + ' ' + h.day + ' (' + h.code + ')');
-      for (const e of status.errors) console.log('  error: ' + e.reader + ' ' + e.code + ': ' + e.message);
+      for (const e of status.errors) console.log('  error on the last run' + (e.at ? ' (' + e.at + ')' : '') + ': ' + e.reader + ' ' + e.code + ': ' + e.message);
       if (status.rescope) console.log('  not kept to the owner yet (' + status.rescope.code + '): ' + status.rescope.message);
+      if (upkeepOff) console.log('  maintenance.auto is false, so free upkeep does not archive by itself (an installed autopilot still does); archive now with "gbrain transcripts archive run"');
     });
     if (status.errors.length) setCliExitVerdict(1);
     return;
@@ -104,10 +120,10 @@ export async function runTranscriptsArchive(engine: BrainEngine, args: string[],
     console.log('  days written ' + result.written + ', unchanged ' + result.unchanged + ', held ' + result.held + ', planned ' + result.planned + ', covered by legacy ' + result.skipped_legacy);
     const redacted = result.days.filter(d => (d.redactions ?? 0) > 0);
     if (redacted.length) console.log('  redacted values on ' + redacted.length + ' page(s): ' + redacted.map(d => d.slug + ' (' + d.redactions + ')').join(', '));
-    for (const d of result.days.filter(d => d.status === 'held' || d.status === 'error')) console.log('  ' + d.status + ': ' + d.harness + ' ' + d.day + ' (' + d.code + ')');
+    for (const d of result.days.filter(d => d.status === 'held')) console.log('  held: ' + d.harness + ' ' + d.day + ' (' + d.code + ')');
     for (const line of result.info) console.log('  ' + line);
-    for (const e of result.errors) console.log('  error: ' + e.reader + ' ' + e.code + ': ' + e.message);
+    for (const e of result.errors) console.log('  error: ' + (e.reader ?? e.harness + (e.day ? ' ' + e.day : '')) + ' ' + e.code + ': ' + e.message);
     if (sub === 'backfill' && result.written) console.log('  backfilled pages are keyword-only; preview their embedding cost with: gbrain embed --held --dry-run');
   });
-  if (result.errors.length || result.days.some(d => d.status === 'error') || (result.held && result.fix)) setCliExitVerdict(1);
+  if (result.errors.length) setCliExitVerdict(1);
 }

@@ -12,7 +12,7 @@
  *   Hermes       hermes hooks doctor
  */
 import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import type { Action } from '../agent-output.ts';
 import { bunSpawnSync } from '../spawn.ts';
 import { codexHookCensus, codexHookGroupRuns, codexHookTrustHash } from '../bootstrap/codex-hooks.ts';
@@ -70,12 +70,15 @@ export function inspectTurnHook(harness: string, opts: { projectDir?: string; ma
   const native_inspect = TURN_HOOK_NATIVE_INSPECT[harness];
   const plugin = enabledPluginLanes('gbrain').find((l) => l.harness === harness);
   if (harness === 'claude-code') {
+    const owned = setupReceiptHashes('claude-code').owned;
     const files = [claudeUserSettingsPath(), ...(opts.projectDir ? [join(opts.projectDir, '.claude', 'settings.local.json'), join(opts.projectDir, '.claude', 'settings.json')] : []), ...claudeManagedSettingsPaths(opts.managedDir)];
     for (const path of files) {
       const committed = !!opts.projectDir && path === join(opts.projectDir, '.claude', 'settings.json');
-      const entries = claudeEntries(path).filter((e) => isTurnRuleEntry(e) || isOtherGbrainEntry(e, committed));
+      // #9505: Claude Code can rewrite the file without the _gbrain marker; setup still owns its entry by hash.
+      const setupOwned = (e: Record<string, unknown>) => !committed && owned.has(hookEntryHash(e) ?? '');
+      const entries = claudeEntries(path).filter((e) => isTurnRuleEntry(e) || isOtherGbrainEntry(e, committed) || setupOwned(e));
       const effective = entries.find((e) => !isTurnRuleEntry(e)) ?? entries[0];
-      if (effective) return { harness, state: 'wired', via: isTurnRuleEntry(effective) ? 'turn-rule' : effective[GBRAIN_HOOK_MARKER_KEY] === 'setup-v1' ? 'setup' : 'bootstrap', detail: `UserPromptSubmit hook in ${path}`, command: String(effective.command), source: path, native_inspect };
+      if (effective) return { harness, state: 'wired', via: isTurnRuleEntry(effective) ? 'turn-rule' : effective[GBRAIN_HOOK_MARKER_KEY] === GBRAIN_SETUP_MARKER_VALUE || setupOwned(effective) ? 'setup' : 'bootstrap', detail: `UserPromptSubmit hook in ${path}`, command: String(effective.command), source: path, native_inspect };
     }
     if (plugin) return { harness, state: 'wired', via: 'plugin', detail: `the '${plugin.plugin}' plugin declares the UserPromptSubmit hook`, native_inspect };
     return { harness, state: 'missing', detail: `no gbrain UserPromptSubmit hook in ${files.join(' or ')}`, native_inspect };
@@ -204,9 +207,16 @@ export function hookLauncherProblem(harness: 'claude-code' | 'codex', opts: { pr
 }
 
 type Run = (argv: string[], stdin?: string) => { ok: boolean; output: string };
-/** Only what a hook needs to find the brain and the rule; never provider keys. */
+/**
+ * Only what a hook, or a harness's own check, needs to find the brain, the rule
+ * and the harness's config (Hermes, OpenClaw); never provider keys. The check
+ * runs from the home directory, so a relative harness path is resolved here,
+ * against the directory setup read it from.
+ */
 function hookEnv(): Record<string, string> {
-  return Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined && /^(HOME|PATH|USER|LANG|TMPDIR|XDG_CONFIG_HOME|CLAUDE_CONFIG_DIR|CODEX_HOME|GBRAIN_HOME|GBRAIN_AGENT_INSTRUCTIONS|GBRAIN_HOOKS)$/.test(e[0])));
+  return Object.fromEntries(Object.entries(process.env)
+    .filter((e): e is [string, string] => e[1] !== undefined && /^(HOME|PATH|USER|LANG|TMPDIR|XDG_CONFIG_HOME|CLAUDE_CONFIG_DIR|CODEX_HOME|HERMES_HOME|OPENCLAW_HOME|OPENCLAW_STATE_DIR|OPENCLAW_CONFIG_PATH|OPENCLAW_PROFILE|GBRAIN_HOME|GBRAIN_AGENT_INSTRUCTIONS|GBRAIN_HOOKS)$/.test(e[0]))
+    .map(([k, v]) => [k, /^(HERMES_HOME|OPENCLAW_HOME|OPENCLAW_STATE_DIR|OPENCLAW_CONFIG_PATH)$/.test(k) && v.trim() && !v.trim().startsWith('~') ? resolve(v.trim()) : v]));
 }
 const defaultRun: Run = (argv, stdin) => {
   try {

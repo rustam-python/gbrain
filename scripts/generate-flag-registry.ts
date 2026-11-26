@@ -27,6 +27,8 @@
  * Output: src/core/cli-flag-registry.generated.ts (committed; freshness is
  * pinned by test/cli-flag-validation.test.ts the same way build:llms pins the
  * llms bundles). Regenerate: bun run build:flag-registry
+ * Check: bun scripts/generate-flag-registry.ts --check exits 1 when the
+ * committed file differs from a fresh render (what regen:all --check runs).
  *
  * Hand-tuning lane: EXTRA_FLAGS below, for flags that live deeper than the
  * one-level scan (add with a comment naming the deep module).
@@ -57,6 +59,8 @@ const EXTRA_FLAGS: Record<string, string[]> = {
   forget: ['--reason', '--request-id', '--purge', '--dry-run', '--yes', '--match', '--status', '--vacuum', '--all-subjects'],
   // sources add reads the meetings and slack options as bare names in src/commands/sources-lifecycle-args.ts (its valued set).
   sources: ['--provider', '--transcript', '--lookback-days', '--sync-interval-min', '--record', '--visibility', '--channels', '--timezone', '--max-requests', '--skip'],
+  // transcripts archive setup-import (setup's history import) parses its flags in src/commands/transcripts-archive-setup-import.ts (two levels deep).
+  transcripts: ['--harness', '--created-by-setup', '--blocker', '--stage', '--offer', '--decision', '--no-extract', '--deadline-ms'],
 };
 
 /**
@@ -98,9 +102,10 @@ const DELEGATED_MODULES: Record<string, string[]> = {
  * serve imports it for the read-only check, and its `--watch` made
  * `gbrain serve --watch` pass validation. grants/shared-exposure.ts (GST-363)
  * names other commands' flags (auth rescope, mcp grant, doctor) in warning
- * text that setup, mcp, connect, skillpack and auth print.
+ * text that setup, mcp, connect, skillpack and auth print. shadow/replay-spawn.ts builds the replay child's argv
+ * (`--no-env-file` is a Bun runtime flag for that child, not a flag `engine` parses).
  */
-const EXCLUDED_MODULES = ['thin-client-routing.ts', 'persistence-delegate.ts', 'job-isolation.ts', 'strict-args.ts', 'direct-pool-profile.ts', 'flag-equals.ts', 'shared-exposure.ts'];
+const EXCLUDED_MODULES = ['thin-client-routing.ts', 'persistence-delegate.ts', 'job-isolation.ts', 'strict-args.ts', 'direct-pool-profile.ts', 'flag-equals.ts', 'shared-exposure.ts', 'replay-spawn.ts'];
 
 function isExcludedModule(p: string): boolean {
   // Basename comparison is path-separator agnostic: on Windows p ends in
@@ -553,7 +558,15 @@ ${render(routing)}
 if (import.meta.main) {
   const { registry, routing } = buildFlagArtifacts(ROOT);
   const outPath = join(ROOT, 'src/core/cli-flag-registry.generated.ts');
-  writeFileSync(outPath, renderRegistryModule(registry, routing));
+  const next = renderRegistryModule(registry, routing);
+  if (process.argv.includes('--check')) {
+    if ((existsSync(outPath) ? readFileSync(outPath, 'utf8') : '') !== next) {
+      console.error('src/core/cli-flag-registry.generated.ts is stale: run bun run regen:all');
+      process.exit(1);
+    }
+    process.exit(0);
+  }
+  writeFileSync(outPath, next);
   const n = Object.keys(registry).length;
   const total = Object.values(registry).reduce((a, v) => a + v.length, 0);
   console.log(`wrote ${outPath} (${n} commands, ${total} flag entries)`);

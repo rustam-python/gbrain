@@ -42,7 +42,7 @@ import {
 import { canonicalOAuthResource } from '../core/oauth-grants.ts';
 import type { McpSurface } from '../mcp/surface.ts';
 import { bindResolveIpcForServe } from '../mcp/resolve-ipc-binding.ts';
-import { createPersistenceIpcProvider, residentPersistenceConfig } from '../core/persistence/provider.ts';
+import { servePersistenceIpcProvider, residentPersistenceConfig } from '../core/persistence/provider.ts';
 import { resolveMcpStdioSourceScope } from '../mcp/server.ts';
 import { type GBrainConfig } from '../core/config.ts';
 import { loadServeConfigs } from '../mcp/serve-config.ts';
@@ -55,7 +55,6 @@ import { VERSION } from '../version.ts';
 import { NoticeLedger } from '../core/notice-ledger.ts';
 import { createReadinessCache, type ReadinessCache } from '../core/readiness.ts';
 import { withLocalScope } from '../core/engine-scope-store.ts';
-import { mcpForegroundMiddleware } from '../core/foreground-activity.ts';
 
 export { extractGitHubItemRef, githubKindCoversRepo, selectGitHubItemSources } from './serve-http-webhooks.ts';
 export { HEALTH_TIMEOUT_MS, probeHealth, probeLiveness, type ProbeHealthResult } from './serve-http-metrics.ts';
@@ -773,7 +772,6 @@ export async function buildServeHttpApp(app: express.Express, engine: BrainEngin
   // below requireAdmin's definition.
   const metricsCounters = createMetricsCounters();
   app.use(metricsTrackingMiddleware(metricsCounters));
-  app.use('/mcp', mcpForegroundMiddleware);
 
   const oauthTokenRateLimit = resolveOAuthTokenRateLimit();
   const ccRateLimiter = rateLimit({
@@ -896,7 +894,7 @@ ${bootstrapFromEnv
     const ipcBinding = await bindResolveIpcForServe(
       engine,
       (await resolveMcpStdioSourceScope(engine)).sourceId,
-      await createPersistenceIpcProvider(engine, residentPersistenceConfig(config) ?? config),
+      await servePersistenceIpcProvider(engine, residentPersistenceConfig(config) ?? config),
     );
     if (ipcBinding.socketPath) {
       console.error(`  Resolve IPC: ${ipcBinding.socketPath}`);

@@ -23,20 +23,12 @@ import { chunkGenerationFilter, currentTextProjectionFilter } from '../search/sa
 import { buildSegmentedProjection } from './projection.ts';
 import { isSegmentedPage } from './page-shape.ts';
 import type { BodyStorage } from './types.ts';
+import type { SegmentedEmbedPage, SegmentedEmbedRef } from './types.ts';
 
 /** Stale rows read and embedded per provider round trip. */
 export const SEGMENTED_EMBED_BATCH_ROWS = 500;
 
-/** The page fields a segmented embed reads: metadata only, never the body. */
-export interface SegmentedEmbedPage {
-  id: number;
-  slug: string;
-  source_id: string;
-  title: string;
-  contextual_retrieval_mode: CRMode | null;
-  body_storage: 'segmented';
-  body_bytes: number;
-}
+export type { SegmentedEmbedPage } from './types.ts';
 
 export interface SegmentedStaleRow { chunk_index: number; chunk_text: string; chunk_source: string }
 
@@ -53,15 +45,9 @@ export interface SegmentedEmbedOpts {
   whileWaiting?: () => Promise<void>;
 }
 
-/** A segmented page that is live, sealed and in a live source, by id or by source and slug; null otherwise (inline pages included). */
-export async function readSegmentedEmbedPage(engine: Pick<BrainEngine, 'executeRaw'>,
-  ref: { id: number } | { sourceId: string; slug: string }): Promise<SegmentedEmbedPage | null> {
-  const [where, params] = 'id' in ref ? ['p.id = $1', [ref.id]] : ['p.source_id = $1 AND p.slug = $2', [ref.sourceId, ref.slug]];
-  const [row] = await engine.executeRaw<{ id: number; slug: string; source_id: string; title: string; contextual_retrieval_mode: CRMode | null; body_bytes: number | string }>(
-    `SELECT p.id, p.slug, p.source_id, p.title, p.contextual_retrieval_mode, p.body_bytes
-       FROM pages p JOIN sources s ON s.id = p.source_id
-      WHERE ${where} AND p.body_storage = 'segmented' AND p.deleted_at IS NULL AND NOT s.archived AND ${currentTextProjectionFilter('p')}`, params);
-  return row ? { ...row, id: Number(row.id), body_storage: 'segmented', body_bytes: Number(row.body_bytes) } : null;
+/** A segmented page that is live, sealed and in a live source, by id or by source and slug; null otherwise (inline pages included). The read is the engine's (engine-sql/page-body.ts). */
+export function readSegmentedEmbedPage(engine: Pick<BrainEngine, 'readSegmentedEmbedPage'>, ref: SegmentedEmbedRef): Promise<SegmentedEmbedPage | null> {
+  return engine.readSegmentedEmbedPage(ref);
 }
 
 /**
@@ -81,7 +67,7 @@ export async function readSealedSegmentedEmbedPage(engine: BrainEngine,
 }
 
 /** A dry run's counts: the page's live rows and those without a vector in the write column. */
-export async function countSegmentedEmbedRows(engine: Pick<BrainEngine, 'executeRaw'>, pageId: number): Promise<{ total: number; stale: number }> {
+export async function countSegmentedEmbedRows(engine: Pick<BrainEngine, 'executeRaw' | 'getConfigValues'>, pageId: number): Promise<{ total: number; stale: number }> {
   const col = quoteIdentifier((await embeddingWriteTarget(engine)).column.name);
   const [row] = await engine.executeRaw<{ total: number; stale: number }>(
     `SELECT count(*)::int AS total, count(*) FILTER (WHERE cc.${col} IS NULL)::int AS stale

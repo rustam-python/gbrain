@@ -83,6 +83,23 @@ function scrubErrorChain(err: unknown, redact: (text: string) => string): void {
   }
 }
 
+/** #9466: the registry code of a success response whose body the AI SDK could not parse as one JSON document. */
+export const UNPARSEABLE_RESPONSE_CODE = 'provider_response_unparseable';
+
+/**
+ * #9466: the provider answered with a success status and a body that is not one JSON document. The AI SDK raises its
+ * JSON parse error, wrapped in an API call error that carries the 2xx status when it read a response. The same request
+ * gets the same body (the common case: a route that streams Server-Sent Events when `stream` is omitted), so retrying
+ * cannot help. A body that parsed but failed the response schema, and an error status whose body did not parse, are not
+ * this case.
+ */
+function unparseableSuccessResponse(err: unknown): boolean {
+  const e = err as { name?: unknown; statusCode?: unknown; cause?: unknown } | null;
+  if (e?.name === 'AI_JSONParseError') return true;
+  return e?.name === 'AI_APICallError' && typeof e.statusCode === 'number' && e.statusCode >= 200 && e.statusCode < 300
+    && (e.cause as { name?: unknown } | null)?.name === 'AI_JSONParseError';
+}
+
 /** Model ids a provider renamed, mapped to the current id (B-N7: suggested on a 404). */
 const KNOWN_MODEL_RENAMES: Readonly<Record<string, string>> = {
   'deepseek:deepseek-v4-flash': 'deepseek:deepseek-flash',
@@ -137,6 +154,11 @@ export function normalizeAIError(err: unknown, context?: string, redact?: (text:
   // 4xx (except 429) = config-level, non-retryable. A 403 whose body says the
   // project has no access to the model is a model problem, not a key problem.
   if (typeof status === 'number' && status >= 400 && status < 500 && status !== 429) {
+    // #9696: Ollama answers 400 while the runner behind a model restarts; a refused connection to it is an outage.
+    const body = (err as { responseBody?: unknown }).responseBody;
+    if (/\bconnect: connection refused\b|"error"\s*:\s*"connection refused"/.test(`${raw}\n${typeof body === 'string' ? body : ''}`)) {
+      return carryStatusFields(err, new AITransientError(`${ctxPrefix}${msg}`, err));
+    }
     return carryStatusFields(err, new AIConfigError(
       `${ctxPrefix}${msg}`,
       status === 404 || MODEL_NOT_FOUND_MESSAGE_RE.test(msg) ? modelNotFoundFix(context, routeHint)
@@ -144,6 +166,16 @@ export function normalizeAIError(err: unknown, context?: string, redact?: (text:
         : 'Check your model id + provider options match the provider API.',
       err,
     ));
+  }
+
+  // #9466: fixed text only; the SDK's parse error quotes the response body, which must not reach a log or a job row.
+  if (unparseableSuccessResponse(err)) {
+    return Object.assign(carryStatusFields(err, new AIConfigError(
+      `${ctxPrefix}The provider answered with a success status, but the response body could not be parsed as one JSON document.`,
+      'Check that this provider route returns one JSON body for a non-streaming request; a route that streams when `stream` is omitted is the common cause. '
+        + 'Send the field the route needs for that model with gbrain config set provider_chat_options.<provider>:<model> \'{"stream": false}\', or fix the route.',
+      err,
+    )), { code: UNPARSEABLE_RESPONSE_CODE, retryable: false });
   }
 
   // AI SDK named errors
@@ -219,7 +251,7 @@ export function providerContentBlockReason(err: unknown): string | undefined {
   return undefined;
 }
 
-const CONTEXT_OVERFLOW_RE = /context[_ ]length|maximum context|prompt is too long|too many (?:input )?tokens|input (?:is )?too long/i;
+const CONTEXT_OVERFLOW_RE = /context[_ ]length|maximum context|prompt is too long|too many (?:input )?tokens|input (?:is )?too long|exceeds the available context size/i;
 
 /**
  * GBRA-130: a provider refusal of one request's own input, which fails the same

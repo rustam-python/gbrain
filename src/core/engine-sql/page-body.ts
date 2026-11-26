@@ -26,17 +26,45 @@ import type { ResolvedColumn } from '../types.ts';
 import { BODY_STAGING_HARD_MS, BODY_STAGING_IDLE_MS, SEGMENT_TEXT_GC_GRACE_MS, STAGE_BATCH_BYTES } from '../page-body/limits.ts';
 import { jsonRowBatches, sanitizeText } from '../batch-rows.ts';
 import { normalizeEngineColumn, quoteIdentifier, resolveWriteColumnFromConfigRows, vectorCastSuffix } from '../search/embedding-column.ts';
-import { SAFE_FENCE_CHUNKER_VERSION } from '../search/safe-chunks.ts';
+import { SAFE_FENCE_CHUNKER_VERSION, SEGMENTED_CHUNKER_VERSION } from '../search/safe-chunks.ts';
 import { validateSlug } from '../utils.ts';
 import { opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import { jsonbParam, type SqlExecutor } from './executor.ts';
+import { HOLD_BIND_CTE, HOLD_BIND_RETURNING } from './hold-binding.ts';
 import type { LegacyUnscopedRead } from './brands.ts';
 import { joinFragments, sqlFragment, trustedSql, type SqlFragment } from './fragment.ts';
 import { compileRowNormalizer } from './normalize.ts';
 import { liveTilingSql, stagingNeedsTextSql, untiledSql } from '../page-body/schema.ts';
 import { DerivationWriteRefused, type SegmentDerivationInput, type SegmentDerivationKind, type SegmentDerivationRow, type SegmentDerivationState } from '../page-body/derivations.ts';
 import { RELEASE_STAGED_CTE } from '../persistence/limits.ts';
+import { pageSearchVectorSql } from '../fts-language.ts';
+import { sanitizeRemoteBody } from '../remote-body.ts';
+import { overlayCanonicalBodies, readPageSnapshot } from '../page-state/snapshot.ts';
+/**
+ * Segmented page storage (Wave B): one SQL implementation for both engines.
+ * Segment texts, the generation-ranged body manifest, staged chunk rows, the
+ * generation flip and garbage collection (docs: wave-b spec 1.2, 3.3-3.5, 4.2).
+ *
+ * Contracts the callers keep:
+ * - Every staged manifest row's `staging_id` names a row `openBodyStaging`
+ *   recorded; a staging is a GC root while it is open, sealed or prepared, or
+ *   while a non-terminal persistence request's `intent.body_ref` names it.
+ * - Manifest rows are staged before the chunk rows of their occurrences: a
+ *   staged chunk row no live staging's manifest row owns is garbage.
+ * - Insert-reference-before-GC: staging a text that already exists refreshes
+ *   its `created_at` under the row lock (a concurrent sweep skips the locked
+ *   row, then sees it inside the grace window), and the text sweep keeps every
+ *   text touched since the oldest live staging of its source opened, so a
+ *   text a preparation staged or deduped onto stays until its manifest row
+ *   references it, however long publication waits.
+ *
+ * Statement sizes stay bounded whatever the page size: texts by
+ * STAGE_BATCH_BYTES per engine, manifest and chunk rows by `jsonRowBatches`
+ * under the same byte bound; the flip touches O(changed rows).
+ */
+import type { SegmentedEmbedPage, SegmentedEmbedRef } from '../page-body/types.ts';
+import { currentTextProjectionFilter } from '../search/safe-chunks.ts';
 
 export const LIVE_STAGING_STATES = ['open', 'sealed', 'prepared'];
 const TERMINAL_STAGING_STATES = ['committed', 'aborted', 'expired'];
@@ -169,6 +197,18 @@ export async function readManifest(exec: LegacyUnscopedRead, pageId: number,
   return opts.lastN !== undefined ? out.reverse() : out;
 }
 
+/**
+ * `readSegmentedEmbedPage`: a segmented page that is live, sealed and in a live source, by id or by source and slug;
+ * null otherwise (inline pages included). The statement page-body/segmented-embedding.ts always sent, byte for byte.
+ */
+export async function readSegmentedEmbedPage(exec: LegacyUnscopedRead, ref: SegmentedEmbedRef): Promise<SegmentedEmbedPage | null> {
+  const where = 'id' in ref ? sqlFragment`p.id = ${ref.id}` : sqlFragment`p.source_id = ${ref.sourceId} AND p.slug = ${ref.slug}`;
+  const { rows: [row] } = await exec.run<{ id: number; slug: string; source_id: string; title: string; contextual_retrieval_mode: SegmentedEmbedPage['contextual_retrieval_mode']; body_bytes: number | string }>(sqlFragment`SELECT p.id, p.slug, p.source_id, p.title, p.contextual_retrieval_mode, p.body_bytes
+       FROM pages p JOIN sources s ON s.id = p.source_id
+      WHERE ${where} AND p.body_storage = 'segmented' AND p.deleted_at IS NULL AND NOT s.archived AND ${trustedSql(currentTextProjectionFilter('p'))}`);
+  return row ? { ...row, id: Number(row.id), body_storage: 'segmented', body_bytes: Number(row.body_bytes) } : null;
+}
+
 /** The write column and model label the chunk rows carry, resolved on this executor's handle (as upsertChunks does). */
 async function resolveChunkWrite(exec: SqlExecutor, chunks: readonly SegmentChunkInput[], embeddingColumn?: ResolvedColumn): Promise<{ column: ResolvedColumn; model: string }> {
   const { rows } = await exec.run<{ key: string; value: string }>(sqlFragment`SELECT key, value FROM config
@@ -269,15 +309,19 @@ function metaParams(meta: SegmentedPageMeta) {
 
 export async function createSegmentedPageShell(exec: SqlExecutor, slug: string, meta: SegmentedPageMeta, opts: { sourceId: string }): Promise<{ id: number }> {
   const m = metaParams(meta);
+  // The new page takes over the quarantine holds waiting for its slug in the same statement (engine-sql/hold-binding.ts).
   // origin-guard-ok: applySegmentedBody runs assertOriginUnclaimed in this transaction first
   const { rows } = await exec.run<{ id: number }>(sqlFragment`
+    WITH ins AS (
     INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, updated_at, effective_date,
       effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at,
       body_storage, body_generation, body_bytes)
     VALUES (${opts.sourceId}, ${validateSlug(slug)}, ${meta.type}, ${m.pageKind}, ${m.title}, NULL, NULL, ${m.frontmatter}, now(), ${m.effectiveDate},
       ${m.effectiveDateSource}, ${m.importFilename}, ${m.chunkerVersion ?? 0}::smallint, ${m.sourcePath}, ${m.sourceKind}, ${m.sourceUri},
       ${m.ingestedVia}, ${m.ingestedAt}, 'segmented', 0, 0)
-    RETURNING id`);
+    RETURNING ${HOLD_BIND_RETURNING}
+    ), ${HOLD_BIND_CTE}
+    SELECT id FROM ins`);
   return { id: Number(rows[0]!.id) };
 }
 
@@ -388,6 +432,31 @@ export async function openBodyStaging(exec: SqlExecutor, input: BodyStagingInput
  * write moving it on (to prepared or committed) refuses body_staging_expired instead of reviving it, and an abort or expiry
  * of it changes nothing. A move to the state it already holds (a retried commit) is a no-op.
  */
+/**
+ * `sealSegmentedPage`: seal a segmented page's text projection at its current revision (chunks visible, title + timeline
+ * lead searchable). The lead is indexed as the inline seal indexes a snapshot's timeline: after the page's withdrawal
+ * overlay, sanitized. `chunker_version` is the oldest segmented chunker among the live chunks: a page sealed at an older
+ * one keeps it while any chunk row from before this generation is still stored (a write re-chunks only the occurrences
+ * it changed), so `gbrain reindex --segmented` still lists it. A missing page is a no-op.
+ */
+export async function sealSegmentedPage(exec: SqlExecutor, pageId: number, timelineLead?: string): Promise<void> {
+  const { rows: [page] } = await exec.run<{ slug: string; source_id: string; timeline_lead: string | null; chunker_version: number | null; body_generation: number | string }>(
+    sqlFragment`SELECT slug, source_id, timeline_lead, chunker_version, body_generation FROM pages WHERE id = ${pageId}`);
+  if (!page) return;
+  const stamped = Number(page.chunker_version ?? 0);
+  const older = stamped >= SAFE_FENCE_CHUNKER_VERSION && stamped < SEGMENTED_CHUNKER_VERSION && (await exec.run(sqlFragment`
+    -- chunk-visibility-ok: a sealing page stores only live rows; any one older than this generation predates the write
+    SELECT 1 FROM content_chunks WHERE page_id = ${pageId} AND body_generation < ${page.body_generation} LIMIT 1`)).rows.length > 0;
+  const query = <T>(text: string, params?: unknown[]) => exec.executeRaw<T>(text, params);
+  const ledger = await readPageSnapshot(query, page.slug, { sourceId: page.source_id, includeDeleted: true });
+  const { timeline } = await overlayCanonicalBodies(query, '', timelineLead ?? page.timeline_lead ?? '', ledger?.withdrawals ?? [],
+    { sourceId: page.source_id, marker: ledger?.globalPurges });
+  await exec.run(sqlFragment`UPDATE pages SET text_projection_revision = knowledge_revision,
+    chunker_version = ${older ? stamped : SEGMENTED_CHUNKER_VERSION}::smallint,
+    search_vector = ${trustedSql(pageSearchVectorSql('pages.title', 'seal.lead'))}
+    FROM (SELECT ${sanitizeRemoteBody(timeline)}::text AS lead) seal WHERE pages.id = ${pageId}`);
+}
+
 export async function setBodyStagingState(exec: SqlExecutor, id: string, state: BodyStagingState, opts: { commitRequestId?: string | null } = {}): Promise<void> {
   const { rows } = await exec.run<{ id: string }>(sqlFragment`UPDATE page_body_stagings SET state = ${state}, updated_at = now(),
       idle_expires_at = CASE WHEN ${state} = ANY(${LIVE_STAGING_STATES}::text[])

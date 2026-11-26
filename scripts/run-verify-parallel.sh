@@ -145,6 +145,8 @@ CHECKS=(
   "check:skills-manifest"
   # GBRA-225: skills.lock.history.json covers the lock and only grows.
   "check:skills-lock-history"
+  # G3: once skills/moved-skills.json names a destination, no unlisted skill folder.
+  "check:moved-skills"
   "check:no-pii-agent-voice"
   "check:synthetic-corpus-privacy"
   "check:operations-filter-bypass"
@@ -158,6 +160,7 @@ CHECKS=(
   "check:source-scope-onboard"
   "check:getpage-scope"
   "check:ascii-slug-class"
+  "check:relative-dotdot"
   "check:origin-assignment"
   "check:no-double-retry"
   "check:batch-audit-site"
@@ -185,6 +188,9 @@ CHECKS=(
   # GBRA-130: per-item catches that test an error code against a list and
   # rethrow the rest only shrink; baseline scripts/item-allowlist-catches-baseline.tsv.
   "check:item-allowlist-catches"
+  # A catch that turns a failed read into an empty answer only falls; baseline
+  # scripts/silent-read-catches-baseline.tsv (rules: scripts/silent-read-rules.ts).
+  "check:silent-read-catches"
   # EO10 (refactor wave 1): engine-sql/ and schema-migrations/ never import
   # back up into the engine façades or migrate.ts (ESM TDZ cycles).
   "check:layering"
@@ -206,6 +212,11 @@ CHECKS=(
   # Goal (a) (refactor wave 1): engine SQL only shrinks; baseline
   # scripts/engine-sql-baseline.tsv.
   "check:engine-sql-ratchet"
+  # D6 (docs/designs/RUST_ENGINE.md): raw SQL outside the engines and two-way
+  # pglite/postgres branches only fall; baselines scripts/engine-raw-sql-baseline.tsv
+  # and scripts/engine-kind-branches-baseline.tsv.
+  "check:engine-raw-sql-ratchet"
+  "check:engine-kind-branches"
   # GBRA-248 W1: world reads in src/core (loadConfig, env, fs, module state,
   # spawn, process hooks) only fall; baseline scripts/core-world-reads-baseline.tsv.
   "check:core-world-reads"
@@ -221,6 +232,8 @@ CHECKS=(
   # CQ3 / EO17 (refactor wave 1): engine-sql splices only constant text, no
   # composed $n, no expanded IN lists.
   "check:engine-sql-dynamic"
+  # #9192: a migration that changes what the page revision trigger watches empties search until the rebuild.
+  "check:migration-projection"
   # GBRA-218: the remote-privacy relaxations are read only in private-visibility.ts.
   "check:remote-privacy-reads"
   # EO4 (refactor wave 1): RLS read brands stay unforgeable; brand factories
@@ -242,6 +255,9 @@ CHECKS=(
   # A since: 'TBD' BEHAVIOR_CHANGES row never ships: refused on a stamped tree
   # (VERSION has a CHANGELOG header and differs from origin/master's) and on master.
   "check:behavior-since"
+  # Stable's promise (docs/STABILITY.md): a documented command, flag, MCP tool, config key or exit code the base has
+  # leaves only through a matured deprecations.d record; new behavior-changes.d rows carry kind:.
+  "check:public-surface"
   # CHANGELOG.md keeps every release heading origin/master has (a cut file is refused).
   "check:changelog-headings"
   "check:structural-manifest"

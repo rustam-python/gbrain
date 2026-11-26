@@ -12,6 +12,7 @@
 import type { BrainEngine } from '../engine.ts';
 import { PAGE_INLINE_MAX_BYTES, PAGE_MAX_BYTES } from '../page-size-policy.ts';
 import type { SegmentedGateWriter } from '../persistence/writer-versions.ts';
+import { sqlEngineKind, type EngineKind } from '../sql-engine-kind.ts';
 
 export { PAGE_INLINE_MAX_BYTES };
 
@@ -66,6 +67,11 @@ export const STAGE_BATCH_BYTES: Readonly<Record<'postgres' | 'pglite', number>> 
   postgres: 4 * 1024 ** 2,
   pglite: 4 * 1024 ** 2,
 };
+
+/** STAGE_BATCH_BYTES for the engine's kind; a Rust brain stages no SQL rows, so it is refused (`engine_capability_missing`). */
+export function stageBatchBytes(kind: EngineKind): number {
+  return STAGE_BATCH_BYTES[sqlEngineKind(kind, 'page body staging')];
+}
 
 /**
  * Segment bytes one projection transaction chunks into rows while it holds the page's key lock (ingest.ts
@@ -149,7 +155,7 @@ export interface PageBodyPolicy {
   versionsMaxPinnedBytes: number;
 }
 
-type PolicyEngine = Pick<BrainEngine, 'getConfig' | 'kind' | 'executeRaw'>;
+type PolicyEngine = Pick<BrainEngine, 'getConfig' | 'kind' | 'readSegmentedGateEvidence'>;
 
 function positiveInt(raw: string | null, fallback: number): number {
   if (raw === null || raw.trim() === '') return fallback;
@@ -178,7 +184,7 @@ export const segmentedWriterGateWork = { reads: 0 };
  * `SEGMENTED_WRITER_FLOOR`, writer-floor.ts). Any one keeps segmented storage off. Cached per engine for
  * `SEGMENTED_WRITER_GATE_TTL_MS`; `fresh` (doctor) reads through.
  */
-export async function segmentedWriterBlockers(engine: Pick<BrainEngine, 'executeRaw'>, opts: { fresh?: boolean } = {}): Promise<SegmentedGateWriter[]> {
+export async function segmentedWriterBlockers(engine: Pick<BrainEngine, 'readSegmentedGateEvidence'>, opts: { fresh?: boolean } = {}): Promise<SegmentedGateWriter[]> {
   let root: object = engine;
   for (let proto = Object.getPrototypeOf(root); proto && !Object.hasOwn(proto, 'constructor'); proto = Object.getPrototypeOf(proto)) root = proto;
   const cached = writerGate.get(root);

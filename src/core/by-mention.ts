@@ -38,11 +38,12 @@ import { stripCodeBlocks, isCrossSourceLinksEnabled } from './link-extraction.ts
 // #4222: shared generic-token reject list — same list gates enrichEntity
 // minting and drives the junk_entity_hubs doctor check.
 import { isGenericEntityToken } from './entity-name-quality.ts';
-import { ALWAYS_LINKABLE_TYPES, linkableTypesFor, loadSourcePack, readMentionPolicy, type MentionPolicy, type PackTypes } from './mentions/policy.ts';
+import { ALWAYS_LINKABLE_TYPES, canonicalTypeOf, linkableTypesFor, loadSourcePack, readMentionPolicy, type MentionPolicy, type PackTypes } from './mentions/policy.ts';
 import { siblingVerdict, type SiblingCandidate } from './mentions/siblings.ts';
 import { isShortCode } from './mentions/short-codes.ts';
 import { bodyBlocks } from './page-body/segment-blocks.ts';
 import { OperationError } from './ops/contract.ts';
+import { retiredPageSql } from './entities/resolve.ts';
 
 /**
  * The four types that are always linkable, whatever the schema pack says. The
@@ -93,6 +94,11 @@ export interface GazetteerEntry {
   /** Spelling being matched (the alias, not the display title, for aliases). */
   matchText?: string;
   /**
+   * Set only on the mention pass's scan entries for retired names, whose saved form lost the written
+   * spacing: a Hangul name matches however its words are spaced.
+   */
+  anySpacing?: true;
+  /**
    * Set on a name two or three identity siblings claim (mentions/siblings.ts):
    * a match links to every sibling with the same tokens instead of one.
    */
@@ -104,6 +110,34 @@ export interface GazetteerEntry {
    * binds to that canonical twin instead (see findMentionedEntities).
    */
   connector_stub?: true;
+  /** An X handle from the page's frontmatter: matches only where the text writes it as `@handle`. */
+  atOnly?: true;
+}
+
+/** Frontmatter keys that hold a person's X handle. */
+export const HANDLE_FRONTMATTER_KEYS = ['x_handle', 'twitter', 'twitter_handle', 'x'] as const;
+
+const HANDLE_RE = /^[A-Za-z0-9_]{1,15}$/;
+/** Values people write in a handle field when they do not know the handle. */
+const PLACEHOLDER_HANDLES = new Set(['unknown', 'none', 'null', 'nil', 'na', 'tbd', 'todo', 'unset', 'undefined', 'private', 'redacted', 'anonymous', 'true', 'false', 'yes', 'no']);
+
+/**
+ * The X handle a frontmatter value names, lowercase without the `@`, or null
+ * for anything that is not a handle: an empty value, a placeholder such as
+ * `unknown`, an all-digit or all-zero value, a list or a longer text. An
+ * `x.com/<handle>` or `twitter.com/<handle>` URL yields its handle.
+ */
+export function frontmatterHandle(value: string | null | undefined): string | null {
+  const raw = value?.trim() ?? '';
+  const url = /^(?:https?:\/\/)?(?:www\.)?(?:x|twitter)\.com\/([^/?#\s]+)/i.exec(raw);
+  const v = (url ? url[1]! : raw).replace(/^@/, '');
+  if (!v || !HANDLE_RE.test(v) || /^[\d_]+$/.test(v) || PLACEHOLDER_HANDLES.has(v.toLowerCase())) return null;
+  return v.toLowerCase();
+}
+
+/** The name an entry is saved and diffed under: its tokens, case-preserved for a case-sensitive entry, `@`-prefixed for a handle. */
+export function entryNameNorm(e: GazetteerEntry): string {
+  return `${e.atOnly ? '@' : ''}${(e.caseTokens ?? e.tokens).join(' ')}`;
 }
 
 /**
@@ -124,7 +158,7 @@ export type Gazetteer = Map<string, GazetteerEntry[]>;
 export function hashGazetteer(gazetteer: Gazetteer): string {
   const entries: string[] = [];
   for (const bucket of gazetteer.values()) {
-    for (const e of bucket) entries.push(`${e.source_id}\0${e.slug}\0${e.title}\0${e.tokens.join(' ')}\0${e.matchText ?? ''}${e.caseTokens ? `\0${e.caseTokens.join(' ')}` : ''}`);
+    for (const e of bucket) entries.push(`${e.source_id}\0${e.slug}\0${e.title}\0${e.tokens.join(' ')}\0${e.matchText ?? ''}${e.caseTokens ? `\0${e.caseTokens.join(' ')}` : ''}${e.atOnly ? '\0@' : ''}`);
   }
   // Matching semantics are part of the resume identity, not just DB contents.
   return createHash('sha256').update('katakana-boundaries-v5\n').update(entries.sort().join('\n')).digest('hex').slice(0, 8);
@@ -143,8 +177,7 @@ export function gazetteerEntryKeys(gazetteer: Gazetteer): GazetteerEntryKey[] {
   const out = new Map<string, GazetteerEntryKey>();
   for (const bucket of gazetteer.values()) {
     for (const e of bucket) {
-      const name_norm = (e.caseTokens ?? e.tokens).join(' ');
-      const key: GazetteerEntryKey = { source_id: e.source_id, name_norm, target_slug: e.slug, case_sensitive: !!e.caseTokens };
+      const key: GazetteerEntryKey = { source_id: e.source_id, name_norm: entryNameNorm(e), target_slug: e.slug, case_sensitive: !!e.caseTokens };
       out.set(`${key.source_id}\0${key.name_norm}\0${key.target_slug}\0${key.case_sensitive}`, key);
     }
   }
@@ -312,6 +345,24 @@ interface ScannedToken {
   length: number;     // original length (for span tracking)
 }
 
+/** CJK_SLUG_CHARS as code-point ranges (it is a list of `a-b` pairs, as CJK_BOUNDS relies on). */
+const CJK_RANGES = ((): Array<[number, number]> => {
+  const chars = [...CJK_SLUG_CHARS];
+  const ranges: Array<[number, number]> = [];
+  for (let k = 0; k < chars.length; k += 3) ranges.push([chars[k]!.codePointAt(0)!, chars[k + 2]!.codePointAt(0)!]);
+  return ranges;
+})();
+function isCJKCodePoint(cp: number): boolean {
+  if (cp < CJK_BOUNDS.min || cp > CJK_BOUNDS.max) return false;
+  for (const [lo, hi] of CJK_RANGES) if (cp >= lo && cp <= hi) return true;
+  return false;
+}
+/** TOKEN_RE anchored at lastIndex (sticky): one regex call per non-ASCII word. */
+const WORD_AT_RE = new RegExp(TOKEN_RE.source, 'uy');
+/** The rest of a word run after its ASCII prefix: TOKEN_RE's continuation, sticky. */
+const WORD_TAIL_RE = new RegExp(`(?:(?![${CJK_SLUG_CHARS}])[\\p{L}\\p{M}0-9])*`, 'uy');
+const isAsciiAlnum = (c: number) => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+
 /**
  * Body-text tokenizer. Returns `[token, offset]` pairs.
  *
@@ -333,47 +384,41 @@ interface ScannedToken {
  * resolved mention (see tokenizeTitle).
  */
 export function tokenizeForScan(text: string): ScannedToken[] {
+  // One forward pass that emits exactly what TOKEN_RE's word runs plus the
+  // per-character CJK walk would. ASCII words are read by char code; a word
+  // with any non-ASCII character is read by one sticky TOKEN_RE match (so
+  // Thai, Cyrillic or Arabic text costs one regex call per word); a CJK
+  // character is its own token; anything else advances one code unit.
   const out: ScannedToken[] = [];
-  TOKEN_RE.lastIndex = 0;
-  let m: RegExpExecArray | null;
-
-  // Collect word-run token spans first.
-  const wordSpans: Array<{ start: number; end: number }> = [];
-  while ((m = TOKEN_RE.exec(text)) !== null) {
-    wordSpans.push({ start: m.index, end: m.index + m[0].length });
-  }
-
-  // Walk character-by-character: emit word-run tokens at their start
-  // positions, then emit individual CJK characters for positions that fall
-  // outside every word-run span.
-  let spanIdx = 0;
-  for (let i = 0; i < text.length;) {
-    // Advance spanIdx past any spans that end before or at i.
-    while (spanIdx < wordSpans.length && wordSpans[spanIdx]!.end <= i) {
-      spanIdx++;
-    }
-
-    // If position i is inside a word-run span, emit the full token and jump
-    // past it.
-    if (spanIdx < wordSpans.length && i >= wordSpans[spanIdx]!.start && i < wordSpans[spanIdx]!.end) {
-      const span = wordSpans[spanIdx]!;
-      const token = text.slice(span.start, span.end);
-      out.push({ text: normalizeToken(token), offset: span.start, length: token.length });
-      i = span.end;
-      spanIdx++;
-      continue;
-    }
-
-    // CJK: emit as individual character token.
-    const cp = text.codePointAt(i) ?? 0;
-    const charLen = cp > 0xffff ? 2 : 1; // surrogate pair
-    const charStr = text.slice(i, i + charLen);
-    if (isCJKChar(charStr)) {
-      out.push({ text: normalizeToken(charStr), offset: i, length: charLen });
-      i += charLen;
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    const c = text.charCodeAt(i);
+    let start = i;
+    if (c < 128) {
+      if (!isAsciiAlnum(c)) { i++; continue; }
+      while (i < n && isAsciiAlnum(text.charCodeAt(i))) i++;
+      if (i >= n || text.charCodeAt(i) < 128) {
+        out.push({ text: text.slice(start, i).toLowerCase(), offset: start, length: i - start });
+        continue;
+      }
+      WORD_TAIL_RE.lastIndex = i;
+      i += WORD_TAIL_RE.exec(text)![0].length;
     } else {
-      i++;
+      const cp = text.codePointAt(i)!;
+      if (isCJKCodePoint(cp)) {
+        out.push({ text: normalizeToken(text[i]!), offset: i, length: 1 });
+        i++;
+        continue;
+      }
+      WORD_AT_RE.lastIndex = i;
+      const m = WORD_AT_RE.exec(text);
+      if (!m) { i++; continue; }
+      start = i;
+      i += m[0].length;
     }
+    const token = text.slice(start, i);
+    out.push({ text: normalizeToken(token), offset: start, length: i - start });
   }
   return out;
 }
@@ -497,19 +542,93 @@ export async function buildGazetteer(
   }
   const allTypes = [...new Set([...typesBySource.values()].flatMap(set => [...set]))];
   const linkable = (sourceId: string | null, type: string | null) => !!type && (typesBySource.get(sourceId ?? 'default')?.has(type) ?? false);
-  const rows = (await engine.executeRaw<{ slug: string; source_id: string | null; title: string | null; type: string | null; connector_stub: boolean }>(
-    `SELECT slug, source_id, title, type, (frontmatter ->> 'google_contact_id') IS NOT NULL AS connector_stub
+  const rows = (await engine.executeRaw<{ slug: string; source_id: string | null; title: string | null; type: string | null; connector_stub: boolean;
+    h1: string | null; h2: string | null; h3: string | null; h4: string | null }>(
+    `SELECT slug, source_id, title, type, (frontmatter ->> 'google_contact_id') IS NOT NULL AS connector_stub,
+            frontmatter ->> $2 AS h1, frontmatter ->> $3 AS h2, frontmatter ->> $4 AS h3, frontmatter ->> $5 AS h4
      FROM pages
      WHERE type = ANY($1::text[])
-       AND deleted_at IS NULL`,
-    [allTypes],
+       AND deleted_at IS NULL
+       AND NOT ${retiredPageSql('pages')}`,
+    [allTypes, ...HANDLE_FRONTMATTER_KEYS],
   )).filter(r => linkable(r.source_id, r.type));
   const stubPages = new Set(rows.filter(r => r.connector_stub).map(r => `${r.source_id ?? 'default'}\0${r.slug}`));
   const stubFlag = (src: string, slug: string) => stubPages.has(`${src}\0${slug}`) ? { connector_stub: true as const } : {};
+  const kindOf = new Map(rows.map(r => [`${r.source_id ?? 'default'}\0${r.slug}`, canonicalTypeOf(r.type, packBySource.get(r.source_id ?? 'default') ?? null)]));
+  const isPerson = (src: string, slug: string) => kindOf.get(`${src}\0${slug}`) === 'person';
 
   const ignoreSet = new Set<string>(DEFAULT_IGNORE_LIST);
   const userIgnore = new Set(policy.ignore.map(n => tokenizeTitle(n).join(' ')).filter(Boolean));
   const excludedSlugs = new Set(policy.excludeSlugs);
+
+  // page_aliases rows joined to LIVE linkable entity pages (read before the
+  // titles: frontmatter aliases are explicit claims a title can yield to).
+  let aliasRows: Array<{ alias_norm: string; slug: string; source_id: string | null; title: string | null; type: string | null;
+    origin: string | null; case_sensitive: boolean | null; alias_text: string | null; identity: unknown }> = [];
+  try {
+    aliasRows = (await engine.executeRaw<typeof aliasRows[number]>(
+      `SELECT pa.alias_norm, pa.slug, pa.source_id, p.title, p.type, pa.origin, pa.case_sensitive, pa.alias_text, p.frontmatter->>'identity' AS identity
+       FROM page_aliases pa
+       JOIN pages p ON p.slug = pa.slug AND p.source_id = pa.source_id
+       WHERE p.type = ANY($1::text[])
+         AND p.deleted_at IS NULL
+         AND NOT ${retiredPageSql('p')}`,
+      [allTypes],
+    )).filter(r => linkable(r.source_id, r.type));
+  } catch (err) {
+    // pre-v110 brains: no page_aliases table — titles-only gazetteer.
+    // Any OTHER failure (connection blip, permission) warns once per process
+    // (adversarial F12): a silently titles-only gazetteer under-links every
+    // page processed until restart, and nobody would know why. A strict
+    // (mention-pass) build throws instead, so nothing is reconciled against
+    // a partial gazetteer.
+    if (opts.strict) throw err;
+    if (!isMissingSchemaObject(err, 'table', 'page_aliases') && !aliasGazetteerWarned) {
+      aliasGazetteerWarned = true;
+      console.error(`[gbrain] gazetteer alias load degraded (titles-only): ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // Explicit claims, per source and name: the pages whose frontmatter writes
+  // the name as an alias or as their X handle. A page titled with a name that
+  // exactly one other page of its kind claims, while it claims nothing itself,
+  // is a thin page for that person or company: its title yields the name to
+  // the claimant (a handle mention lands on the person, not on a page whose
+  // slug is the handle) once the claimant's own entry for the name survives
+  // the alias guards below. Two claimants keep the title.
+  const handlesOf = (r: typeof rows[number]) => [...new Set([r.h1, r.h2, r.h3, r.h4].map(frontmatterHandle).filter((h): h is string => !!h))];
+  const explicit = new Map<string, Set<string>>();
+  const claim = (src: string, key: string, slug: string) => {
+    if (!key) return;
+    const k = `${src}\0${key}`;
+    explicit.set(k, (explicit.get(k) ?? new Set<string>()).add(slug));
+  };
+  for (const a of aliasRows) if (a.origin === 'frontmatter' || a.origin === null) claim(a.source_id ?? 'default', tokenizeTitle(a.alias_norm ?? '').join(' '), a.slug);
+  for (const r of rows) for (const h of handlesOf(r)) claim(r.source_id ?? 'default', tokenizeTitle(h).join(' '), r.slug);
+  const claimant = (src: string, key: string, slug: string): string | null => {
+    const slugs = explicit.get(`${src}\0${key}`);
+    if (!slugs || slugs.size !== 1 || slugs.has(slug)) return null;
+    const [other] = slugs;
+    return kindOf.get(`${src}\0${other}`) === kindOf.get(`${src}\0${slug}`) ? other! : null;
+  };
+  /** `source\0name\0claimant` for every title that yields its name to a claimant whose entry survives. */
+  const yielded = new Set<string>();
+  const yielding: Array<{ entry: GazetteerEntry; base: Omit<DroppedName, 'reason'>; key: string }> = [];
+
+  // Per source: the first word of every multi-word person name (titles and
+  // aliases) and the pages that write it. A one-word person title equal to
+  // another page's one is a bare first name: it never links alone, the same
+  // rule single-token aliases follow below.
+  const personFirstWords = new Map<string, Map<string, Set<string>>>();
+  const notePersonName = (src: string, slug: string, name: string | null) => {
+    const tokens = tokenizeTitle(name ?? '');
+    if (tokens.length < 2 || !isPerson(src, slug)) return;
+    const words = personFirstWords.get(src) ?? new Map<string, Set<string>>();
+    words.set(tokens[0]!, (words.get(tokens[0]!) ?? new Set<string>()).add(slug));
+    personFirstWords.set(src, words);
+  };
+  for (const r of rows) notePersonName(r.source_id ?? 'default', r.slug, r.title);
+  for (const a of aliasRows) notePersonName(a.source_id ?? 'default', a.slug, a.alias_norm);
 
   const gazetteer: Gazetteer = new Map();
   const add = (entry: GazetteerEntry) => {
@@ -555,13 +674,17 @@ export async function buildGazetteer(
     // ("Will Smith") are unaffected; aliases of every type are checked below.
     if (tokens.length === 1 && isGenericEntityToken(tokens[0]!)) { drop({ ...base, reason: 'generic_token' }); continue; }
     noteFirstWord(src, tokens);
-    add({ slug: row.slug, source_id: src, title: row.title, tokens, origin: 'title', matchText: row.title, ...stubFlag(src, row.slug) });
+    if (tokens.length === 1 && isPerson(src, row.slug) && [...personFirstWords.get(src)?.get(tokens[0]!) ?? []].some(s => s !== row.slug)) { drop({ ...base, reason: 'ambiguous_first_word' }); continue; }
+    const entry: GazetteerEntry = { slug: row.slug, source_id: src, title: row.title, tokens, origin: 'title', matchText: row.title, ...stubFlag(src, row.slug) };
+    const owner = claimant(src, tokens.join(' '), row.slug);
+    if (owner) { const key = `${src}\0${tokens.join(' ')}\0${owner}`; yielded.add(key); yielding.push({ entry, base, key }); continue; }
+    add(entry);
   }
 
   // ── Alias entries ────────────────────────────────────────────────────────
-  // page_aliases rows joined to LIVE linkable entity pages become additional
-  // gazetteer entries, so a body mention of "saoirse" links to
-  // people/saoirse-x and "QUCO" links to the account that declares it.
+  // page_aliases rows become additional gazetteer entries, so a body mention
+  // of "saoirse" links to people/saoirse-x and "QUCO" links to the account
+  // that declares it.
   // Guards (stricter than titles — aliases are not user-created pages):
   //   - one row per (source, alias, page) with origin precedence
   //     frontmatter > declared > subject
@@ -570,36 +693,13 @@ export async function buildGazetteer(
   //   - an alias claimed by >1 page at its best origin within a source is
   //     dropped (ambiguous); a lower-precedence claim yields
   //   - aliases colliding with any existing page TITLE in the SAME source
-  //     are skipped (the title entry wins; per-source scoping per R2-9)
+  //     are skipped (the title entry wins; per-source scoping per R2-9),
+  //     unless that title yielded the name to this page's explicit claim
   //   - MIN_NAME_LENGTH and the generic-token list apply to the alias string
   //   - a single-token alias equal to the first word of a multi-word entity
   //     name in the same source is dropped
   //   - a case-sensitive row (a single-token declared alias) matches only
   //     the original-case text
-  let aliasRows: Array<{ alias_norm: string; slug: string; source_id: string | null; title: string | null; type: string | null;
-    origin: string | null; case_sensitive: boolean | null; alias_text: string | null; identity: unknown }> = [];
-  try {
-    aliasRows = (await engine.executeRaw<typeof aliasRows[number]>(
-      `SELECT pa.alias_norm, pa.slug, pa.source_id, p.title, p.type, pa.origin, pa.case_sensitive, pa.alias_text, p.frontmatter->>'identity' AS identity
-       FROM page_aliases pa
-       JOIN pages p ON p.slug = pa.slug AND p.source_id = pa.source_id
-       WHERE p.type = ANY($1::text[])
-         AND p.deleted_at IS NULL`,
-      [allTypes],
-    )).filter(r => linkable(r.source_id, r.type));
-  } catch (err) {
-    // pre-v110 brains: no page_aliases table — titles-only gazetteer.
-    // Any OTHER failure (connection blip, permission) warns once per process
-    // (adversarial F12): a silently titles-only gazetteer under-links every
-    // page processed until restart, and nobody would know why. A strict
-    // (mention-pass) build throws instead, so nothing is reconciled against
-    // a partial gazetteer.
-    if (opts.strict) throw err;
-    if (!isMissingSchemaObject(err, 'table', 'page_aliases') && !aliasGazetteerWarned) {
-      aliasGazetteerWarned = true;
-      console.error(`[gbrain] gazetteer alias load degraded (titles-only): ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
   const ignoreLc = new Set(Array.from(ignoreSet, (n) => n.toLowerCase()));
   // Per-source title index for alias-vs-title collision checks.
   const titleBySource = new Set<string>();
@@ -645,9 +745,9 @@ export async function buildGazetteer(
     if (alias.length < MIN_NAME_LENGTH && !hasCJK(alias) && !shortCode) { drop({ ...base, reason: 'below_min_length' }); continue; }
     if (hasCJK(alias) && cjkCharCount(alias) < MIN_CJK_NAME_LENGTH) { drop({ ...base, reason: 'below_min_length' }); continue; }
     if (ignoreLc.has(alias.toLowerCase())) { drop({ ...base, reason: 'ignored' }); continue; }
-    if (titleBySource.has(`${src} ${alias.toLowerCase()}`)) { drop({ ...base, reason: 'title_wins' }); continue; }
     const tokens = tokenizeTitle(alias);
     if (tokens.length === 0) continue;
+    if (titleBySource.has(`${src} ${alias.toLowerCase()}`) && !yielded.has(`${src}\0${tokens.join(' ')}\0${a.slug}`)) { drop({ ...base, reason: 'title_wins' }); continue; }
     if (tokens[0]!.length < MIN_NAME_LENGTH && tokens.length === 1 && !shortCode) { drop({ ...base, reason: 'below_min_length' }); continue; }
     if (userIgnore.has(tokens.join(' '))) { drop({ ...base, reason: 'ignored' }); continue; }
     if (tokens.length === 1 && isGenericEntityToken(tokens[0]!)) { drop({ ...base, reason: 'generic_token' }); continue; }
@@ -658,20 +758,56 @@ export async function buildGazetteer(
     noteFirstWord(src, tokens);
     aliasEntries.push({ entry, base });
   }
+
+  // ── Handle entries ───────────────────────────────────────────────────────
+  // A frontmatter X handle (x_handle, twitter, twitter_handle, x) links where
+  // the text writes it as @handle. Where a thin page titled with the handle
+  // yielded it above, the bare handle links to the claimant too, as it linked
+  // to the thin page before. Two pages claiming one handle link neither.
+  const aliasKeys = new Set(aliasEntries.map(({ entry }) => `${entry.source_id}\0${entry.tokens.join(' ')}\0${entry.slug}`));
+  for (const row of rows) {
+    if (!row.title) continue;
+    const src = row.source_id ?? 'default';
+    for (const handle of handlesOf(row)) {
+      const tokens = tokenizeTitle(handle);
+      const key = tokens.join(' ');
+      const base = { source_id: src, slug: row.slug, name: `@${handle}`, origin: 'frontmatter' as const };
+      if (tokens.length === 0) continue;
+      if (excludedSlugs.has(row.slug)) { drop({ ...base, reason: 'excluded_slug' }); continue; }
+      if ((explicit.get(`${src}\0${key}`)?.size ?? 0) > 1) { drop({ ...base, reason: 'alias_collision' }); continue; }
+      if (handle.length < MIN_NAME_LENGTH) { drop({ ...base, reason: 'below_min_length' }); continue; }
+      if (ignoreLc.has(handle) || userIgnore.has(key)) { drop({ ...base, reason: 'ignored' }); continue; }
+      if (tokens.length === 1 && isGenericEntityToken(tokens[0]!)) { drop({ ...base, reason: 'generic_token' }); continue; }
+      const entry: GazetteerEntry = { slug: row.slug, source_id: src, title: row.title, tokens, origin: 'frontmatter', matchText: handle, ...stubFlag(src, row.slug) };
+      add({ ...entry, matchText: `@${handle}`, atOnly: true });
+      const k = `${src}\0${key}\0${row.slug}`;
+      if (yielded.has(k) && !aliasKeys.has(k)) { aliasKeys.add(k); aliasEntries.push({ entry, base: { ...base, name: handle } }); }
+    }
+  }
+  const claimed = new Set<string>();
   for (const { entry, base } of aliasEntries) {
     if (entry.tokens.length === 1 && firstWords.get(entry.source_id)?.has(entry.tokens[0]!)) {
       drop({ ...base, reason: 'ambiguous_first_word' });
       continue;
     }
     add(entry);
+    claimed.add(`${entry.source_id}\0${entry.tokens.join(' ')}\0${entry.slug}`);
+  }
+  // A title yields only to a claimant whose entry for the name survived;
+  // otherwise it keeps the name, as it did before the claim.
+  for (const { entry, base, key } of yielding) {
+    if (claimed.has(key)) drop({ ...base, reason: 'alias_collision' });
+    else add(entry);
   }
 
   // Sort each bucket by token-count DESC so maximal-munch walks longest-first;
-  // ties break on (source_id, slug) so the pick among same-name entries is
-  // deterministic instead of following DB row order.
+  // a handle entry comes before a same-length name, so `@name` reaches the
+  // page that claims the handle; ties break on (source_id, slug) so the pick
+  // among same-name entries is deterministic instead of following DB row order.
   for (const bucket of gazetteer.values()) {
     bucket.sort((a, b) =>
       (b.tokens.length - a.tokens.length)
+      || (Number(!!b.atOnly) - Number(!!a.atOnly))
       || a.source_id.localeCompare(b.source_id)
       || a.slug.localeCompare(b.slug));
   }
@@ -706,15 +842,16 @@ const HANGUL_NAME_SUFFIX_RE = new RegExp(
  * end at a non-Hangul character or an attached name suffix (above).
  */
 function hasHangulMatchBoundary(
-  text: string, tokens: ScannedToken[], start: number, entry: GazetteerEntry,
+  text: string, tokens: ScannedToken[], start: number, entry: GazetteerEntry, scripts: EntryScripts,
 ): boolean {
-  if (!entry.tokens.every(t => /^[가-힣]+$/u.test(t))) return true;
+  if (!(scripts(entry) & ALL_HANGUL)) return true;
   const first = tokens[start]!;
   if (first.offset > 0 && /[가-힣]/u.test(text[first.offset - 1]!)) return false;
   const last = tokens[start + entry.tokens.length - 1]!;
   const end = last.offset + last.length;
-  const actual = text.slice(first.offset, end).replace(/\s+/gu, ' ');
-  const expected = (entry.matchText ?? entry.tokens.join('')).trim().replace(/\s+/gu, ' ');
+  const space = entry.anySpacing ? '' : ' ';
+  const actual = text.slice(first.offset, end).replace(/\s+/gu, space);
+  const expected = (entry.matchText ?? entry.tokens.join('')).trim().replace(/\s+/gu, space);
   return actual === expected && HANGUL_NAME_SUFFIX_RE.test(text.slice(end, end + 12));
 }
 
@@ -730,10 +867,31 @@ const KATAKANA_RUN_CHARS = '\\p{Script=Katakana}ー\\u3099-\\u309c\\uff70\\uff9e
 const KATAKANA_RUN_BEFORE_RE = new RegExp(`[${KATAKANA_RUN_CHARS}]$`, 'u');
 const KATAKANA_RUN_AFTER_RE = new RegExp(`^[${KATAKANA_RUN_CHARS}]`, 'u');
 
+const HANGUL_NAME_TOKEN_RE = /^[가-힣]+$/u;
+const ALL_HANGUL = 1;
+const ALL_KATAKANA = 2;
+/** Whether a name is written only in Hangul (ALL_HANGUL) or only in Katakana (ALL_KATAKANA). */
+type EntryScripts = (entry: GazetteerEntry) => number;
+/** The answer depends on the name alone, so one scan works it out once per
+ * name, not at every place in the text where the name could match.
+ */
+function entryScriptCache(): EntryScripts {
+  const seen = new Map<readonly string[], number>();
+  return entry => {
+    let flags = seen.get(entry.tokens);
+    if (flags === undefined) {
+      flags = (entry.tokens.every(t => HANGUL_NAME_TOKEN_RE.test(t)) ? ALL_HANGUL : 0)
+        | (entry.tokens.every(t => KATAKANA_NAME_TOKEN_RE.test(t)) ? ALL_KATAKANA : 0);
+      seen.set(entry.tokens, flags);
+    }
+    return flags;
+  };
+}
+
 function hasKatakanaMatchBoundary(
-  text: string, tokens: ScannedToken[], start: number, entry: GazetteerEntry,
+  text: string, tokens: ScannedToken[], start: number, entry: GazetteerEntry, scripts: EntryScripts,
 ): boolean {
-  if (!entry.tokens.every(t => KATAKANA_NAME_TOKEN_RE.test(t))) return true;
+  if (!(scripts(entry) & ALL_KATAKANA)) return true;
   const first = tokens[start]!;
   const last = tokens[start + entry.tokens.length - 1]!;
   const end = last.offset + last.length;
@@ -778,12 +936,15 @@ export function findMentionedEntities(
   const stripped = stripCodeBlocks(text, { onHtmlComment: () => {} });
   const tokens = tokenizeForScan(stripped);
   if (tokens.length === 0) return [];
+  const scripts = entryScriptCache();
   const ignored = new Set((opts.ignoreNames ?? []).map(n => tokenizeTitle(n).join(' ')).filter(Boolean));
   // A case-sensitive entry matches only the original-case body text.
   const caseMatches = (entry: GazetteerEntry, at: number) => !entry.caseTokens || entry.caseTokens.every((t, k) => {
     const tok = tokens[at + k]!;
     return stripped.slice(tok.offset, tok.offset + tok.length).normalize('NFC') === t;
   });
+  // A handle entry matches only where the text writes it as @handle.
+  const atMatches = (entry: GazetteerEntry, at: number) => !entry.atOnly || stripped[tokens[at]!.offset - 1] === '@';
 
   const out: Mention[] = [];
   const seenTargets = new Set<string>();
@@ -803,16 +964,10 @@ export function findMentionedEntities(
     let matchedTokens = 0;
     for (const entry of bucket) {
       if (i + entry.tokens.length > tokens.length) continue;
-      if (!hasHangulMatchBoundary(stripped, tokens, i, entry)) continue;
-      if (!hasKatakanaMatchBoundary(stripped, tokens, i, entry)) continue;
-      if (!caseMatches(entry, i)) continue;
-      if (entry.tokens.length === 1) {
-        matched = entry;
-        matchedTokens = 1;
-        break;
-      }
-      // Multi-word: validate subsequent tokens.
-      if (i + entry.tokens.length > tokens.length) continue;
+      // Cheapest test first: the name's later tokens must follow. Every check
+      // in this loop is pure, so their order does not change which entry wins,
+      // and a big bucket of names sharing a first word no longer pays the
+      // boundary checks for every name that does not match here.
       let allMatch = true;
       for (let k = 1; k < entry.tokens.length; k++) {
         if (tokens[i + k]!.text !== entry.tokens[k]) {
@@ -820,11 +975,14 @@ export function findMentionedEntities(
           break;
         }
       }
-      if (allMatch) {
-        matched = entry;
-        matchedTokens = entry.tokens.length;
-        break;
-      }
+      if (!allMatch) continue;
+      if (!hasHangulMatchBoundary(stripped, tokens, i, entry, scripts)) continue;
+      if (!hasKatakanaMatchBoundary(stripped, tokens, i, entry, scripts)) continue;
+      if (!caseMatches(entry, i)) continue;
+      if (!atMatches(entry, i)) continue;
+      matched = entry;
+      matchedTokens = entry.tokens.length;
+      break;
     }
 
     if (!matched) {
@@ -839,8 +997,9 @@ export function findMentionedEntities(
       e.tokens.length === want.tokens.length
         && e.tokens.every((t, k) => t === want.tokens[k])
         && caseMatches(e, i)
-        && hasHangulMatchBoundary(stripped, tokens, i, e)
-        && hasKatakanaMatchBoundary(stripped, tokens, i, e);
+        && atMatches(e, i)
+        && hasHangulMatchBoundary(stripped, tokens, i, e, scripts)
+        && hasKatakanaMatchBoundary(stripped, tokens, i, e, scripts);
     if (matched.source_id !== opts.fromSourceId) {
       const want = matched;
       const own = bucket.find(e => e.source_id === opts.fromSourceId && sameName(e, want));
@@ -880,7 +1039,7 @@ export function findMentionedEntities(
     const want = matched.tokens;
     const group = matched.shared
       ? bucket.filter(e => e.shared && e.source_id === matched!.source_id && e.tokens.length === want.length
-        && e.tokens.every((t, k) => t === want[k]) && caseMatches(e, i))
+        && e.tokens.every((t, k) => t === want[k]) && caseMatches(e, i) && atMatches(e, i))
       : [matched];
     if (group.length > 1 && group.some(e => e.source_id === opts.fromSourceId && e.slug === opts.fromSlug)) {
       i += matchedTokens;

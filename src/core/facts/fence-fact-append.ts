@@ -45,6 +45,7 @@ import { assertFenceRewritable } from '../fence-shared.ts';
 import { pageFencesNormalized } from '../fence-repair/report.ts';
 import { withPendingFenceRows } from '../eligibility/fence-overlay.ts';
 import { withPageTierKept } from '../trust/fence-append.ts';
+import { newHoldingPageFrontmatter } from '../trust/page-write.ts';
 import type { TrustTier } from '../trust/tier.ts';
 import { extractFactsFromFenceText } from './extract-from-fence.ts';
 import { isHoldingSlug } from '../facts-fence.ts';
@@ -61,7 +62,8 @@ export type FenceFactAppendInput = {
   /** The tier the new row's chunks are cut at until its facts row exists (`withPendingFenceRows`); append only. */
   pendingTier: TrustTier;
 } & (
-  | { mode?: 'append'; supersede?: { rowNum: number; validUntil: Date | null } }
+  | { mode?: 'append'; supersede?: { rowNum: number; validUntil: Date | null };
+      /** GST-2875: the facts row is stored at this visibility while its cell keeps the fact's (a widening the owner decides). */ storedVisibility?: string }
   | { mode: 'index-existing'; rowNum: number }
 );
 
@@ -110,7 +112,7 @@ function fenceCellFor(fact: FenceFactAppendInput['fact'], rowNum: number, slug: 
  * write created first makes this attempt conflict, and the retry appends to it. File before facts row, as an append.
  */
 export async function prepareFenceFactCreate(engine: BrainEngine, row: WriteRequest, config: GBrainConfig,
-  input: { fact: NewFact & { valid_from: Date }; pendingTier: TrustTier; frontmatter: string; heading: string }, signal?: AbortSignal): Promise<FenceFactAppend> {
+  input: { fact: NewFact & { valid_from: Date }; pendingTier: TrustTier; frontmatter: string; heading: string; storedVisibility?: string }, signal?: AbortSignal): Promise<FenceFactAppend> {
   const page = { sourceId: row.source_id, slug: row.slug };
   const [indexedMax] = await engine.executeRaw<{ n: number }>('SELECT COALESCE(MAX(row_num),0)::int AS n FROM facts WHERE source_id=$1 AND source_markdown_slug=$2', [row.source_id, row.slug]);
   const rowNum = (indexedMax?.n ?? 0) + 1;
@@ -125,7 +127,7 @@ export async function prepareFenceFactCreate(engine: BrainEngine, row: WriteRequ
   }
   return { prepared, rowNum, fencesNormalized: {}, apply: async tx => {
     const pageReceipt = await withPageTierKept(tx, page, () => prepared.apply(tx));
-    return { id: await insertFenceFactRow(tx, row, rowNum, input.fact), pageReceipt };
+    return { id: await insertFenceFactRow(tx, row, rowNum, input.storedVisibility ? { ...input.fact, visibility: input.storedVisibility as NewFact['visibility'] } : input.fact), pageReceipt };
   } };
 }
 
@@ -141,7 +143,7 @@ export async function prepareFenceFactAppend(engine: BrainEngine, row: WriteRequ
   // Wave B: a segmented page is read back whole up to the single-string ceiling.
   if (snapshot && segmentedOverCeiling(snapshot.page)) throw pageBodyOverCeilingError(snapshot.page, `${row.operation} facts fence write`);
   const base = snapshot ? await materializedPage(engine, snapshot.page)
-    : { slug: row.slug, source_id: row.source_id, type: 'note', title: 'Unattributed memory', compiled_truth: '', timeline: '', frontmatter: {} } as unknown as Page;
+    : { slug: row.slug, source_id: row.source_id, type: 'note', title: 'Unattributed memory', compiled_truth: '', timeline: '', frontmatter: newHoldingPageFrontmatter(row) } as unknown as Page;
   const insert = (tx: BrainEngine, rowNum: number, indexed: NewFact) => insertFenceFactRow(tx, row, rowNum, indexed);
 
   if (input.mode === 'index-existing') {
@@ -192,7 +194,7 @@ export async function prepareFenceFactAppend(engine: BrainEngine, row: WriteRequ
   return { prepared, rowNum, fencesNormalized, apply: async tx => {
     const pageReceipt = await withPageTierKept(tx, page, () => prepared.apply(tx));
     if (snapshot && isHoldingSlug(row.slug) && !isSegmentedPage(snapshot.page)) await pruneHoldingPageVersions(tx, snapshot.page.id);
-    return { id: await insert(tx, rowNum, fact), pageReceipt };
+    return { id: await insert(tx, rowNum, input.storedVisibility ? { ...fact, visibility: input.storedVisibility as NewFact['visibility'] } : fact), pageReceipt };
   } };
 }
 

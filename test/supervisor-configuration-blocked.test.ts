@@ -13,6 +13,7 @@ import { autopilotLockPath } from '../src/core/autopilot-paths.ts';
 import { killProcessGroup } from '../src/core/minions/job-isolation.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { withQueueMembers } from './helpers/queue-engine-members.ts';
 
 async function isolated(fn: (root: string) => Promise<void>): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), 'gbrain-blocked-owner-'));
@@ -197,8 +198,10 @@ process.exit(1);`);
     const supervisorModule = pathToFileURL(join(import.meta.dir, '../src/core/minions/child-worker-supervisor.ts')).href;
     const workerPidFile = join(root, 'worker.pid');
     const worker = join(root, 'worker.ts');
-    writeFileSync(worker, `import {writeFileSync} from 'node:fs';
-writeFileSync(${JSON.stringify(workerPidFile)},String(process.pid));
+    // Written aside and renamed into place: the poll below sees no file or the whole pid, never the empty file writeFileSync creates before it writes.
+    writeFileSync(worker, `import {renameSync,writeFileSync} from 'node:fs';
+writeFileSync(${JSON.stringify(`${workerPidFile}.tmp`)},String(process.pid));
+renameSync(${JSON.stringify(`${workerPidFile}.tmp`)},${JSON.stringify(workerPidFile)});
 setInterval(()=>{},1000);`);
     const ownerScript = join(root, 'owner.ts');
     writeFileSync(ownerScript, `import {OwnerProcessingState} from ${JSON.stringify(statusModule)};
@@ -388,7 +391,8 @@ import {${kind === 'supervisor' ? 'MinionSupervisor' : 'runAutopilot'}} from ${J
 const engine = {
  kind:'postgres', sql:async()=>[{id:'fixture',fence:'1'}],
  getConfig:async()=>null, executeRaw:async()=>[], executeRawDirect:async()=>[{id:'fixture'}],
- getHealth:async()=>({brain_score:100}), disconnect:async()=>{}, reconnect:async()=>{}
+ getHealth:async()=>({brain_score:100}), disconnect:async()=>{}, reconnect:async()=>{},
+ acquireCycleLock:async(id:string)=>({id,fence:'1'}), refreshCycleLock:async()=>true, releaseCycleLock:async()=>true
 };
 ${kind === 'supervisor'
   ? `await new MinionSupervisor(engine as any,{cliPath:process.execPath,cliArgsPrefix:[${JSON.stringify(worker)}],pidFile:${JSON.stringify(pidFile)},healthInterval:10,_backoffFloorMs:1}).start();`
@@ -582,10 +586,10 @@ ${kind === 'supervisor'
     const state = new OwnerProcessingState('supervisor', 'fixture');
     let rejectHealth!: (error: Error) => void;
     let reconnects = 0;
-    const engine = {
+    const engine = withQueueMembers({
       executeRaw: () => new Promise((_r, reject) => { rejectHealth = reject; }),
       reconnect: async () => { reconnects++; },
-    } as unknown as BrainEngine;
+    }) as unknown as BrainEngine;
     const supervisor = new MinionSupervisor(engine, { cliPath: process.execPath, pidFile: join(root, 'owner.pid') });
     Object.assign(supervisor, { processingState: state, consecutiveHealthFailures: 2 });
     writeWorkerProcessingStatus({ state: 'ready' }, state.prepareChild());

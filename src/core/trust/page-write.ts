@@ -44,7 +44,7 @@ import { asciiLower } from '../edge-whitespace.ts';
 
 /** Page writes that only edit a gbrain-managed fence (or strike a row) and keep the page's tier. */
 const FENCE_EDIT_OPERATIONS = ['remember', 'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve', 'takes_remove',
-  'decide_proposal', 'loops_close', 'relink_facts', 'add_timeline_entry', 'add_link', 'remove_link', 'trust_release'];
+  'decide_proposal', 'loops_close', 'relink_facts', 'retire_connector_facts', 'add_timeline_entry', 'add_link', 'remove_link', 'trust_release'];
 /** Page writes whose caller supplies the page content: they stamp the marker and can lower the page (CEO-12). */
 const CONTENT_OPERATIONS = ['put_page', 'capture', 'edit_page', 'append_page', 'revert_version', 'restore_page'];
 
@@ -104,6 +104,17 @@ export function stampPageTrustMarker(row: Pick<WriteRequest, 'operation' | 'inte
   const tier = minTrust(trust.tier, ...prior);
   const stamped = stampTrustMarker(frontmatter, tier);
   if (stamped !== frontmatter) frontmatter.trust_tier = stamped.trust_tier;
+}
+
+/**
+ * #10286: the frontmatter of the holding page a fence write creates (`memory/unattributed`). A fence edit keeps a page's
+ * tier and marker, but a page it creates has neither, so it starts with the writer's marker, as a content write stamps
+ * it; without one doctor `provenance_stamp_drift` counts the page `marker_missing`.
+ */
+export function newHoldingPageFrontmatter(row: Pick<WriteRequest, 'id' | 'operation' | 'authority' | 'intent'>, cap?: TrustTier): Record<string, unknown> {
+  const page = pageWriteTrust(row, {})?.tier;
+  const tier = page && cap ? minTrust(page, cap) : page ?? cap;
+  return tier ? stampTrustMarker({}, tier) : {};
 }
 
 /** GST-2518: the privacy flag keys (visibility and its aliases) and the readers key a lower-tier write cannot widen alone. */

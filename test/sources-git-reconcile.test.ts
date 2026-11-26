@@ -22,8 +22,11 @@ import { runSources } from '../src/commands/sources.ts';
 import { REFRESH_PUBLISH_DIVERGED_KEY } from '../src/core/persistence/worktree-refresh.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { testBackends } from './helpers/test-backends.ts';
-import { withEnv } from './helpers/with-env.ts';
+import { withEnv, envForFile } from './helpers/with-env.ts';
 import { page, withRefreshFixture } from './helpers/worktree-refresh-fixture.ts';
+
+/** GST-2988: these tests pin the publish refusal, which secrets.on_push refuse keeps. */
+envForFile({ GBRAIN_SECRETS_ON_PUSH: 'refuse' });
 
 const dir = realpathSync(mkdtempSync(join(tmpdir(), 'gbrain-reconcile-')));
 const identity = { GIT_AUTHOR_NAME: 'Example', GIT_AUTHOR_EMAIL: 'example@example.invalid', GIT_COMMITTER_NAME: 'Example', GIT_COMMITTER_EMAIL: 'example@example.invalid' };
@@ -193,6 +196,14 @@ test('managed worktree: Git durability on publishes through refresh and a repeat
       expect(off[0].sources.sort()).toEqual([f.alpha, f.beta].sort());
       await engine.executeRaw(`UPDATE persistence_host_bindings SET git_durability='enabled' WHERE local_path LIKE $1`, [`${f.root}%`]);
       try {
+        if (Bun.which('flock')) {
+          const lock = join(git(f.root, 'rev-parse', '--absolute-git-dir'), 'brain-publish.lock');
+          const holder = spawn('flock', ['-o', lock, 'sleep', '60'], { stdio: 'ignore' });
+          try {
+            for (let i = 0; i < 100 && Bun.spawnSync(['flock', '-n', lock, 'true']).exitCode === 0; i++) await new Promise(r => setTimeout(r, 50));
+            expect(await reconcileSources(engine, { sourceIds: [f.alpha, f.beta] })).toMatchObject([{ managed: true, status: 'failed', error: { code: 'refresh_diverged' } }]);
+          } finally { holder.kill('SIGKILL'); }
+        }
         const [done] = await reconcileSources(engine, { sourceIds: [f.alpha, f.beta] });
         expect(done).toMatchObject({ managed: true, status: 'published', ahead: 1, behind: 1 });
         git(f.root, 'merge-base', '--is-ancestor', local, 'HEAD');
@@ -291,6 +302,42 @@ test('a checkout that fails with a plain error is reported for that checkout and
     chmodSync(join(broken.root, '.git'), 0o755);
     await resetPlain();
   }
+}, 120_000);
+
+test('a commit-push child stopped before it finished (git_command_stopped) is a retryable failure, not a question for the user', async () => {
+  const engine = plain;
+  const r = repo('child-stopped');
+  const stoppedCli = join(dir, 'bin', 'gbrain-stopped');
+  const envelope = { code: 'git_command_stopped', message: 'git ls-files in the checkout did not finish: it ran past its 60 s limit and was stopped.', suggestion: 'Rerun the same command once.', reason: 'timeout' };
+  writeFileSync(stoppedCli, `#!/bin/sh\necho '${JSON.stringify(envelope)}'\nexit 1\n`);
+  chmodSync(stoppedCli, 0o755);
+  try {
+    await engine.executeRaw('INSERT INTO sources(id,name,local_path,config) VALUES($1,$1,$2,$3::jsonb)', ['child-stopped', r.root, JSON.stringify({ remote_url: r.remote, managed_clone: true })]);
+    commit(r.root, 'notes/local.md', 'local\n');
+    const results = await withEnv({ ...identity, GBRAIN_JOB_CHILD_CLI: stoppedCli }, () => reconcileSources(engine, { sourceIds: ['child-stopped'] }));
+    expect(results).toMatchObject([{ status: 'failed', error: { code: 'git_command_stopped' } }]);
+  } finally { await resetPlain(); }
+}, 120_000);
+
+test('a commit-push child stopped by its output limit or a git crash goes to the user, since a retry stops the same way', async () => {
+  const engine = plain;
+  const stops = [
+    { id: 'child-output-limit', stop: { command: 'git ls-files', reason: 'output_limit' } },
+    { id: 'child-crashed', stop: { command: 'git ls-files', reason: 'signal', signal: 'SIGSEGV' } },
+  ];
+  try {
+    for (const { id, stop } of stops) {
+      const r = repo(id);
+      const stoppedCli = join(dir, 'bin', `gbrain-${id}`);
+      const envelope = { code: 'git_command_stopped', message: 'git ls-files in the checkout did not finish.', suggestion: 'Rerun the same command once.', detail: JSON.stringify(stop) };
+      writeFileSync(stoppedCli, `#!/bin/sh\necho '${JSON.stringify(envelope)}'\nexit 1\n`);
+      chmodSync(stoppedCli, 0o755);
+      await engine.executeRaw('INSERT INTO sources(id,name,local_path,config) VALUES($1,$1,$2,$3::jsonb)', [id, r.root, JSON.stringify({ remote_url: r.remote, managed_clone: true })]);
+      commit(r.root, 'notes/local.md', 'local\n');
+      const results = await withEnv({ ...identity, GBRAIN_JOB_CHILD_CLI: stoppedCli }, () => reconcileSources(engine, { sourceIds: [id] }));
+      expect(results).toMatchObject([{ status: 'needs_user', error: { code: 'git_command_stopped' } }]);
+    }
+  } finally { await resetPlain(); }
 }, 120_000);
 
 test('a checkout with a recorded remote that gbrain did not clone keeps its local commits by default', async () => {

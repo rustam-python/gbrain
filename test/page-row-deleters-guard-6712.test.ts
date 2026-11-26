@@ -20,8 +20,7 @@ const SEGMENTS = /(?<!function )\bdeletePageWithSegments\(/g;
  * `writeOriginDeletedMarker(` within three lines.
  */
 const MARKED: Record<string, number> = {
-  'src/core/persistence/page-purge.ts': 1, // delete_page --purge, manual and retention (the coordinator's purge transaction)
-  'src/core/belief/purge-mirror.ts': 1, // the restore-time purge replay
+  'src/core/persistence/page-purge.ts': 1, // deletePurgedPage: delete_page --purge, manual and retention, and the restore-time purge replay (#9469)
 };
 
 /** Reviewed callers a managed Git source never reaches, with the number of matches each file may hold. */
@@ -29,6 +28,8 @@ const REVIEWED: Record<string, { count: number; why: string }> = {
   'src/core/pglite-engine.ts': { count: 2, why: 'engine methods forwarding to engine-sql/pages.ts' },
   'src/core/postgres-engine.ts': { count: 2, why: 'engine methods forwarding to engine-sql/pages.ts' },
   'src/core/engine-sql/pages.ts': { count: 3, why: 'the engine implementations themselves' },
+  'src/core/rust-engine/store-members/pages.ts': { count: 1, why: 'the Rust engine deletePage member forwarding to the native store, as the PGLite and Postgres engine methods forward to engine-sql' },
+  'src/core/rust-engine/store-members/page-ops.ts': { count: 1, why: 'the Rust engine deletePages member forwarding to the native store, as the PGLite and Postgres engine methods forward to engine-sql' },
   'src/core/persistence/page-purge.ts': { count: 1, why: 'inside deletePageWithSegments, whose callers are MARKED' },
   'src/core/engine.ts': { count: 1, why: 'doc comment of deletePages' },
   'src/core/engine-constants.ts': { count: 1, why: 'doc comment of the batch bound' },

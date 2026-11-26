@@ -4,7 +4,7 @@
  * path, with the rename map) and slugs. Peeled out of extract-atoms.ts (module-size ratchet).
  */
 import { existsSync } from 'node:fs';
-import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { relative, resolve, sep } from 'node:path';
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
 import { isAvailable } from '../ai/gateway.ts';
 import { ATOM_KIND, atomGenerationAdapter, atomOwnerKey, atomPagePin, TRANSCRIPT_KEY_PREFIX, type AtomGenerationContext } from '../generations/adapters/atoms.ts';
@@ -12,6 +12,7 @@ import { markdownItem } from '../generations/adapters/page.ts';
 import type { GenerationKey } from '../generations/contract.ts';
 import { publishGeneration } from '../generations/publish.ts';
 import type { ExtractAtomsItem } from './extract-atoms-input.ts';
+import { relativeEscapesRoot } from '../path-confine.ts';
 
 /**
  * GBRA-161: one unmanaged item's atoms, their provenance edges (#3961, #4733), the completion flip (source_hash, #4148)
@@ -54,7 +55,7 @@ export const heldLine = (originLabel: string, key: GenerationKey, reason: string
 
 /** GBRA-161 PR 1b: the corpus root a discovered transcript lies under, with the label its key carries. */
 export function transcriptRoot(filePath: string, corpusDir: string, meetingDir: string | undefined): { path: string; label: string } {
-  const inside = (dir: string) => { const rel = relative(resolve(dir), resolve(filePath)); return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel); };
+  const inside = (dir: string) => { const rel = relative(resolve(dir), resolve(filePath)); return rel !== '' && !relativeEscapesRoot(rel); };
   return meetingDir && inside(meetingDir) && !(inside(corpusDir) && resolve(corpusDir).length > resolve(meetingDir).length)
     ? { path: meetingDir, label: 'meetings' } : { path: corpusDir, label: 'corpus' };
 }
@@ -105,4 +106,16 @@ export async function resolveTranscriptAtomSlug(engine: BrainEngine, sourceId: s
     `SELECT locator FROM derived_generations WHERE source_id=$1 AND kind=$2 AND owner_key=$3 AND state='live'`,
     [sourceId, ATOM_KIND, atomOwnerKey({ kind: 'transcript', transcriptKey: item.transcriptKey ?? item.filePath })]);
   return mine?.locator === held.source_path ? legacy : atomSlug(title, item.filePath, item.transcriptKey ?? item.filePath, undatedDate);
+}
+
+/**
+ * #10270: a page whose complete read already has a held result for its current input pin and the current policy (the
+ * hold ids `currentHoldIds` returns, bound at `placeholder`) is skipped by the phase (`heldForInput`), so discovery and
+ * the backlog leave it out too; doctor's `generation_held` lists it with its release.
+ */
+export function heldAtomInputExclusionSql(placeholder: string): string {
+  return `AND NOT EXISTS (SELECT 1 FROM derived_generations dg
+        WHERE dg.source_id = p.source_id AND dg.kind = 'atom' AND dg.state = 'held' AND dg.owner_key = 'source_slug:' || p.slug
+          AND dg.hold_id = ANY(${placeholder}::text[]) AND COALESCE(dg.held_context->>'partial', 'false') <> 'true'
+          AND dg.input_pin IN (p.content_hash, p.content_hash || ':' || p.id::text || ':' || p.knowledge_revision::text))`;
 }

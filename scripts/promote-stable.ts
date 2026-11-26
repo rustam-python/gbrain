@@ -25,6 +25,10 @@
  *    judgeMatrixRun), and any matrix run named is checked the same way, so a
  *    red or foreign run is refused; a maintainer may promote without one, and
  *    the record then says matrix_run: null with the maintainer as promoted_by;
+ * 4c. a forward promotion needs the install canary's pass on the release
+ *    commit (a trusted gbrain/install-canary commit status; scripts/stable-canary.ts
+ *    judgeCanary); a failed or untested release is refused, except that a
+ *    maintainer may promote it with a canary_waiver reason, which the record keeps;
  * 5. the version is strictly newer than the current stable, unless this is a
  *    rollback with a reason; promoting the current stable again moves no
  *    tag and only writes its evidence record when the published one does
@@ -43,8 +47,9 @@
  * 8. the release's GitHub release is marked "Latest" (pre-release cleared):
  *    release.yml publishes every batch release as a pre-release, so the
  *    stable channel is the one release GitHub calls Latest. A forward
- *    promotion replaces its notes with every CHANGELOG entry since the
- *    previous stable (rolledUpNotes()); a rollback keeps the notes. If this
+ *    promotion replaces its notes with a short summary of the behavior
+ *    changes since the previous stable (upgradeSummary()), then every
+ *    CHANGELOG entry since it (rolledUpNotes()); a rollback keeps the notes. If this
  *    last step fails, stable has already moved: the refusal names
  *    `bun scripts/release-channel.ts backfill --apply`, which sets it.
  *
@@ -63,6 +68,8 @@ import { spawnSync } from 'node:child_process';
 import { appendFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { upgradeSummary } from '../src/core/upgrade-summary.ts';
+import { judgeCanary, parseCanaryPosters, readCanaryStatuses } from './stable-canary.ts';
 import { judgeMatrixRun, MATRIX_RECEIPT_ARTIFACT, type BreakIssue, type MatrixReceipt, type MatrixRunRow } from './stable-matrix.ts';
 
 export const DOCS = 'docs/RELEASING.md#stable-channel-promotion';
@@ -93,6 +100,8 @@ export interface PromoteInputs {
   matrixRunUrl?: string;
   /** The open break issue a security or data-loss promotion passes (stable-daily only); the run may fail only on its named from-versions. */
   matrixExcuse?: BreakIssue | null;
+  /** A maintainer's reason for promoting a release the install canary failed or has not tested (never the schedule's). */
+  canaryWaiver?: string;
 }
 
 /** A release outside evidence shows is bad although it may soak clean, with the release that fixes it. */
@@ -109,6 +118,8 @@ export interface PromoteDeps {
   actor: string;
   /** True only for the scheduled stable-daily.yml run (scheduleAuthorized); it replaces the role check. */
   scheduled?: boolean;
+  /** Logins whose gbrain/install-canary statuses count (STABLE_CANARY_POSTERS); unset: DEFAULT_CANARY_POSTERS. */
+  canaryPosters?: string[];
   soakWorkflow: string;
   ghApi(path: string): Promise<unknown>;
   /** A write to the GitHub API (only the release edit that marks stable Latest). */
@@ -136,6 +147,8 @@ export interface TagFields {
   scoreboard: string;
   /** The upgrade matrix run; absent or empty when a maintainer promoted without one. */
   matrixRun?: string;
+  /** The install canary's verdict (its status description), or `waived: <reason>`; absent on a rollback and before the gate. */
+  installCanary?: string;
   promotedBy: string;
   promotedAt: string;
   previous: string | null;
@@ -156,6 +169,7 @@ export function renderRecord(f: TagFields, knownBad: readonly string[], notPromo
     soak_run: f.soakRun,
     scoreboard: f.scoreboard,
     matrix_run: f.matrixRun || null,
+    install_canary: f.installCanary || null,
     promoted_by: f.promotedBy,
     promoted_at: f.promotedAt,
     previous: f.previous,
@@ -287,6 +301,7 @@ export function renderTagMessage(f: TagFields): string {
     `previous: ${f.previous ?? 'none'}`,
     `rollback: ${f.rollback}`,
     `reason: ${f.reason.trim().replace(/\s+/g, ' ') || '-'}`,
+    ...(f.installCanary ? [`install_canary: ${f.installCanary.replace(/\s+/g, ' ')}`] : []),
     '',
   ].join('\n');
 }
@@ -309,8 +324,9 @@ export function parseTagMessage(message: string): TagFields | null {
   if (!soakRun || !scoreboard || !promotedBy || !promotedAt || !reason || (rollback !== 'true' && rollback !== 'false')) return null;
   if (!previous || (previous !== 'none' && !VERSION_RE.test(previous))) return null;
   const matrixRun = kv.get('matrix_run');
+  const installCanary = kv.get('install_canary');
   return {
-    version, commit, tree, soakRun, scoreboard, ...(matrixRun ? { matrixRun } : {}), promotedBy, promotedAt,
+    version, commit, tree, soakRun, scoreboard, ...(matrixRun ? { matrixRun } : {}), ...(installCanary ? { installCanary } : {}), promotedBy, promotedAt,
     previous: previous === 'none' ? null : previous,
     rollback: rollback === 'true',
     reason: reason === '-' ? '' : reason,
@@ -325,6 +341,7 @@ export function renderSummary(p: Promotion, notPromotable: readonly NotPromotabl
     ['Soak run', p.soakRun],
     ['Scoreboard', p.scoreboard],
     ['Upgrade matrix', p.matrixRun || 'none (promoted without one)'],
+    ['Install canary', p.installCanary || 'not checked (rollback, or a re-record of the current stable)'],
     ['Previous stable', p.previous ? `v${p.previous}` : 'none'],
     ['Rollback', p.rollback ? `yes: ${p.reason.trim()}` : 'no'],
     ['Known bad', p.knownBad.length ? p.knownBad.map(v => `v${v}`).join(', ') : 'none'],
@@ -487,12 +504,14 @@ export async function promote(deps: PromoteDeps, inputs: PromoteInputs): Promise
     if (recordCommit !== commit) throw new Refusal(`stable-v${version} points at ${recordCommit}, not the release commit ${commit}; investigate the tags before promoting.`);
   }
   deps.log(`[promote-stable] record tag stable-v${version} ${recordExists ? 'exists (rollback re-promotion): keeping it' : 'is new: creating it'}.`);
+  const installCanary = await checkCanary(deps, inputs, { version, commit }, recordExists || (current !== null && compareVersions(version, current.version) < 0));
 
   const fields: TagFields = {
     version, commit, tree,
     soakRun: inputs.soakRunUrl.trim(),
     scoreboard: inputs.scoreboardUrl.trim() || inputs.soakRunUrl.trim(),
     ...(matrixRun ? { matrixRun } : {}),
+    ...(installCanary ? { installCanary } : {}),
     promotedBy: deps.scheduled ? `schedule (${DAILY_WORKFLOW})` : deps.actor,
     promotedAt: deps.now().toISOString().replace(/\.\d{3}Z$/, 'Z'),
     previous: current?.version ?? null,
@@ -500,7 +519,7 @@ export async function promote(deps: PromoteDeps, inputs: PromoteInputs): Promise
   };
   const message = renderTagMessage(fields);
   const changelog = rollback ? null : await deps.git(['show', `${releaseRef}:CHANGELOG.md`]);
-  const notes = changelog === null ? null : rolledUpNotes(changelog.code === 0 ? changelog.stdout : '', fields.previous, version, deps.repo);
+  const notes = changelog === null ? null : rolledUpNotes(changelog.code === 0 ? changelog.stdout : '', fields.previous, version, deps.repo, fields.previous ? upgradeSummary(fields.previous, version) : null);
 
   // The evidence record: carried forward from the previous record commit (none before the first promotion).
   const prior = await readPriorRecord(deps);
@@ -553,6 +572,31 @@ async function checkMatrix(deps: PromoteDeps, inputs: PromoteInputs, release: { 
 
 const MATRIX_DOCS = 'docs/RELEASING.md#daily-stable-check';
 
+/**
+ * The install canary's verdict on a forward promotion (scripts/stable-canary.ts). A pass is recorded as its status
+ * description. A failed or untested release is refused; a maintainer's canary_waiver promotes it anyway and is
+ * recorded as `waived: <reason>`. A real rollback (to an older release, or back to one that was stable before) is
+ * not checked; rollback=true on a newer release that was never stable is. An unreadable status list refuses.
+ */
+async function checkCanary(deps: PromoteDeps, inputs: PromoteInputs, release: { version: string; commit: string }, wasStableOrOlder: boolean): Promise<string> {
+  if (inputs.rollback && wasStableOrOlder) return '';
+  let statuses;
+  try {
+    statuses = await readCanaryStatuses(deps.ghApi, deps.repo, release.commit);
+  } catch (error) {
+    throw new Refusal(`the install canary's statuses on v${release.version} (${release.commit}) could not be read (${(error as Error).message.split('\n')[0]}), so stable holds; re-run this workflow (${MATRIX_DOCS}).`);
+  }
+  const verdict = judgeCanary(statuses, release.version, deps.canaryPosters ?? parseCanaryPosters(undefined));
+  if (verdict.state === 'success') {
+    deps.log(`[promote-stable] ${verdict.why}.`);
+    return verdict.description;
+  }
+  const waiver = (inputs.canaryWaiver ?? '').trim().replace(/\s+/g, ' ');
+  if (!waiver || deps.scheduled) throw new Refusal(`${verdict.why}; promote only a release the install canary passed, or have a maintainer pass canary_waiver with the reason (${MATRIX_DOCS}).`);
+  deps.log(`[promote-stable] ${verdict.why}; promoted anyway on ${deps.actor}'s waiver: ${waiver}.`);
+  return `waived: ${waiver}`;
+}
+
 /** GitHub's limit on a release body is 125,000 characters; stay under it with room for the trailer. */
 export const RELEASE_NOTES_MAX = 120_000;
 
@@ -560,9 +604,10 @@ export const RELEASE_NOTES_MAX = 120_000;
  * The stable release's notes: every CHANGELOG.md section newer than `previous` up to and including `version`, newest
  * first, under one line naming the previous stable. Oldest sections drop first when the roll-up would pass
  * RELEASE_NOTES_MAX, and a link to the full CHANGELOG at the tag says so. With no previous stable it is the release's
- * own entry; with no matching section it is the same link stub release.yml writes.
+ * own entry; with no matching section it is the same link stub release.yml writes. The behavior-change summary sits
+ * under the opening line, and is left out when it alone would pass RELEASE_NOTES_MAX.
  */
-export function rolledUpNotes(changelog: string, previous: string | null, version: string, repo: string): string {
+export function rolledUpNotes(changelog: string, previous: string | null, version: string, repo: string, summary: string[] | null = null): string {
   const link = `https://github.com/${repo}/blob/v${version}/CHANGELOG.md`;
   const wanted = (v: string) => compareVersions(v, version) <= 0 && (previous === null ? compareVersions(v, version) === 0 : compareVersions(v, previous) > 0);
   const sections: string[][] = [];
@@ -577,7 +622,9 @@ export function rolledUpNotes(changelog: string, previous: string | null, versio
     current?.push(line);
   }
   if (sections.length === 0) return `See [CHANGELOG.md](${link}) for v${version}.\n`;
-  const intro = previous === null ? `Stable release v${version}.\n` : `Stable release v${version}: every change since the previous stable release, v${previous}, newest first.\n`;
+  const opening = previous === null ? `Stable release v${version}.\n` : `Stable release v${version}: every change since the previous stable release, v${previous}, newest first.\n`;
+  const summarized = summary ? `${opening}\n${summary.join('\n')}\n` : opening;
+  const intro = summarized.length + 200 > RELEASE_NOTES_MAX ? opening : summarized;
   const bodies = sections.map(s => `${s.join('\n').trimEnd()}\n`);
   const kept: string[] = [];
   let size = intro.length;
@@ -642,6 +689,7 @@ export function processDeps(env: NodeJS.ProcessEnv = process.env, cwd = process.
     repo: env.GITHUB_REPOSITORY ?? '',
     actor: env.GITHUB_ACTOR ?? '',
     soakWorkflow: env.STABLE_SOAK_WORKFLOW ?? '',
+    canaryPosters: parseCanaryPosters(env.STABLE_CANARY_POSTERS),
     async ghApi(path) {
       const r = spawnSync('gh', ['api', path], { cwd, env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
       if (r.status !== 0) throw new Error(`gh api ${path} failed: ${(r.stderr || r.error?.message || '').trim()}`);
@@ -687,6 +735,7 @@ if (import.meta.main) {
       .map(version => ({ version, reason: env.PROMOTE_NOT_PROMOTABLE_REASON ?? '', fixed_in: (env.PROMOTE_NOT_PROMOTABLE_FIXED_IN ?? '').trim().replace(/^v/, '') })),
     notPromotableRemove: (env.PROMOTE_NOT_PROMOTABLE_REMOVE ?? '').split(',').map(v => v.trim().replace(/^v/, '')).filter(Boolean),
     matrixRunUrl: env.PROMOTE_MATRIX_RUN_URL ?? '',
+    canaryWaiver: env.PROMOTE_CANARY_WAIVER ?? '',
   };
   const deps = processDeps();
   try {

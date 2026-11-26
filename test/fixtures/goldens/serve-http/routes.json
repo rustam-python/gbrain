@@ -34,14 +34,6 @@
     },
     {
       "handlers": [
-        "mcpForegroundMiddleware"
-      ],
-      "method": "use",
-      "path": "/mcp",
-      "when": []
-    },
-    {
-      "handlers": [
         "cors(corsOAuthOptions)"
       ],
       "method": "use",
@@ -516,6 +508,25 @@
         "<inline>"
       ],
       "method": "get",
+      "path": "/admin/api/access/handover/:id",
+      "when": []
+    },
+    {
+      "handlers": [
+        "requireAdmin",
+        "express.json()",
+        "<inline>"
+      ],
+      "method": "post",
+      "path": "/admin/api/access/handover",
+      "when": []
+    },
+    {
+      "handlers": [
+        "requireAdmin",
+        "<inline>"
+      ],
+      "method": "get",
       "path": "/admin/api/memory-proposals",
       "when": []
     },
@@ -536,6 +547,25 @@
       ],
       "method": "post",
       "path": "/admin/api/memory-proposals/:request_id",
+      "when": []
+    },
+    {
+      "handlers": [
+        "requireAdmin",
+        "<inline>"
+      ],
+      "method": "get",
+      "path": "/admin/api/policy",
+      "when": []
+    },
+    {
+      "handlers": [
+        "requireAdmin",
+        "express.json()",
+        "<inline>"
+      ],
+      "method": "post",
+      "path": "/admin/api/policy/accept",
       "when": []
     },
     {
@@ -609,6 +639,7 @@
       "handlers": [
         "ipLimit",
         "withBearerScopeHint(requireBearerAuth({ verifier : resourceVerifier , resourceMetadataUrl }), [ 'read' , 'write' ])",
+        "mcpForegroundMiddleware",
         "tokenLimit",
         "<inline>"
       ],

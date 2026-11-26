@@ -11,6 +11,7 @@ import { coverageActive, noteBelief, readLedgerSource, withBeliefBatch } from '.
 import { createPageVersion } from '../page-state/versions.ts';
 import { validateSlug } from '../utils.ts';
 import { factWithdrawalSubjectSql, onOwnedMemoryPageSql } from '../access/member-facts.ts';
+import { ownedMemorySubjectSql, unbackedEntitySql } from './withdrawal-schema.ts';
 
 export interface WithdrawalCommit {
   withdrawn: boolean;
@@ -81,7 +82,7 @@ export async function planFactWithdrawal(engine: BrainEngine, id: number, source
   const affected = existing ? [] : await discoverWithdrawalTargets(engine, sourceId, [{ visibility, fact_hash, subject, claim: fact }]).catch(withdrawalDiscoveryFailure);
   // The belief ledger's streams of the facts this withdrawal expires (fence pages and database-only subjects), locked with the pages.
   const streams = (await engine.executeRaw<{ slug: string }>(`SELECT DISTINCT COALESCE(source_markdown_slug, entity_slug) AS slug FROM facts
-    WHERE source_id=$1 AND visibility=$2 AND gbrain_fact_fingerprint(fact)=$3 AND ($4='*' OR entity_slug=$4 OR (${onOwnedMemoryPageSql('facts')} AND source_markdown_slug=$4)) AND expired_at IS NULL
+    WHERE source_id=$1 AND visibility=$2 AND gbrain_fact_fingerprint(fact)=$3 AND ($4='*' OR entity_slug=$4 OR (${unbackedEntitySql('facts')} AND NOT ${ownedMemorySubjectSql('$4::text')}) OR (${onOwnedMemoryPageSql('facts')} AND source_markdown_slug=$4)) AND expired_at IS NULL
       AND COALESCE(source_markdown_slug, entity_slug) IS NOT NULL`, [sourceId, visibility, fact_hash, subject]))
     .map(r => r.slug).filter(slug => { try { validateSlug(slug); return true; } catch { return false; } });
   const slugs = [...new Set([...affected.map(page => page.slug), ...streams])].sort();
@@ -133,12 +134,13 @@ export async function recordFactWithdrawal(
     return batch(async () => {
       // Scoped to the forgotten row's entity: the same claim about another
       // entity stays active and rememberable. A subjectless fact withdraws
-      // source-wide ('*').
+      // source-wide ('*'), and so does one on an unbacked name key (GBRA-574),
+      // whose rows every withdrawal of the claim reaches, except one on an owned memory page.
       const inserted = await tx.executeRaw(`INSERT INTO fact_withdrawals(source_id,visibility,subject,fact_hash,withdrawn_at)
         VALUES ($1,$2,$4,gbrain_fact_fingerprint($3),COALESCE($5::timestamptz,now())) ON CONFLICT DO NOTHING RETURNING fact_hash`, [sourceId,row.visibility,row.fact,row.subject,opts.publication?.withdrawnAt ?? null]);
       const expired = await tx.executeRaw<{ id: number }>(`UPDATE facts SET expired_at=now(),valid_until=LEAST(COALESCE(valid_until,now()),now())
         WHERE source_id=$1 AND visibility=$2 AND gbrain_fact_fingerprint(fact)=gbrain_fact_fingerprint($3)
-          AND ($4='*' OR entity_slug=$4 OR ${pageScoped}) AND expired_at IS NULL RETURNING id`, [sourceId,row.visibility,row.fact,row.subject]);
+          AND ($4='*' OR entity_slug=$4 OR (${unbackedEntitySql('facts')} AND NOT ${ownedMemorySubjectSql('$4::text')}) OR ${pageScoped}) AND expired_at IS NULL RETURNING id`, [sourceId,row.visibility,row.fact,row.subject]);
       noteBelief({ kind: 'withdrawn', factIds: expired.map(r => Number(r.id)) });
       if (!inserted.length) return { withdrawn: false, pages: [] };
       // Overnight semantic review (decide review lane): queued with the ledger row so a late commit is never skipped.
@@ -273,9 +275,7 @@ export async function isFactWithdrawn(
 
 /** #5575: the claim matches a purge tombstone (the facts guard raises the same typed code on insert). */
 export async function isFactPurged(engine: BrainEngine, sourceId: string, visibility: string, claim: string, entitySlug: string | null): Promise<boolean> {
-  const rows = await engine.executeRaw(`SELECT 1 FROM fact_purges WHERE source_id=$1 AND visibility=$2 AND fact_hash=gbrain_fact_fingerprint($3)
-    AND (subject = '*' OR subject = $4::text) LIMIT 1`, [sourceId, visibility, claim, entitySlug]);
-  return rows.length > 0;
+  return engine.isFactPurged(sourceId, visibility, claim, entitySlug);
 }
 
 /** Writers check this before isFactWithdrawn so a purged claim refuses with typed purged_content, before any provider work. */

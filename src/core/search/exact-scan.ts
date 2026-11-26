@@ -38,7 +38,7 @@ import { pageEligibleSql } from '../eligibility/sql.ts';
 import { buildHardExcludeClause } from './sql-ranking.ts';
 import { escapeLikePattern } from './sql-ranking.ts';
 import { isStatementTimeoutError } from '../retry-matcher.ts';
-import { chunkVisibleFilter, currentTextProjectionFilter, safeChunksFilter, SAFE_FENCE_CHUNKER_VERSION } from './safe-chunks.ts';
+import { chunkVisibleFilter, safeChunksFilter, SAFE_FENCE_CHUNKER_VERSION, servedTextProjectionFilter } from './safe-chunks.ts';
 
 export const EXACT_DEFAULT_LIMIT = 100;
 export const EXACT_MAX_LIMIT = 1000;
@@ -46,7 +46,7 @@ export const EXACT_DEFAULT_SECONDS = 30;
 export const EXACT_MAX_SECONDS = 120;
 export const EXACT_MAX_PHRASE_CHARS = 500;
 export const EXACT_SNIPPETS_PER_PAGE = 3;
-const SNIPPET_CONTEXT = 80;
+export const EXACT_SNIPPET_CONTEXT = 80;
 const BATCH_PAGES = 2000;
 const GAP_SAMPLE = 20;
 
@@ -59,6 +59,8 @@ export interface ExactScanOpts {
   sourceIds?: string[];
   types?: string[];
   slugPrefix?: string;
+  /** More prefixes searched with `slugPrefix` (one name stored under another spelling). */
+  slugPrefixAlso?: string[];
   excludeSlugPrefixes: string[];
   excludePrivate: boolean;
   remote: boolean;
@@ -119,7 +121,7 @@ export function buildExactBatchStatement(opts: ExactScanOpts, after: number, bat
   const limitP = add(batchPages);
   const flags = opts.caseSensitive ? "''" : "'i'";
   const re = add(pattern.regex);
-  const snippetRe = add('.{0,' + SNIPPET_CONTEXT + '}' + pattern.regex + '.{0,' + SNIPPET_CONTEXT + '}');
+  const snippetRe = add('.{0,' + EXACT_SNIPPET_CONTEXT + '}' + pattern.regex + '.{0,' + EXACT_SNIPPET_CONTEXT + '}');
   const like = add('%' + escapeLikePattern(pattern.longest) + '%');
   const op = opts.caseSensitive ? '~' : '~*';
   const likeOp = opts.caseSensitive ? 'LIKE' : 'ILIKE';
@@ -133,7 +135,8 @@ export function buildExactBatchStatement(opts: ExactScanOpts, after: number, bat
   if (opts.sourceIds?.length) pageFilters.push('p.source_id = ANY(' + add(opts.sourceIds) + '::text[])');
   else if (opts.sourceId) pageFilters.push('p.source_id = ' + add(opts.sourceId));
   if (opts.types?.length) pageFilters.push('p.type = ANY(' + add(opts.types) + '::text[])');
-  if (opts.slugPrefix) pageFilters.push('p.slug LIKE ' + add(escapeLikePattern(opts.slugPrefix) + '%') + " ESCAPE '\\'");
+  if (opts.slugPrefix && opts.slugPrefixAlso?.length) pageFilters.push('p.slug LIKE ANY(' + add([opts.slugPrefix, ...opts.slugPrefixAlso].map(prefix => escapeLikePattern(prefix) + '%')) + '::text[])');
+  else if (opts.slugPrefix) pageFilters.push('p.slug LIKE ' + add(escapeLikePattern(opts.slugPrefix) + '%') + " ESCAPE '\\'");
   if (opts.excludePrivate) pageFilters.push(privatePagesFilterForCaller('p'));
   if (opts.minTrust) pageFilters.push(pageEligibleSql('p', { floor: opts.minTrust }));
   const hardExclude = buildHardExcludeClause('p.slug', opts.excludeSlugPrefixes);
@@ -160,7 +163,7 @@ export function buildExactBatchStatement(opts: ExactScanOpts, after: number, bat
 )
 SELECT p.id AS page_id, p.slug, p.source_id, p.title, p.type, pp.matching_chunks, pp.snippets,
        CASE WHEN pp.page_id IS NOT NULL THEN NULL ${unsealed}
-            WHEN NOT ${currentTextProjectionFilter('p')} THEN 'projection_pending'
+            WHEN NOT ${servedTextProjectionFilter('p')} THEN 'projection_pending'
             WHEN NOT EXISTS (SELECT 1 FROM content_chunks vc WHERE vc.page_id = p.id AND ${chunkVisibleFilter('p', 'vc')}) AND ${hasBody} THEN 'unchunked'
             ELSE NULL END AS gap
   FROM batch b JOIN pages p ON p.id = b.id LEFT JOIN per_page pp ON pp.page_id = b.id

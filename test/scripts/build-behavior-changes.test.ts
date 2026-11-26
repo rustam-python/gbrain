@@ -35,7 +35,7 @@ function run(root: string, argv: string[]): { code: number; out: string } {
   return { code, out: lines.join('\n') };
 }
 
-const rowsOf = (text: string) => [...text.matchAll(/^ {2}\{ since: '([^']+)', id: '([^']+)', text: (".*") \},$/gm)].map((m) => ({ since: m[1], id: m[2], text: JSON.parse(m[3]!) }));
+const rowsOf = (text: string) => [...text.matchAll(/^ {2}\{ since: '([^']+)', id: '([^']+)', (?:kind: '([a-z-]+)', )?text: (".*") \},$/gm)].map((m) => ({ since: m[1], id: m[2], ...(m[3] ? { kind: m[3] } : {}), text: JSON.parse(m[4]!) }));
 const releasesOf = (text: string) => Object.fromEntries([...text.matchAll(/^ {2}([a-z0-9_]+): '([^']+)',$/gm)].map((m) => [m[1], m[2]]));
 
 describe('build()', () => {
@@ -59,6 +59,22 @@ describe('build()', () => {
     };
     expect(rowsOf(build(tree({ VERSION: '0.1.0.0\n', ...files })).text)).toEqual([]);
     expect(rowsOf(build(tree({ VERSION: '0.1.1.0\n', ...files })).text)).toEqual([{ since: '0.1.1.0', id: 'faster_sync_abc', text: 'Sync is faster now.' }]);
+  });
+
+  test('front matter (kind, exception, deprecation) is read and left out of the notice text; bad values are problems', () => {
+    const root = tree({
+      VERSION: '0.1.0.0\n',
+      'CHANGELOG.md': changelog(section('0.1.0.0', 'First.', marker('kinded_row_abc'), marker('bad_kind_abc'))),
+      'behavior-changes.d/kinded_row_abc.md': '---\nkind: breaking\nexception: security\n---\nA kinded\nchange.\n',
+      'behavior-changes.d/bad_kind_abc.md': '---\nkind: sideways\nexception: data-loss\nowner: someone\n---\nText.\n',
+    });
+    const { text, problems } = build(root);
+    expect(rowsOf(text).find((r) => r.id === 'kinded_row_abc')).toEqual({ since: '0.1.0.0', id: 'kinded_row_abc', kind: 'breaking', text: 'A kinded change.' });
+    expect(problems).toEqual([
+      'behavior-changes.d/bad_kind_abc.md: front matter line "owner: someone" is not one of kind, exception, deprecation',
+      'behavior-changes.d/bad_kind_abc.md: kind: sideways is not one of breaking, action, default, fix, add',
+      'behavior-changes.d/bad_kind_abc.md: exception: applies only to kind: breaking',
+    ]);
   });
 
   test('a marker under a released CHANGELOG heading dates the row with that version, text joined to one line', () => {

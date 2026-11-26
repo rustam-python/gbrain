@@ -8,7 +8,7 @@ import { prepareMarkdownChunks } from '../markdown-chunks.ts';
 import { loadFenceChunkOverlay, type FenceChunkOverlay } from '../eligibility/fence-overlay.ts';
 import { prepareCodeChunks, installCodeChunkEdges } from '../code-chunks.ts';
 import { resolveMaxChunkTokens } from '../embedding-input-limit.ts';
-import { assertPageRevision, PageRevisionConflictError, type PageSnapshot } from './types.ts';
+import { assertPageRevision, PageProjectionConflictError, PageRevisionConflictError, type PageSnapshot, type ProjectionConflictField } from './types.ts';
 import { sanitizeRemoteBody } from '../remote-body.ts';
 import { digest } from '../persistence/digest.ts';
 import { quoteIdentifier, resolveWriteColumnFromConfigRows, vectorCastSuffix } from '../search/embedding-column.ts';
@@ -27,20 +27,11 @@ import { advanceProjectionCursor, ineligibleKey, rememberIneligible, residentWin
 import { acceptedEmbeddingInputHashes, embeddingInputHash, plainEmbeddingTier, synopsisBodyHash,
   type EmbeddingInputContext, type EmbeddingTier } from '../embedding-input-hash.ts';
 import { chunkModelMatchesSql } from '../embedding-invalidation.ts';
+import { isRetryableConnError } from '../retry-matcher.ts';
+import { ACTIVATION_SERVED_REVISION } from '../search/safe-chunks.ts';
 
-/**
- * Complete the searchable snapshot only after its sanitized chunks are installed.
- * `guarded` is this transaction's own read of the page under its guard, when
- * the caller has one and has not changed the page's revision or timeline since.
- */
-export async function sealPageTextProjection(engine: BrainEngine, slug: string, sourceId: string, guarded?: PageSnapshot): Promise<void> {
-  const current = guarded ?? await engine.readPageSnapshot(slug, { sourceId });
-  if (!current) return;
-  await engine.executeRaw(`UPDATE pages SET text_projection_revision=knowledge_revision,
-    search_vector=${pageSearchVectorSql('title', '$3')}
-    WHERE source_id=$1 AND slug=$2 AND knowledge_revision=$4::uuid`,
-  [sourceId, slug, sanitizeRemoteBody(current.page.timeline), current.revision]);
-}
+export { sealPageTextProjection } from './text-seal.ts';
+import { sealPageTextProjection } from './text-seal.ts';
 
 /**
  * A coordinated import's one closing page write: the chunker version its apply
@@ -72,16 +63,7 @@ export interface ProjectionSnapshot {
   fenceOverlay?: FenceChunkOverlay;
 }
 
-export type ProjectionConflictField = 'text_projection_revision' | 'chunk_digest' | 'indexing_context';
-
-/** Canonical state can stay unchanged while another worker replaces its projection. */
-export class PageProjectionConflictError extends PageRevisionConflictError {
-  constructor(expected: string, current: string, readonly changed: readonly ProjectionConflictField[], readonly slug: string, readonly sourceId: string) {
-    super(expected, current);
-    this.name = 'PageProjectionConflictError';
-    this.message = `The search projection of ${slug} (source ${sourceId}) changed during preparation (${changed.join(', ')}) at the same page revision; nothing was installed. Re-read its current snapshot before retrying.`;
-  }
-}
+export { PageProjectionConflictError, type ProjectionConflictField } from './types.ts';
 
 /**
  * The loser of a concurrent projection installation re-reads and prepares
@@ -99,10 +81,10 @@ export async function retryProjectionConflict<T>(attempt: () => Promise<T>, rand
 }
 
 /** The vector column and model a write targets; `model` is what a stored chunk's label and provenance are compared to. */
-export async function embeddingWriteTarget(engine: Pick<BrainEngine, 'executeRaw'>): Promise<{ config: Array<{ key: string; value: string }>; model: string | null; column: ResolvedColumn; provenanceModel: string | null }> {
+export async function embeddingWriteTarget(engine: Pick<BrainEngine, 'getConfigValues'>): Promise<{ config: Array<{ key: string; value: string }>; model: string | null; column: ResolvedColumn; provenanceModel: string | null }> {
   // A missing config table reads as defaults, as upsertChunks' own resolution does.
-  const config = await engine.executeRaw<{ key: string; value: string }>(
-    "SELECT key,value FROM config WHERE key IN ('search_embedding_column','embedding_columns','embedding_model','embedding_dimensions','contextual_retrieval.mode') ORDER BY key") ?? [];
+  const config = await engine.getConfigValues(
+    ['search_embedding_column', 'embedding_columns', 'embedding_model', 'embedding_dimensions', 'contextual_retrieval.mode']) ?? [];
   let model = config.find(row => row.key === 'embedding_model')?.value ?? null;
   try { model = getEmbeddingModel(); } catch { /* Unconfigured gateway: retain the brain's recorded model. */ }
   const column = resolveWriteColumnFromConfigRows({
@@ -124,7 +106,7 @@ export function embeddingInputContext(target: { column: ResolvedColumn; provenan
  * `tier`, and return the column the hash names so the write targets it
  * (undefined when nothing was freshly embedded). Reused vectors stay unrecorded.
  */
-export async function stampEmbeddingInputs(engine: Pick<BrainEngine, 'executeRaw'>, chunks: ChunkInput[], fresh: ReadonlySet<number> | null,
+export async function stampEmbeddingInputs(engine: Pick<BrainEngine, 'getConfigValues'>, chunks: ChunkInput[], fresh: ReadonlySet<number> | null,
   page: { title: string; tier: EmbeddingTier; corpusGeneration: string | null }): Promise<ResolvedColumn | undefined> {
   if (!chunks.some((chunk, i) => chunk.embedding && (!fresh || fresh.has(i)))) return undefined;
   const target = await embeddingWriteTarget(engine);
@@ -138,15 +120,13 @@ export async function stampEmbeddingInputs(engine: Pick<BrainEngine, 'executeRaw
 async function indexingContext(engine: BrainEngine, snapshot: PageSnapshot, maxChunkTokensOverride?: number): Promise<{ key: string; model: string | null; maxChunkTokens: number; column: ResolvedColumn; pageKind: PageKind; provenanceModel: string | null; corpusGeneration: string | null }> {
   const { config, model, column, provenanceModel } = await embeddingWriteTarget(engine);
   const maxChunkTokens = maxChunkTokensOverride ?? resolveMaxChunkTokens();
-  const [projection] = await engine.executeRaw<{ chunker_version: number | null; corpus_generation: string | null }>(
-    'SELECT chunker_version,corpus_generation FROM pages WHERE id=$1', [snapshot.page.id]);
-  const [kind] = await engine.executeRaw<{ page_kind: PageKind }>('SELECT page_kind FROM pages WHERE id=$1', [snapshot.page.id]);
-  if (!kind) throw new PageRevisionConflictError(snapshot.revision, null);
+  const state = await engine.readPageIndexingState(snapshot.page.id);
+  if (!state) throw new PageRevisionConflictError(snapshot.revision, null);
   return { key: digest({ config, mode: snapshot.page.contextual_retrieval_mode, model, column,
-    maxChunkTokens, storedChunkerVersion: projection?.chunker_version ?? null, corpusGeneration: projection?.corpus_generation ?? null,
-    chunkerVersion: MARKDOWN_CHUNKER_VERSION, codeChunkerVersion: CHUNKER_VERSION, pageKind: kind.page_kind,
-    ftsLanguage: getFtsLanguage() }), model, maxChunkTokens, column, pageKind: kind.page_kind, provenanceModel,
-    corpusGeneration: projection?.corpus_generation ?? null };
+    maxChunkTokens, storedChunkerVersion: state.chunker_version, corpusGeneration: state.corpus_generation,
+    chunkerVersion: MARKDOWN_CHUNKER_VERSION, codeChunkerVersion: CHUNKER_VERSION, pageKind: state.page_kind,
+    ftsLanguage: getFtsLanguage() }), model, maxChunkTokens, column, pageKind: state.page_kind, provenanceModel,
+    corpusGeneration: state.corpus_generation };
 }
 
 /**
@@ -415,7 +395,7 @@ export async function installPageEmbeddings(engine: BrainEngine, prepared: Proje
     const current = await tx.readPageSnapshot(slug, { sourceId });
     if (!current || current.page.deleted_at || current.sourceIncarnation !== snapshot.sourceIncarnation || current.page.id !== snapshot.page.id
       || current.page.text_projection_revision !== current.revision || isSegmentedPage(current.page)) return refused;
-    const [source] = await tx.executeRaw<{ archived: boolean }>('SELECT archived FROM sources WHERE id=$1', [sourceId]);
+    const source = await tx.readSourceRow(sourceId);
     if (!source || source.archived) return refused;
     const context = await indexingContext(tx, current, prepared.maxChunkTokensOverride);
     if (context.key !== prepared.indexingContext) return refused;
@@ -450,7 +430,6 @@ export async function installPageEmbeddings(engine: BrainEngine, prepared: Proje
     const complete = dropped === 0 && stored.length === prepared.chunks.length && stored.every((c, i) => c.chunk_index === prepared.chunks[i].chunk_index && c.chunk_text === prepared.chunks[i].chunk_text && c.chunk_source === prepared.chunks[i].chunk_source);
     if (built && !complete) return refused;
     const updates = [...accepted.values()].flatMap(({ ids, hash, chunk }) => ids.map(id => ({ id, hash, chunk })));
-    const col = quoteIdentifier(column.name);
     for (const batch of jsonRowBatches(updates, ({ id, hash, chunk }) => ({
       id,
       chunk_text: chunk.chunk_text,
@@ -461,14 +440,7 @@ export async function installPageEmbeddings(engine: BrainEngine, prepared: Proje
       model: chunk.model ?? (chunk.embedding ? prepared.embeddingModel : null),
       input_hash: hash,
     }))) {
-      await tx.executeRaw(`UPDATE content_chunks SET
-        ${col}=CASE WHEN v.embedding IS NULL THEN content_chunks.${col} ELSE v.embedding${vectorCastSuffix(column)} END,
-        embedding_image=CASE WHEN v.image IS NULL THEN content_chunks.embedding_image ELSE v.image::vector END,
-        embedding_input_hash=CASE WHEN v.embedding IS NULL THEN content_chunks.embedding_input_hash ELSE v.input_hash END,
-        embedded_at=now(),embedded_text_hash=md5(content_chunks.chunk_text),model=COALESCE(v.model,content_chunks.model),
-        embedding_pending_since=CASE WHEN v.embedding IS NULL THEN content_chunks.embedding_pending_since ELSE NULL END
-        FROM jsonb_to_recordset($2::text::jsonb) AS v(id int, chunk_text text, embedding text, image text, model text, input_hash text)
-        WHERE content_chunks.id=v.id AND content_chunks.page_id=$1 AND content_chunks.chunk_text=v.chunk_text`, [snapshot.page.id, batch]);
+      await tx.installChunkEmbeddings(snapshot.page.id, column, batch);
     }
     if (signature && complete) await tx.setPageEmbeddingSignature(slug, { sourceId, signature });
     return { installed, complete };
@@ -483,13 +455,13 @@ export async function queuePageProjection(engine: Pick<BrainEngine, 'executeRaw'
     ON CONFLICT(source_incarnation,slug) DO UPDATE SET revision=EXCLUDED.revision,reason=EXCLUDED.reason,updated_at=now()`, [sourceId, slug, reason]);
 }
 
-/** A live, unsegmented page's chunker version (`projectionBelowSafeFence`). */
-export const SAFE_FENCE_SQL = "SELECT chunker_version FROM pages WHERE id=$1 AND deleted_at IS NULL AND body_storage IS DISTINCT FROM 'segmented'";
+/** A live, unsegmented page's chunker version (`projectionBelowSafeFence`); the text lives in engine-sql/pages.ts with `getPageSealState`. */
+export { SAFE_FENCE_SQL } from '../engine-sql/pages.ts';
 
 /** #5050/#5247: whether a live page's installed chunks predate the safe-chunk fence. */
-export async function projectionBelowSafeFence(engine: Pick<BrainEngine, 'executeRaw'>, pageId: number): Promise<boolean> {
-  const [row] = await engine.executeRaw<{ chunker_version: number | null }>(SAFE_FENCE_SQL, [pageId]) ?? [];
-  return row !== undefined && belowSafeChunkFence(row.chunker_version === null ? null : Number(row.chunker_version));
+export async function projectionBelowSafeFence(engine: Pick<BrainEngine, 'getPageSealState'>, pageId: number): Promise<boolean> {
+  const row = await engine.getPageSealState(pageId);
+  return row !== null && belowSafeChunkFence(row.chunker_version === null ? null : Number(row.chunker_version));
 }
 
 /**
@@ -645,6 +617,19 @@ export interface ProjectionRebuildOptions {
    * per run instead of once per batch. Ignored with `window`.
    */
   walk?: { after?: QueueKey };
+  /**
+   * #9192: pages rebuilt at once, each in its own transactions on its own pooled connection. Defaults to 1. When an
+   * extra connection is refused or dropped while more than one page is in flight, that page goes back to the others
+   * and one fewer page runs at once from then on (onNarrow); the last one keeps today's behaviour.
+   */
+  concurrency?: number;
+  /** Receives the lowered page count, and the connection error that lowered it. */
+  onNarrow?: (concurrency: number, error: unknown) => void;
+  /**
+   * #9192: only pages search does not answer for yet ('waiting'), or only pages it answers for from their
+   * pre-upgrade index (ACTIVATION_SERVED_REVISION, 'answering').
+   */
+  served?: 'waiting' | 'answering';
 }
 
 /** A queue row's position in the walk order (updated_at as text, so microseconds survive). */
@@ -754,7 +739,9 @@ export async function previewProjectionDrain(engine: Pick<BrainEngine, 'executeR
   const backlog = await projectionBacklog(engine);
   const rows = await engine.executeRaw<{ source_id: string; slug: string; page_kind: string; reason: string; updated_at: string }>(`SELECT s.id AS source_id,j.slug,p.page_kind,j.reason,j.updated_at::text AS updated_at
     FROM page_projection_jobs j ${projectionJobProbes({ media: true })}
-    ORDER BY j.updated_at,j.source_incarnation,j.slug LIMIT $1`, [Math.max(1, limit)]);
+    ORDER BY CASE WHEN p.page_kind NOT IN ('markdown','code') THEN 1
+      WHEN EXISTS (SELECT 1 FROM pages q WHERE q.source_id=s.id AND q.slug=j.slug AND q.text_projection_revision='${ACTIVATION_SERVED_REVISION}'::uuid) THEN 2
+      ELSE 0 END,j.updated_at,j.source_incarnation,j.slug LIMIT $1`, [Math.max(1, limit)]);
   return { ...backlog, rows };
 }
 
@@ -786,7 +773,13 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
     params.push(after.updated_at, after.source_incarnation, after.slug);
     filters.push(`(j.updated_at,j.source_incarnation,j.slug)>($${params.length - 2}::text::timestamptz,$${params.length - 1}::uuid,$${params.length})`);
   }
-  const sourceFilter = opts.pages ? `WHERE s.id=$${params.push(opts.pages.sourceId)}` : '';
+  const outer: string[] = [];
+  if (opts.pages) outer.push(`s.id=$${params.push(opts.pages.sourceId)}`);
+  if (opts.served) {
+    outer.push(`${opts.served === 'waiting' ? 'NOT ' : ''}EXISTS (SELECT 1 FROM pages q WHERE q.source_id=s.id AND q.slug=j.slug
+      AND q.text_projection_revision='${ACTIVATION_SERVED_REVISION}'::uuid)`);
+  }
+  const sourceFilter = outer.length ? `WHERE ${outer.join(' AND ')}` : '';
   const selected = opts.window ? await selectWindowJobs(engine, opts.window, opts.retryCooldown === true) : null;
   const jobs = selected ? selected.jobs.slice(0, Number(params[0])) : await engine.executeRaw<QueuedJob>(`SELECT s.id AS source_id,j.source_incarnation,j.slug,j.revision,p.page_kind,j.updated_at::text AS updated_at
     FROM (SELECT source_incarnation,slug,revision,updated_at FROM page_projection_jobs j
@@ -797,9 +790,14 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
   let rebuilt = 0;
   let superseded = 0;
   let attempted = 0;
-  for (const [index, job] of jobs.entries()) {
-    if (opts.deadlineMs !== undefined && index > 0 && now() - startedAt >= opts.deadlineMs) break;
-    attempted = index + 1;
+  const width = engine.kind === 'postgres' ? Math.max(1, Math.min(Math.floor(opts.concurrency ?? 1), jobs.length)) : 1;
+  let active = width;
+  let lost = 0;
+  let next = 0;
+  const retry: number[] = [];
+  // false: a refused or dropped connection handed this page back and this worker stops.
+  const runJob = async (index: number): Promise<boolean> => {
+    const job = jobs[index]!;
     const observed = [job.source_incarnation, job.slug, job.revision];
     try {
       const prepared = await engine.transaction(async tx => {
@@ -824,8 +822,8 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
           WHERE source_incarnation=$1::uuid AND slug=$2 AND revision=$3::uuid`, [...observed, snapshot.revision]);
         return read;
       });
-      if (!prepared) { superseded++; continue; }
-      if (prepared === 'removed') { superseded++; opts.onHeal?.({ kind: 'removed', source_id: job.source_id, slug: job.slug }); continue; }
+      if (!prepared) { superseded++; return true; }
+      if (prepared === 'removed') { superseded++; opts.onHeal?.({ kind: 'removed', source_id: job.source_id, slug: job.slug }); return true; }
       if (prepared === 'deferred') {
         // #7172: a publication left this revision's chunk replacement; it finishes in bounded steps, within the deadline.
         const step = await continueDeferredProjection(engine, job.source_id, job.slug,
@@ -838,7 +836,7 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
           await engine.executeRaw(`UPDATE page_projection_jobs SET updated_at=now()${step === 'skipped' ? ",reason='canonical_change'" : ''}
             WHERE source_incarnation=$1::uuid AND slug=$2 AND revision=$3::uuid`, observed);
         }
-        continue;
+        return true;
       }
       if (prepared === 'segmented') {
         const built = await buildSegmentedProjection(engine, { sourceId: job.source_id, slug: job.slug });
@@ -848,28 +846,45 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
             AND NOT ${SEGMENTED_PROJECTION_CLAIMED_SQL}`, observed);
         if (built.sealed) rebuilt++;
         else superseded++;
-        continue;
+        return true;
       }
       const projection = await preparePageProjection(prepared);
       await installPageProjection(engine, prepared, projection.chunks, { seal: true, preserveEmbeddings: true, code: projection.code });
       rebuilt++;
     } catch (error) {
+      if (active > 1 && isRetryableConnError(error)) {
+        active--;
+        lost++;
+        retry.push(index);
+        opts.onNarrow?.(width - lost, error);
+        return false;
+      }
       if (!(error instanceof PageRevisionConflictError)) {
         await engine.executeRaw(`UPDATE page_projection_jobs j SET reason='rebuild_failed',updated_at=now()
           WHERE j.source_incarnation=$1::uuid AND j.slug=$2 AND j.revision=$3::uuid AND NOT ${SEGMENTED_PROJECTION_CLAIMED_SQL}`, observed);
         if (opts.onFailure) opts.onFailure({ source_id: job.source_id, slug: job.slug, reason: (error instanceof Error ? error.message : String(error)).split('\n')[0].slice(0, 300) });
         else process.stderr.write('[gbrain] Projection rebuild failed; work remains queued. Inspect projection readiness and the recorded source path.\n');
-        continue;
+        return true;
       }
       // The page moved under its install: defer the exact row this call listed
       // (a newer trigger-queued row already carries its own stamp) and report it.
       const deferred = await engine.executeRaw(`UPDATE page_projection_jobs SET updated_at=now()
         WHERE source_incarnation=$1::uuid AND slug=$2 AND revision=$3::uuid RETURNING slug`, observed);
-      if (!deferred.length) { superseded++; continue; }
+      if (!deferred.length) { superseded++; return true; }
       opts.onHeal?.({ kind: 'deferred', source_id: job.source_id, slug: job.slug });
       opts.onFailure?.({ source_id: job.source_id, slug: job.slug, reason: `revision_conflict: ${error.message.split('\n')[0].slice(0, 280)}` });
     }
-  }
+    return true;
+  };
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = retry.length ? retry.shift()! : next < jobs.length ? next++ : -1;
+      if (index < 0 || (opts.deadlineMs !== undefined && index > 0 && now() - startedAt >= opts.deadlineMs)) { active--; return; }
+      attempted = Math.max(attempted, index + 1);
+      if (!(await runJob(index))) return;
+    }
+  };
+  await Promise.all(Array.from({ length: width }, worker));
   if (selected && opts.window) {
     // The window is finished up to its first eligible row this call did not reach.
     const unreached = selected.jobs.slice(attempted).find(job => job.ord > 0);
@@ -923,7 +938,8 @@ export interface ProjectionDrainResult {
  * after v153's activation) each of those statements scans pages, so 2,000
  * notes beside 93K queued images rebuilt at 14 pages/s instead of 150.
  */
-export async function drainProjections(engine: BrainEngine, opts: { limit?: number; progress?: ProgressReporter; reasons?: readonly string[]; media?: boolean } = {}): Promise<ProjectionDrainResult> {
+export async function drainProjections(engine: BrainEngine, opts: { limit?: number; progress?: ProgressReporter; reasons?: readonly string[]; media?: boolean;
+  concurrency?: number; onNarrow?: (concurrency: number, error: unknown) => void } = {}): Promise<ProjectionDrainResult> {
   const [{ runStart }] = await engine.executeRaw<{ runStart: string }>('SELECT now()::text AS "runStart"');
   // PGLite's clock can be coarse: wait until it passes the run start, so a page
   // that fails in this run is stamped after it and is not tried again.
@@ -941,7 +957,29 @@ export async function drainProjections(engine: BrainEngine, opts: { limit?: numb
   let superseded = 0;
   let tried = 0;
   let seal = { sealed: 0, sealed_with_visual: 0, sealed_text_only: 0 };
-  const walk: { after?: QueueKey } = {};
+  let concurrency = Math.max(1, Math.floor(opts.concurrency ?? 1));
+  const onNarrow = (width: number, error: unknown) => { concurrency = width; opts.onNarrow?.(width, error); };
+  // Continue while a batch rebuilt, removed, failed or durably deferred a
+  // row; stop on a no-op batch. A bare `superseded` row (another worker
+  // consumed it) is not progress, so one row can never spin the drain.
+  const rebuildInline = async (served: 'waiting' | 'answering') => {
+    const walk: { after?: QueueKey } = {};
+    while (opts.limit === undefined || tried < opts.limit) {
+      let healed = 0;
+      let failedNow = 0;
+      const batch = await rebuildPendingPageProjections(engine, Math.min(DRAIN_BATCH, (opts.limit ?? Infinity) - tried),
+        { notAfter: runStart, reasons: opts.reasons, media: opts.media, walk, served, concurrency, onNarrow, onHeal: () => { healed++; },
+          onFailure: failure => { failed.push(failure); if (!failure.reason.startsWith('revision_conflict:')) failedNow++; } });
+      rebuilt += batch.rebuilt;
+      superseded += batch.superseded;
+      const progressed = batch.rebuilt + healed + failedNow;
+      projectionDrainWork.batches++;
+      projectionDrainWork.inline_pages += progressed;
+      if (progressed === 0) break;
+      tried += progressed;
+      opts.progress?.tick(progressed, `${rebuilt} rebuilt, ${failed.length} failed`);
+    }
+  };
   try {
     // Wave B: pages stored in segments first, through their own route, each queued row listed once per run. A row
     // another process's live claim holds is not listed; one that row's build leaves unsealed stays queued.
@@ -958,24 +996,9 @@ export async function drainProjections(engine: BrainEngine, opts: { limit?: numb
       tried += batch.listed.length;
       opts.progress?.tick(batch.listed.length, `${rebuilt} rebuilt, ${failed.length} failed`);
     }
-    // Continue while a batch rebuilt, removed, failed or durably deferred a
-    // row; stop on a no-op batch. A bare `superseded` row (another worker
-    // consumed it) is not progress, so one row can never spin the drain.
-    while (opts.limit === undefined || tried < opts.limit) {
-      let healed = 0;
-      let failedNow = 0;
-      const batch = await rebuildPendingPageProjections(engine, Math.min(DRAIN_BATCH, (opts.limit ?? Infinity) - tried),
-        { notAfter: runStart, reasons: opts.reasons, media: opts.media, walk, onHeal: () => { healed++; },
-          onFailure: failure => { failed.push(failure); if (!failure.reason.startsWith('revision_conflict:')) failedNow++; } });
-      rebuilt += batch.rebuilt;
-      superseded += batch.superseded;
-      const progressed = batch.rebuilt + healed + failedNow;
-      projectionDrainWork.batches++;
-      projectionDrainWork.inline_pages += progressed;
-      if (progressed === 0) break;
-      tried += progressed;
-      opts.progress?.tick(progressed, `${rebuilt} rebuilt, ${failed.length} failed`);
-    }
+    // #9192: pages search does not answer for yet come first, then sealable images, then pages it answers for
+    // from their pre-upgrade index.
+    await rebuildInline('waiting');
     if (opts.media && (opts.limit === undefined || tried < opts.limit)) {
       const { sealImageProjections } = await import('./image-seal.ts');
       seal = await sealImageProjections(engine, { limit: opts.limit === undefined ? undefined : opts.limit - tried, notAfter: runStart });
@@ -984,6 +1007,7 @@ export async function drainProjections(engine: BrainEngine, opts: { limit?: numb
       await noteProjectionRebuilds(engine, seal.sealed, async () => !(await engine.executeRaw(`SELECT 1 FROM page_projection_jobs j ${probes}
         WHERE j.reason<>'rebuild_failed' LIMIT 1`)).length);
     }
+    await rebuildInline('answering');
   } finally {
     opts.progress?.finish();
   }

@@ -59,6 +59,8 @@ on:
       - TLA+ specs
       - Stable daily
       - Upgrade matrix
+      - Rust engine
+      - Eval gates pin
     types: [completed]
     branches: [master]
   workflow_dispatch:

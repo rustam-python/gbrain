@@ -98,6 +98,31 @@ describe('per-turn rule: Claude Code and Codex user-prompt hook', () => {
   });
 });
 
+describe('per-turn rule: turns no person typed (#9163)', () => {
+  async function prompt(text: string, extra: Record<string, string | undefined> = {}): Promise<string> {
+    let out = '';
+    await withEnv(env(home([{ harness: 'claude-code', status: 'installed' }]), extra), async () => {
+      await runHook(['user-prompt'], { stdin: JSON.stringify({ prompt: text, session_id: 's1' }), write: (s) => { out += s; },
+        configOverride: null, disablePushBanner: true, disableTelemetry: true });
+    });
+    return out;
+  }
+  const NOTIFICATION = '<task-notification>\n<task-id>t1</task-id>\n<status>completed</status>\n</task-notification>';
+  const TEAMMATE = '<teammate-message teammate_id="lead">rebase on main</teammate-message>';
+
+  test('a task notification or teammate message gets no rule; a typed turn keeps it', async () => {
+    expect(await prompt(NOTIFICATION)).toBe('');
+    expect(await prompt(TEAMMATE)).toBe('');
+    expect(await prompt('what did alice-example decide about the launch?')).toContain('check GBrain first');
+  });
+
+  test('the turn-rule lane skips them too', async () => {
+    const lane = { GBRAIN_HOOK_LANE: 'turn-rule' };
+    expect(await prompt(NOTIFICATION, lane)).toBe('');
+    expect(await prompt('what did alice-example decide about the launch?', lane)).toContain('check GBrain first');
+  });
+});
+
 describe('per-turn rule names the tools where tool_search hides them', () => {
   test('OpenClaw: names the gbrain tools and the tool_search / tool_call route; Hermes: names mcp__<server>__<tool>', () => {
     const starter = { kind: 'mcp', server: 'gbrain', surface: 'starter' } as const;
@@ -305,6 +330,32 @@ describe('per-turn rule: OpenClaw before_prompt_build plugin', () => {
       expect(Object.keys(handlers)).toEqual(['before_prompt_build']);
       expect(handlers.before_prompt_build()).toEqual({ prependContext: renderBrainFirstTurnRule(access, 'openclaw') });
       expect(syncOpenclawTurnPlugin({ access, dryRun: false, openclawBin: '/bin/openclaw', run: recorder().run }).action).toBe('keep');
+    });
+  });
+
+  test('a re-run with an unchanged plugin OpenClaw already loads, enables and allows runs no openclaw command', async () => {
+    const st = state();
+    await withEnv({ OPENCLAW_STATE_DIR: st, OPENCLAW_PROFILE: undefined, OPENCLAW_CONFIG_PATH: undefined }, async () => {
+      syncOpenclawTurnPlugin({ access, dryRun: false, openclawBin: '/bin/openclaw', run: recorder().run });
+      const dir = openclawTurnPluginDir();
+      writeFileSync(join(st, 'openclaw.json'), JSON.stringify({ plugins: { load: { paths: [dir] }, entries: { [OPENCLAW_TURN_PLUGIN_ID]: { enabled: true, hooks: { allowConversationAccess: true } } } } }));
+      const rec = recorder();
+      const o = syncOpenclawTurnPlugin({ access, dryRun: false, openclawBin: '/bin/openclaw', run: rec.run });
+      expect(o).toMatchObject({ action: 'keep', unchanged: true });
+      expect(rec.calls).toEqual([]);
+      writeFileSync(join(st, 'openclaw.json'), JSON.stringify({ plugins: { load: { paths: [dir] }, entries: { [OPENCLAW_TURN_PLUGIN_ID]: { enabled: false, hooks: { allowConversationAccess: true } } } } }));
+      const off = recorder();
+      expect(syncOpenclawTurnPlugin({ access, dryRun: false, openclawBin: '/bin/openclaw', run: off.run }).unchanged).toBeUndefined();
+      expect(off.calls).toHaveLength(3);
+      const entries = { [OPENCLAW_TURN_PLUGIN_ID]: { enabled: true, hooks: { allowConversationAccess: true } } };
+      for (const policy of [{ allow: ['another-plugin'] }, { deny: [OPENCLAW_TURN_PLUGIN_ID] }, { enabled: false }]) {
+        writeFileSync(join(st, 'openclaw.json'), JSON.stringify({ plugins: { ...policy, load: { paths: [dir] }, entries } }));
+        const blocked = recorder();
+        expect(syncOpenclawTurnPlugin({ access, dryRun: false, openclawBin: '/bin/openclaw', run: blocked.run }).unchanged).toBeUndefined();
+        expect(blocked.calls).toHaveLength(3);
+      }
+      writeFileSync(join(st, 'openclaw.json'), JSON.stringify({ plugins: { allow: [OPENCLAW_TURN_PLUGIN_ID], load: { paths: [dir] }, entries } }));
+      expect(syncOpenclawTurnPlugin({ access, dryRun: false, openclawBin: '/bin/openclaw', run: recorder().run }).unchanged).toBe(true);
     });
   });
 

@@ -9,6 +9,7 @@ import { assertLegacyEngineMigration, assertUnmanagedCanonicalWriter } from '../
  */
 
 import { opError } from '../core/ops/contract.ts';
+import { sqlEngineKind } from '../core/sql-engine-kind.ts';
 import { ItemRun } from '../core/item-failure.ts';
 import { createEngine } from '../core/engine-factory.ts';
 import { loadConfig, saveConfig, toEngineConfig, gbrainPath, effectiveEnvDatabaseUrl, type GBrainConfig } from '../core/config.ts';
@@ -30,6 +31,7 @@ import { listLiveLocks } from '../core/db-lock.ts';
 import { drainProjections, queuePageProjection } from '../core/page-state/projections.ts';
 import { carryChunkMetadata } from '../core/embed-stale.ts';
 import { normalizeAliasList } from '../core/search/alias-normalize.ts';
+import { withReservedConfigWrite } from '../core/config-snapshot.ts';
 
 interface MigrateOpts {
   targetEngine: 'postgres' | 'pglite';
@@ -397,7 +399,8 @@ export const MIGRATE_CONFIG_ENGINE_LOCAL_KEYS: ReadonlySet<string> = new Set([
  * Copy every DB-plane config row except the engine-local denylist above.
  * Subsumes the old 3-key allowlist (embedding_model / embedding_dimensions /
  * chunk_strategy — schema metadata recording what the schema was sized
- * with); those still copy, now alongside everything else.
+ * with); those still copy, now alongside everything else. The reserved agent-policy
+ * rows (an owner approval checks its own digest) copy unchanged too.
  */
 export async function copyMigrationConfig(
   source: BrainEngine,
@@ -407,14 +410,16 @@ export async function copyMigrationConfig(
     'SELECT key, value FROM config ORDER BY key');
   const skipped: string[] = [];
   let copied = 0;
-  for (const row of rows) {
-    if (MIGRATE_CONFIG_ENGINE_LOCAL_KEYS.has(row.key)) {
-      skipped.push(row.key);
-      continue;
+  await withReservedConfigWrite(async () => {
+    for (const row of rows) {
+      if (MIGRATE_CONFIG_ENGINE_LOCAL_KEYS.has(row.key)) {
+        skipped.push(row.key);
+        continue;
+      }
+      await target.setConfig(row.key, row.value);
+      copied++;
     }
-    await target.setConfig(row.key, row.value);
-    copied++;
-  }
+  });
   return { copied, skipped };
 }
 
@@ -910,8 +915,9 @@ function reportLoopRowFailures(tables: Record<string, MigrateSimpleTableResult>,
 
 export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]): Promise<void> {
   const opts = parseArgs(args);
+  const sourceKind = sqlEngineKind(sourceEngine.kind, 'gbrain migrate'); // SQL on both sides: a Rust source refuses before any read.
   await assertWindowsGraduationPlatform(sourceEngine, opts);
-  const migration = { from: sourceEngine.kind, to: opts.targetEngine };
+  const migration = { from: sourceKind, to: opts.targetEngine };
   await assertUnmanagedCanonicalWriter(sourceEngine, 'engine migration', { migration: { side: 'source', ...migration } });
   await assertLegacyEngineMigration(sourceEngine, { side: 'source', ...migration });
   const config = loadConfig();

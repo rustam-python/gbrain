@@ -14,7 +14,7 @@ import { discoverGitRoot } from '../../core/sync-git.ts';
  * consult for the repo-level db_only rules. Best-effort: falls back to the
  * given path when git discovery fails (manageGitignore no-ops on non-repos).
  */
-export function manageGitignoreAtGitRoot(path: string, engineKind?: 'pglite' | 'postgres'): void {
+export function manageGitignoreAtGitRoot(path: string, engineKind?: 'pglite' | 'postgres' | 'rust'): void {
   let root = path;
   try { root = discoverGitRoot(path); } catch { /* best-effort */ }
   try { manageGitignore(root, engineKind); }
@@ -59,7 +59,7 @@ export function __resetPGLiteTierWarn(): void {
 
 export function manageGitignore(
   repoPath: string,
-  engineKind?: 'pglite' | 'postgres',
+  engineKind?: 'pglite' | 'postgres' | 'rust',
 ): void {
   if (process.env.GBRAIN_NO_GITIGNORE === '1') {
     return;
@@ -165,8 +165,10 @@ export function manageGitignore(
   const linesToAdd: string[] = [];
 
   for (const dir of storageConfig.db_only) {
-    if (!existingLines.has(dir) && !existingLines.has(`/${dir}`)) {
-      linesToAdd.push(dir);
+    // #10102: a pattern without an inner slash matches at every depth (`decisions/` also ignores docs/decisions/), so a single-segment dir is anchored to the root.
+    const entry = dir.replace(/\/+$/, '').includes('/') ? dir : `/${dir}`;
+    if (!existingLines.has(dir) && !existingLines.has(`/${dir}`) && !existingLines.has(entry)) {
+      linesToAdd.push(entry);
     }
   }
 

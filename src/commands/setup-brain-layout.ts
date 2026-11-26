@@ -15,7 +15,8 @@
  *   - with --transcripts, a one-shot import of exported call transcripts (.txt, .md) as company/calls/<date>-<title>
  *     pages in the company source (gbrain import --calls: credentials redacted, keyword-only, each file once), and a
  *     line naming who can read them, read from gbrain access who-can-read; the pages carry no readers of their own;
- *   - me/facts and company/facts carry type: facts, and the block tells the agent to quote only their dated lines;
+ *   - me/facts and company/facts carry type: facts and claims: allowed (check_claims reads them), and the block tells
+ *     the agent to quote only their dated lines and to check a draft's numbers with check_claims;
  *   - one line saying what the conversation archive is doing on this brain (on, off or offered), read from doctor;
  *   - a managed layout block beside the brain-first block, telling the agent which pages to read and to quote
  *     facts and numbers only from the facts pages. `--shape none` removes the block and keeps the pages;
@@ -53,7 +54,7 @@ export interface LayoutFlags {
 }
 
 export const IMPORT_INLINE_MAX = 500;
-export const LAYOUT_VERSION = 3;
+export const LAYOUT_VERSION = 4;
 export const LAYOUT_BEGIN = '<!-- gbrain:brain-layout:begin -->';
 export const LAYOUT_END = '<!-- gbrain:brain-layout:end -->';
 export const COMPANY_SOURCE = 'company';
@@ -71,7 +72,7 @@ export const setupArgv = (harness: string, scope: LayoutScope = 'user', source: 
 
 const markers = (harness: string, scope: LayoutScope, source: string | null, shape: BrainShape): BlockMarkers => ({ begin: LAYOUT_BEGIN, end: LAYOUT_END, label: 'brain-layout', rerun: [...setupArgv(harness, scope, source), '--shape', shape === 'none' ? 'personal' : shape].join(' ') });
 
-export interface StarterPage { slug: string; title: string; body: string; type?: string }
+export interface StarterPage { slug: string; title: string; body: string; type?: string; claims?: 'allowed' }
 
 /** The personal starter pages: empty forms with one marked example line each. */
 export const PERSONAL_PAGES: readonly StarterPage[] = [
@@ -79,6 +80,7 @@ export const PERSONAL_PAGES: readonly StarterPage[] = [
     slug: 'me/facts',
     title: 'Facts about me',
     type: 'facts',
+    claims: 'allowed',
     body: 'True things about me that agents may say. One dated line per fact, with where it came from. '
       + 'Never overwrite a line: when something changes, add a new dated line.\n\n'
       + '- Example (delete me): 2026-01-01: I live in example-city. Source: I said so.',
@@ -105,6 +107,7 @@ export const COMPANY_PAGES: readonly StarterPage[] = [
     slug: 'company/facts',
     title: 'Company facts',
     type: 'facts',
+    claims: 'allowed',
     body: 'Numbers and facts agents may quote. One line each, with a date and where it came from. '
       + 'Never overwrite a line: when a number changes, add a new dated line.\n\n'
       + '- Example (delete me): 2026-01-01: 12 paying customers. Source: billing export.',
@@ -143,7 +146,7 @@ export const COMPANY_PAGES: readonly StarterPage[] = [
 ];
 
 export function renderStarterPage(p: StarterPage): string {
-  return `---\ntitle: ${p.title}\n${p.type ? `type: ${p.type}\n` : ''}status: stub\n---\n# ${p.title}\n\n${p.body}\n\n`
+  return `---\ntitle: ${p.title}\n${p.type ? `type: ${p.type}\n` : ''}${p.claims ? `claims: ${p.claims}\n` : ''}status: stub\n---\n# ${p.title}\n\n${p.body}\n\n`
     + '_This page is an empty form (status: stub). It holds no facts until you add your own lines; then remove the stub line from the frontmatter._\n';
 }
 
@@ -164,9 +167,10 @@ export function renderLayoutBlock(harness: string, scope: LayoutScope = 'user', 
     lines.push(`- Before a task that needs the company's context, read company/facts, company/decisions and company/pricing (source ${COMPANY_SOURCE}).`,
       '- Quote company numbers only from company/facts, and name it.',
       '- Add a new decision to company/decisions as a dated entry with why, who and what would make us revisit it.',
-      `- Save company facts and decisions with --source ${COMPANY_SOURCE}; personal ones go to the default source.`);
+      `- Save company facts and decisions with --source ${COMPANY_SOURCE}; personal ones go to the default source.`,
+      '- Save a decision the whole team should know into company/ with its readers named (readable_by: [<member>, ...] in its frontmatter); a company/ page without readable_by is readable by everyone who can read the company source.');
   }
-  lines.push('- A page with type: facts holds one dated line per fact: quote only its dated lines, and add a new fact as a new dated line.',
+  lines.push('- A page with type: facts holds one dated line per fact: quote only its dated lines, check a draft\'s numbers against them with check_claims (gbrain claims check) before stating them, and add a new fact as a new dated line.',
     '- Never overwrite a page: add a new dated line. Save facts I tell you with remember, naming where they came from.',
     '- A page whose frontmatter says status: stub is an empty form: it holds no facts yet.');
   return lines.join('\n');
@@ -257,6 +261,10 @@ export interface TranscriptsOutcome extends ImportOutcome {
   readers?: { members: 'every_source_reader' | string[] | null; serves: 'one' | 'several' | null; detail: string };
   /** What can send call text off this machine, from doctor's auto_chronicle and extract_atoms_backlog checks. */
   egress?: { leaves: boolean | null; detail: string };
+  /** GST-2904: each call the import kept to the owner and its attendees, with the names it could not match. */
+  calls?: Array<{ slug: string; readers: string[]; unmatched: string[] }>;
+  /** GST-2904: why the import kept new calls open to the source's readers (the calls_not_scoped notice), and its fix. */
+  not_scoped?: { reason: string; why: string; command: string | null };
 }
 
 export interface LayoutOutcome {
@@ -311,10 +319,17 @@ function writePages(exec: Run, launcher: string, pages: readonly StarterPage[], 
   });
 }
 
+/** Why a requested import folder cannot be read (the import would find nothing in it), or null. */
+function unreadableFolder(dir: string): string | null {
+  try { readdirSync(dir); return null; } catch (e) { return `cannot read ${dir}: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`; }
+}
+
 /** One read-only import of `dir` into `source`, deferred to the agent above IMPORT_INLINE_MAX; returns the first file's title to search for. */
 function importFolder(exec: Run, launcher: string, dir: string, source: string | null, dryRun: boolean): { outcome: ImportOutcome; title: string | null } {
-  const { count, first } = countNotes(dir);
   const argv = ['gbrain', 'import', dir, '--no-embed', ...(source ? ['--source', source] : [])];
+  const unreadable = unreadableFolder(dir);
+  if (unreadable) return { outcome: { dir, files: 0, action: 'failed', argv, detail: unreadable }, title: null };
+  const { count, first } = countNotes(dir);
   if (count > IMPORT_INLINE_MAX) return { outcome: { dir, files: count, action: 'deferred', argv, detail: `more than ${IMPORT_INLINE_MAX} markdown files; run the import as its own step` }, title: null };
   if (dryRun) return { outcome: { dir, files: count, action: 'imported', argv, detail: 'would import (read only)' }, title: null };
   const imp = exec([launcher, 'import', dir, '--no-embed', '--json'], undefined, source);
@@ -323,6 +338,12 @@ function importFolder(exec: Run, launcher: string, dir: string, source: string |
 }
 
 /** Who can read the call pages, from gbrain access who-can-read on one of them and gbrain access serves; read only. */
+const servesSeveralClause = (enabled: string[]): string => `this brain serves several people: ${enabled.join(', ') || 'none enabled'}`;
+
+/** GBRA-585 A: the call readers once this run's regrant gave the member keys setup minted the company source. */
+export const mintedKeysReadCalls = (enabled: string[]): string =>
+  `every member key gbrain setup minted, and other keys only when their grant names source ${COMPANY_SOURCE} or it is in default search (${servesSeveralClause(enabled)})`;
+
 function readersOf(exec: Run, launcher: string, slug: string): NonNullable<TranscriptsOutcome['readers']> {
   const unknown = { members: null, serves: null, detail: `unknown; run gbrain access who-can-read ${slug} --source ${COMPANY_SOURCE}` };
   let page: { readers: string[] | null; members: 'every_source_reader' | string[] } | undefined;
@@ -330,30 +351,42 @@ function readersOf(exec: Run, launcher: string, slug: string): NonNullable<Trans
   try { page = (JSON.parse(exec([launcher, 'access', 'who-can-read', slug, '--source', COMPANY_SOURCE, '--json'], undefined, null).stdout) as { pages?: Array<NonNullable<typeof page>> }).pages?.[0]; } catch { return unknown; }
   try { serves = JSON.parse(exec([launcher, 'access', 'serves', '--json', '--no-open-pages'], undefined, null).stdout) as typeof serves; } catch { /* the serves clause is left out */ }
   if (!page) return unknown;
-  const who = serves.serves === 'several' ? `this brain serves several people: ${(serves.enabled_members ?? []).join(', ') || 'none enabled'}`
-    : serves.serves === 'one' ? 'this brain serves one person' : null;
+  const several = serves.serves === 'several';
+  const who = several ? servesSeveralClause(serves.enabled_members ?? []) : serves.serves === 'one' ? 'this brain serves one person' : null;
   const members = page.members;
   const clauses = [...(members === 'every_source_reader' ? [] : [`access rules on source ${COMPANY_SOURCE} cover ${CALLS_PREFIX}/`]), ...(who ? [who] : [])];
+  if (members === 'every_source_reader' && several) {
+    return { members, serves: 'several', detail: `no member key setup minted reads them yet: source ${COMPANY_SOURCE} is not federated and is not on those keys' source lists. `
+      + `Run gbrain setup again with --serves several to give them ${COMPANY_SOURCE}, or gbrain sources federate ${COMPANY_SOURCE} for keys with no source list; either way every member then reads every page in it, every call included; `
+      + `${CALLS_PREFIX}/ pages carry no readers of their own (gbrain access who-can-read ${slug} --source ${COMPANY_SOURCE}) (${who})` };
+  }
   const detail = `${members === 'every_source_reader' ? `everyone who can read source ${COMPANY_SOURCE}` : `${members.join(', ') || 'no member'} only`}${clauses.length ? ` (${clauses.join('; ')})` : ''}`;
   return { members, serves: serves.serves ?? null, detail };
 }
 
 /** One read-only import of a call-transcript folder into the company source, deferred to the agent above IMPORT_INLINE_MAX files. */
 function importCalls(exec: Run, launcher: string, dir: string, dryRun: boolean): TranscriptsOutcome {
-  const { count } = countNotes(dir, IMPORT_INLINE_MAX, CALL_FILES);
   const args = ['import', dir, '--calls', '--prefix', CALLS_PREFIX, '--no-embed'];
   const argv = ['gbrain', ...args, '--source', COMPANY_SOURCE];
+  const unreadable = unreadableFolder(dir);
+  if (unreadable) return { dir, files: 0, action: 'failed', argv, detail: unreadable };
+  const { count } = countNotes(dir, IMPORT_INLINE_MAX, CALL_FILES);
   if (count > IMPORT_INLINE_MAX) return { dir, files: count, action: 'deferred', argv, detail: `more than ${IMPORT_INLINE_MAX} call files; run the import as its own step` };
   if (dryRun) return { dir, files: count, action: 'imported', argv, detail: 'would import (read only)' };
   const imp = exec([launcher, ...args, '--json'], undefined, COMPANY_SOURCE);
-  let doc: { imported?: number; unchanged?: number; kept?: number; errors?: number; redactions?: number; pages?: Array<{ slug: string; status: string; error?: string }> };
+  let doc: { imported?: number; unchanged?: number; kept?: number; errors?: number; redactions?: number; notices?: Array<{ code: string; why: string; fix?: { argv?: string[] } }>;
+    pages?: Array<{ slug: string; status: string; error?: string; scoped?: boolean; reason?: string; readers?: string[] | null; unmatched?: string[] }> };
   try { doc = JSON.parse(imp.stdout) as typeof doc; } catch { return { dir, files: count, action: 'failed', argv, detail: lastLine(imp.stderr || imp.stdout) }; }
   const landed = (doc.pages ?? []).filter(p => p.status !== 'error');
   const failed = (doc.pages ?? []).find(p => p.status === 'error');
   const counts = { imported: doc.imported ?? 0, unchanged: doc.unchanged ?? 0, kept: doc.kept ?? 0, redactions: doc.redactions ?? 0 };
   if (!landed.length && (failed || imp.code !== 0)) return { dir, files: count, action: 'failed', argv, ...counts, detail: failed?.error ?? lastLine(imp.stderr) };
+  const calls = landed.filter(p => p.scoped && p.readers?.length).map(p => ({ slug: p.slug, readers: p.readers!, unmatched: p.unmatched ?? [] }));
+  const open = doc.notices?.find(n => n.code === 'calls_not_scoped');
+  const reason = landed.find(p => p.scoped === false && p.reason)?.reason;
   return { dir, files: count, action: 'imported', argv, ...counts, ...(failed ? { detail: `${doc.errors} file(s) not imported: ${failed.error}` } : {}),
-    ...(landed[0] ? { readers: readersOf(exec, launcher, landed[0].slug) } : {}) };
+    ...(calls.length ? { calls } : landed[0] ? { readers: readersOf(exec, launcher, landed[0].slug) } : {}),
+    ...(open ? { not_scoped: { reason: reason ?? 'unknown', why: open.why, command: open.fix?.argv?.length ? open.fix.argv.join(' ') : null } } : {}) };
 }
 
 type DoctorChecks = Array<{ name: string; details?: Record<string, unknown> }>;
@@ -382,8 +415,9 @@ function archiveState(exec: Run, launcher: string, calls: TranscriptsOutcome | n
   let checks: DoctorChecks = [];
   try { checks = (JSON.parse(out.stdout) as { checks?: DoctorChecks }).checks ?? []; } catch { /* unknown below */ }
   if (calls) calls.egress = callEgress(checks);
-  const details = checks.find(c => c.name === 'transcript_archive_freshness')?.details as { enabled?: boolean; offered?: boolean } | undefined;
+  const details = checks.find(c => c.name === 'transcript_archive_freshness')?.details as { enabled?: boolean; offered?: boolean; serves_several?: boolean; reason?: string } | undefined;
   if (!details) return { state: 'unknown', detail: 'could not be read; gbrain transcripts archive status shows it' };
+  if (details.enabled && details.serves_several && details.reason) return { state: 'on', detail: `${details.reason}. Your agent conversations are kept, redacted, under conversations/; call transcripts are separate (gbrain transcripts archive off turns it off)` };
   if (details.enabled) return { state: 'on', detail: 'on: your agent conversations are kept, redacted, under conversations/; call transcripts are separate (gbrain transcripts archive off turns it off)' };
   if (details.offered) return { state: 'offered', detail: 'offered, not on: this brain may serve more than one person (gbrain transcripts archive on turns it on)' };
   return { state: 'off', detail: 'off (gbrain transcripts archive on turns it on)' };
@@ -458,6 +492,11 @@ export function applyBrainLayout(opts: { harness: string; scope?: LayoutScope; s
     } else {
       const company = outcome.company = ensureCompanySource(exec, launcher, flags.dryRun);
       if (company.action === 'failed' && !opts.instructionsDeclined) outcome.block = syncLayoutBlock(opts.instructionsPath, harness, scope, source, blockShape(flags.brain, true), flags.dryRun);
+      if (company.action === 'failed') {
+        const detail = `not run: the ${COMPANY_SOURCE} source could not be set up (${company.detail ?? 'unknown error'})`;
+        if (flags.docs) outcome.docs = { dir: flags.docs, files: 0, action: 'failed', argv: ['gbrain', 'import', flags.docs, '--no-embed', '--source', COMPANY_SOURCE], detail };
+        if (flags.transcripts) outcome.transcripts = { dir: flags.transcripts, files: 0, action: 'failed', argv: ['gbrain', 'import', flags.transcripts, '--calls', '--prefix', CALLS_PREFIX, '--no-embed', '--source', COMPANY_SOURCE], detail };
+      }
       if (company.action !== 'failed') {
         outcome.pages.push(...writePages(exec, launcher, COMPANY_PAGES, COMPANY_SOURCE, flags.dryRun));
         if (flags.docs) {
@@ -520,6 +559,14 @@ export function describeLayout(o: LayoutOutcome, dryRun: boolean): string[] {
     lines.push(t.action !== 'imported' ? `  calls    ${t.action}: ${t.detail ?? ''} (${t.argv.join(' ')})`
       : `  calls    ${would}import ${t.files} call file(s) from ${t.dir} as ${CALLS_PREFIX}/<date>-<title> (read only, credentials redacted)`
         + (t.imported === undefined ? '' : `: ${t.imported} new, ${t.unchanged} unchanged, ${t.kept} kept, ${t.redactions} credential(s) redacted${t.detail ? `; ${t.detail}` : ''}`));
+    if (t.calls) {
+      lines.push('           each kept to the people on it (the owner reads every call):');
+      for (const c of t.calls) {
+        lines.push(`             ${c.slug}  ${c.readers.join(', ')}${c.readers.length === 1 && !c.unmatched.length ? ' (no other attendee matched a member)' : ''}`);
+        if (c.unmatched.length) lines.push(`                 not matched: ${c.unmatched.map(u => JSON.stringify(u)).join(', ')}. To add a reader: gbrain repair visibility --source ${COMPANY_SOURCE} --slug ${c.slug} --readers ${c.readers.join(',')},<member>`);
+      }
+    }
+    if (t.not_scoped) lines.push(`           calls kept open, as before: ${t.not_scoped.why}${t.not_scoped.command ? ` Run: ${t.not_scoped.command}` : ''}`);
     if (t.readers) lines.push(`           readable by: ${t.readers.detail}`);
     if (t.egress) lines.push(`           what leaves this machine: ${t.egress.detail}`);
   }

@@ -208,7 +208,7 @@
             "details": {
               "audience": "personal",
               "audience_reasons": [
-                "no shared declaration; 0 non-automation client(s) active in 30d"
+                "no shared declaration; 0 non-automation client(s) active in 30d, 0 people (0 member(s), 0 unbound client(s))"
               ],
               "backstop_visibility": "private",
               "capture_lanes": {
@@ -495,6 +495,15 @@
           {
             "category": "ops",
             "elapsed_ms": "<volatile>",
+            "message": "Not applicable: Rust engine shadow mode is off for this brain.",
+            "name": "rust_engine_addon",
+            "readiness_state": "not_applicable",
+            "severity": "info",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "elapsed_ms": "<volatile>",
             "message": "Connected, 20 pages",
             "name": "connection",
             "status": "ok"
@@ -523,7 +532,7 @@
                 "explicit_retention_days": null,
                 "over_target": false,
                 "target_bytes": 8589934592,
-                "used_bytes": 200716
+                "used_bytes": 203628
               },
               "inspected": 2,
               "outstanding": [],
@@ -533,7 +542,7 @@
               "verify": "gbrain doctor --only persistence_capacity --json"
             },
             "elapsed_ms": "<volatile>",
-            "message": "No cumulative write cap is set (the default), so receipt storage never refuses or pauses a write; it holds 200716 reserved bytes, and receipts not yet compacted are under the housekeeping target of 8589934592.",
+            "message": "No cumulative write cap is set (the default), so receipt storage never refuses or pauses a write; it holds 203628 reserved bytes, and receipts not yet compacted are under the housekeeping target of 8589934592.",
             "name": "persistence_capacity",
             "status": "ok"
           },
@@ -1374,6 +1383,34 @@
           {
             "category": "brain",
             "elapsed_ms": "<volatile>",
+            "message": "Not applicable: this brain has no members (gbrain access member add <id>).",
+            "name": "access_pages_read_by_nobody",
+            "readiness_state": "not_applicable",
+            "severity": "info",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
+            "message": "Not applicable: this brain serves one person, so no source has to be shared with members.",
+            "name": "access_shared_source_unread",
+            "readiness_state": "not_applicable",
+            "severity": "info",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "count": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No live token or OAuth client is bound to a disabled or removed member.",
+            "name": "access_disabled_member_credentials",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
             "message": "Not applicable: no attest credential reads named sources as the person (--attest-read person).",
             "name": "attest_read_shared_scope",
             "readiness_state": "not_applicable",
@@ -1392,7 +1429,7 @@
           {
             "category": "ops",
             "elapsed_ms": "<volatile>",
-            "message": "RLS enabled on 185/185 public tables",
+            "message": "RLS enabled on 196/196 public tables",
             "name": "rls",
             "status": "ok"
           },
@@ -1413,6 +1450,23 @@
           {
             "category": "ops",
             "elapsed_ms": "<volatile>",
+            "message": "Every purge and withdrawal guard refuses a write role that row-level security keeps from its ledger",
+            "name": "guard_ledger_checks",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
+              "closed": false
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "Every owner-only delete trigger exists, so rows derived from a removed owner-only source stay owner-only",
+            "name": "owner_only_marks_triggers",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "elapsed_ms": "<volatile>",
             "message": "The database encoding is UTF8",
             "name": "database_encoding",
             "status": "ok"
@@ -1427,14 +1481,14 @@
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "1399 column(s) verified against live schema",
+            "message": "1422 column(s) verified against live schema",
             "name": "schema_columns",
             "status": "ok"
           },
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "All 185 table(s) the applied migrations create exist.",
+            "message": "All 196 table(s) the applied migrations create exist.",
             "name": "schema_missing_tables",
             "status": "ok"
           },
@@ -2856,6 +2910,7 @@
               "behind": [],
               "docs": "docs/guides/conversation-archive.md#doctor",
               "enabled": true,
+              "enabled_by": "default",
               "harnesses": [
                 {
                   "harness": "claude-code",
@@ -2901,6 +2956,7 @@
                 }
               ],
               "held": [],
+              "reason": "on by default on a personal brain",
               "source_id": "conversations",
               "stale_days": 2
             },
@@ -3157,40 +3213,35 @@
             },
             "elapsed_ms": "<volatile>",
             "fix": {
-              "actor": "agent",
+              "actor": "host_admin",
               "argv": [
-                "gbrain",
-                "export",
-                "--source",
-                "default",
-                "--dir",
-                "<BACKUP_DIR>/default",
-                "--brain",
-                "host"
+                "pg_dump",
+                "--format",
+                "custom",
+                "--file",
+                "<DUMP_FILE>",
+                "--dbname",
+                "<DATABASE_URL>"
               ],
-              "command": "gbrain export --source default --dir '<BACKUP_DIR>/default' --brain host",
-              "consent": [],
-              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/operations/backup-check.md",
+              "command": "pg_dump --format custom --file '<DUMP_FILE>' --dbname '<DATABASE_URL>'",
+              "consent": [
+                "credentials"
+              ],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/memory-boundaries.md#full-backup",
               "inputs": [
                 {
-                  "how": "Ask the user where backups should live (a directory outside the brain, ideally synced or on another disk).",
-                  "name": "BACKUP_DIR"
+                  "how": "A new file outside the brain, in a directory only the user can read.",
+                  "name": "DUMP_FILE"
+                },
+                {
+                  "how": "The brain's Postgres connection, preferably service=<name> from a pg_service file so no password lands in the command line.",
+                  "name": "DATABASE_URL"
                 }
               ],
-              "next": "run",
+              "next": "tell_user_to_run",
               "requires_exclusive": false,
-              "verify": {
-                "argv": [
-                  "gbrain",
-                  "doctor",
-                  "--only",
-                  "backup_coverage",
-                  "--json",
-                  "--brain",
-                  "host"
-                ]
-              },
-              "why": "Writes a Markdown copy of 'default' (pages and facts) to a directory outside the brain so it survives losing the database."
+              "user_message": "This brain lives in Postgres, so back it up with a database dump of its database: `pg_dump --format custom --file <DUMP_FILE> --dbname <DATABASE_URL>`, kept private (it holds every page, fact, member and token); `pg_restore --list <DUMP_FILE>` reads it back. Restore it into a new, empty database with `pg_restore --no-owner --dbname <NEW_DATABASE_URL> <DUMP_FILE>`, then run `gbrain init --url <NEW_DATABASE_URL>` under a separate GBRAIN_HOME, which opens the restored brain. `gbrain export` is not a backup: an import of it puts every page in one source and keeps no members, tokens or facts.",
+              "why": "A database dump keeps every source, page, fact, member, token and folder rule of a Postgres brain; a Markdown export keeps pages only."
             },
             "message": "Not urgent yet: the brain holds 23 page(s)+fact(s) and is under 7 days old (backup coaching starts at 25 items or 7 days). 3 knowledge asset(s) lack verified recovery: default (not_a_git_repo), plain (not_a_git_repo), notes (no git remote). A source repo with a pushed git remote restores its Markdown files only, never DB-only pages, facts, config or credentials. Run `gbrain backup status` for each asset's fix command.",
             "name": "backup_coverage",
@@ -3442,8 +3493,44 @@
           {
             "category": "brain",
             "elapsed_ms": "<volatile>",
+            "message": "The nightly cycle has not recorded anything it learned yet.",
+            "name": "learning_note",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "delivered_sessions": 0,
+              "last_session": null,
+              "max_sessions": 3,
+              "reason": "not_new_install",
+              "state": "off",
+              "window_ends_at": null
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "The first-session suggestion is off: this brain was not created by a gbrain setup run (an upgrade, a restored or imported brain, or an older install), so there is no first session to suggest for. Details: gbrain onboarding status.",
+            "name": "first_session_suggestion",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
             "message": "No memory proposals await the owner.",
             "name": "memory_proposals_pending",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
+            "message": "No agent policy is set; policy_check answers none (gbrain policy init sets one).",
+            "name": "policy_valid",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
+            "message": "No confirmed standing rules to check (gbrain correct saves one).",
+            "name": "rules_regression",
             "status": "ok"
           },
           {
@@ -3975,6 +4062,36 @@
           {
             "category": "brain",
             "details": {
+              "items": [],
+              "total": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "Every held write is tied to one page, or waits for its page to be created.",
+            "name": "write_gate_hold_ambiguous",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "by_source": {},
+              "complete": true,
+              "items": [],
+              "items_truncated": false,
+              "row_budget": 5000,
+              "scanned": 0,
+              "stranded": {
+                "no_page": 0,
+                "page_deleted": 0
+              }
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No held write is without a live page (0 held write(s) read).",
+            "name": "write_gate_holds_stranded",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
               "bad_config": [],
               "chars_limit": 4000,
               "chars_used": 0,
@@ -4189,6 +4306,19 @@
           {
             "category": "brain",
             "details": {
+              "by_source": [],
+              "count": 0,
+              "docs": "docs/guides/repair.md#slug-spelling",
+              "truncated": false
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No page is stored under an older spelling of its name.",
+            "name": "legacy_slug_spellings",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
               "parked": 0
             },
             "elapsed_ms": "<volatile>",
@@ -4205,6 +4335,18 @@
             "elapsed_ms": "<volatile>",
             "message": "No soft-deleted page is kept from the purge to keep a page derived from it private.",
             "name": "derived_origin_parked",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "missing": 0,
+              "path": "<home>/.gbrain/purge-events.jsonl",
+              "recent": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No purge in the last 30 days to check against the purge mirror at <home>/.gbrain/purge-events.jsonl.",
+            "name": "purge_mirror",
             "status": "ok"
           },
           {
@@ -4414,6 +4556,43 @@
           {
             "category": "brain",
             "details": {
+              "counts": {
+                "by_class": {
+                  "clean": 0,
+                  "conflict": 0,
+                  "likely": 0,
+                  "thin": 0,
+                  "weak": 0
+                },
+                "by_kind": {
+                  "conflict": 0,
+                  "cross_source": 0,
+                  "in_source": 0,
+                  "thin": 0
+                },
+                "crowded_key_values": 0
+              },
+              "groups": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No likely duplicate person or company pages.",
+            "name": "entity_duplicates",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "classes": [],
+              "links": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No person pages linked or collapsed automatically in the last 24 hours.",
+            "name": "dedupe_auto_links",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
               "docs": "docs/guides/write-refusals.md#file_database_drift",
               "sources": []
             },
@@ -4512,6 +4691,53 @@
             "elapsed_ms": "<volatile>",
             "message": "Every fact line on 0 facts page(s) carries a date.",
             "name": "facts_undated_lines",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "backup": {
+                "backend": false,
+                "carried_by": "database_backup",
+                "last_failure": null,
+                "last_success": null
+              },
+              "by_rule": {},
+              "checkouts": [],
+              "docs": "docs/guides/secret-store.md#health-and-backups",
+              "entries": 0,
+              "keys": {
+                "current": null,
+                "escrow_exported": [],
+                "in_use": [],
+                "missing": [],
+                "origin": "none",
+                "present": []
+              },
+              "occurrences": 0,
+              "spooled": 0,
+              "unreferenced": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "The secret store holds no entries.",
+            "name": "secret_store",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
+              "entity_basis": "reserved_page",
+              "identifier_kinds": [],
+              "identifier_shared": 0,
+              "identifiers": 0,
+              "owner_member_set": false,
+              "person_types_unavailable": false,
+              "several_pages": false,
+              "unbound_google_sources": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No owner identifier yet: set the owner member's email (gbrain access member set <id> --email <addr>) or connect a Google source. The owner page is memory/owner.",
+            "name": "owner_identity",
             "status": "ok"
           },
           {
@@ -4976,7 +5202,7 @@
             "category": "meta",
             "details": {
               "counts": {
-                "global": 18,
+                "global": 19,
                 "mixed": 2,
                 "source": 12
               },
@@ -4999,6 +5225,7 @@
                 "facts_drain": "global",
                 "fence_repair": "global",
                 "grade_takes": "global",
+                "learning_derive": "global",
                 "lint": "source",
                 "orphans": "global",
                 "patterns": "mixed",
@@ -5016,7 +5243,7 @@
               }
             },
             "elapsed_ms": "<volatile>",
-            "message": "Phase taxonomy: 12 source-scoped, 18 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, schema-suggest]. Brain-global: [fence_repair, content_repair, unindexed_files, resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, edge_contradictions, claim_conflicts, drift, standing_questions, chronicle, facts_drain, skillopt, embed, orphans, purge, bookkeeping_gc]. Mixed: [synthesize, patterns].",
+            "message": "Phase taxonomy: 12 source-scoped, 19 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, schema-suggest]. Brain-global: [fence_repair, content_repair, unindexed_files, resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, edge_contradictions, claim_conflicts, drift, standing_questions, chronicle, facts_drain, skillopt, embed, orphans, learning_derive, purge, bookkeeping_gc]. Mixed: [synthesize, patterns].",
             "name": "cycle_phase_scope",
             "status": "ok"
           },
@@ -5125,14 +5352,14 @@
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "Active pack gbrain-base-v2@1.7.0+e142684a is current (no successor declared)",
+            "message": "Active pack gbrain-base-v2@1.7.0+f1691ae3 is current (no successor declared)",
             "name": "pack_upgrade_available",
             "status": "ok"
           },
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "5 distinct typed values (pack gbrain-base-v2 declares 25)",
+            "message": "5 distinct typed values (pack gbrain-base-v2 declares 28)",
             "name": "type_proliferation",
             "status": "ok"
           },
@@ -5665,7 +5892,7 @@
             "details": {
               "audience": "personal",
               "audience_reasons": [
-                "no shared declaration; 0 non-automation client(s) active in 30d"
+                "no shared declaration; 0 non-automation client(s) active in 30d, 0 people (0 member(s), 0 unbound client(s))"
               ],
               "backstop_visibility": "private",
               "capture_lanes": {
@@ -5952,6 +6179,15 @@
           {
             "category": "ops",
             "elapsed_ms": "<volatile>",
+            "message": "Not applicable: Rust engine shadow mode is off for this brain.",
+            "name": "rust_engine_addon",
+            "readiness_state": "not_applicable",
+            "severity": "info",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "elapsed_ms": "<volatile>",
             "message": "Connected, 20 pages",
             "name": "connection",
             "status": "ok"
@@ -5980,7 +6216,7 @@
                 "explicit_retention_days": null,
                 "over_target": false,
                 "target_bytes": 8589934592,
-                "used_bytes": 200716
+                "used_bytes": 203628
               },
               "inspected": 2,
               "outstanding": [],
@@ -5990,7 +6226,7 @@
               "verify": "gbrain doctor --only persistence_capacity --json"
             },
             "elapsed_ms": "<volatile>",
-            "message": "No cumulative write cap is set (the default), so receipt storage never refuses or pauses a write; it holds 200716 reserved bytes, and receipts not yet compacted are under the housekeeping target of 8589934592.",
+            "message": "No cumulative write cap is set (the default), so receipt storage never refuses or pauses a write; it holds 203628 reserved bytes, and receipts not yet compacted are under the housekeeping target of 8589934592.",
             "name": "persistence_capacity",
             "status": "ok"
           },
@@ -6831,6 +7067,34 @@
           {
             "category": "brain",
             "elapsed_ms": "<volatile>",
+            "message": "Not applicable: this brain has no members (gbrain access member add <id>).",
+            "name": "access_pages_read_by_nobody",
+            "readiness_state": "not_applicable",
+            "severity": "info",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
+            "message": "Not applicable: this brain serves one person, so no source has to be shared with members.",
+            "name": "access_shared_source_unread",
+            "readiness_state": "not_applicable",
+            "severity": "info",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "count": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No live token or OAuth client is bound to a disabled or removed member.",
+            "name": "access_disabled_member_credentials",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
             "message": "Not applicable: no attest credential reads named sources as the person (--attest-read person).",
             "name": "attest_read_shared_scope",
             "readiness_state": "not_applicable",
@@ -6849,7 +7113,7 @@
           {
             "category": "ops",
             "elapsed_ms": "<volatile>",
-            "message": "RLS enabled on 185/185 public tables",
+            "message": "RLS enabled on 196/196 public tables",
             "name": "rls",
             "status": "ok"
           },
@@ -6870,6 +7134,23 @@
           {
             "category": "ops",
             "elapsed_ms": "<volatile>",
+            "message": "Every purge and withdrawal guard refuses a write role that row-level security keeps from its ledger",
+            "name": "guard_ledger_checks",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
+              "closed": false
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "Every owner-only delete trigger exists, so rows derived from a removed owner-only source stay owner-only",
+            "name": "owner_only_marks_triggers",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "elapsed_ms": "<volatile>",
             "message": "The database encoding is UTF8",
             "name": "database_encoding",
             "status": "ok"
@@ -6884,14 +7165,14 @@
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "1399 column(s) verified against live schema",
+            "message": "1422 column(s) verified against live schema",
             "name": "schema_columns",
             "status": "ok"
           },
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "All 185 table(s) the applied migrations create exist.",
+            "message": "All 196 table(s) the applied migrations create exist.",
             "name": "schema_missing_tables",
             "status": "ok"
           },
@@ -8313,6 +8594,7 @@
               "behind": [],
               "docs": "docs/guides/conversation-archive.md#doctor",
               "enabled": true,
+              "enabled_by": "default",
               "harnesses": [
                 {
                   "harness": "claude-code",
@@ -8358,6 +8640,7 @@
                 }
               ],
               "held": [],
+              "reason": "on by default on a personal brain",
               "source_id": "conversations",
               "stale_days": 2
             },
@@ -8614,40 +8897,35 @@
             },
             "elapsed_ms": "<volatile>",
             "fix": {
-              "actor": "agent",
+              "actor": "host_admin",
               "argv": [
-                "gbrain",
-                "export",
-                "--source",
-                "default",
-                "--dir",
-                "<BACKUP_DIR>/default",
-                "--brain",
-                "host"
+                "pg_dump",
+                "--format",
+                "custom",
+                "--file",
+                "<DUMP_FILE>",
+                "--dbname",
+                "<DATABASE_URL>"
               ],
-              "command": "gbrain export --source default --dir '<BACKUP_DIR>/default' --brain host",
-              "consent": [],
-              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/operations/backup-check.md",
+              "command": "pg_dump --format custom --file '<DUMP_FILE>' --dbname '<DATABASE_URL>'",
+              "consent": [
+                "credentials"
+              ],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/memory-boundaries.md#full-backup",
               "inputs": [
                 {
-                  "how": "Ask the user where backups should live (a directory outside the brain, ideally synced or on another disk).",
-                  "name": "BACKUP_DIR"
+                  "how": "A new file outside the brain, in a directory only the user can read.",
+                  "name": "DUMP_FILE"
+                },
+                {
+                  "how": "The brain's Postgres connection, preferably service=<name> from a pg_service file so no password lands in the command line.",
+                  "name": "DATABASE_URL"
                 }
               ],
-              "next": "run",
+              "next": "tell_user_to_run",
               "requires_exclusive": false,
-              "verify": {
-                "argv": [
-                  "gbrain",
-                  "doctor",
-                  "--only",
-                  "backup_coverage",
-                  "--json",
-                  "--brain",
-                  "host"
-                ]
-              },
-              "why": "Writes a Markdown copy of 'default' (pages and facts) to a directory outside the brain so it survives losing the database."
+              "user_message": "This brain lives in Postgres, so back it up with a database dump of its database: `pg_dump --format custom --file <DUMP_FILE> --dbname <DATABASE_URL>`, kept private (it holds every page, fact, member and token); `pg_restore --list <DUMP_FILE>` reads it back. Restore it into a new, empty database with `pg_restore --no-owner --dbname <NEW_DATABASE_URL> <DUMP_FILE>`, then run `gbrain init --url <NEW_DATABASE_URL>` under a separate GBRAIN_HOME, which opens the restored brain. `gbrain export` is not a backup: an import of it puts every page in one source and keeps no members, tokens or facts.",
+              "why": "A database dump keeps every source, page, fact, member, token and folder rule of a Postgres brain; a Markdown export keeps pages only."
             },
             "message": "Not urgent yet: the brain holds 23 page(s)+fact(s) and is under 7 days old (backup coaching starts at 25 items or 7 days). 3 knowledge asset(s) lack verified recovery: default (not_a_git_repo), plain (not_a_git_repo), notes (no git remote). A source repo with a pushed git remote restores its Markdown files only, never DB-only pages, facts, config or credentials. Run `gbrain backup status` for each asset's fix command.",
             "name": "backup_coverage",
@@ -8911,8 +9189,44 @@
           {
             "category": "brain",
             "elapsed_ms": "<volatile>",
+            "message": "The nightly cycle has not recorded anything it learned yet.",
+            "name": "learning_note",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "delivered_sessions": 0,
+              "last_session": null,
+              "max_sessions": 3,
+              "reason": "not_new_install",
+              "state": "off",
+              "window_ends_at": null
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "The first-session suggestion is off: this brain was not created by a gbrain setup run (an upgrade, a restored or imported brain, or an older install), so there is no first session to suggest for. Details: gbrain onboarding status.",
+            "name": "first_session_suggestion",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
             "message": "No memory proposals await the owner.",
             "name": "memory_proposals_pending",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
+            "message": "No agent policy is set; policy_check answers none (gbrain policy init sets one).",
+            "name": "policy_valid",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
+            "message": "No confirmed standing rules to check (gbrain correct saves one).",
+            "name": "rules_regression",
             "status": "ok"
           },
           {
@@ -9444,6 +9758,36 @@
           {
             "category": "brain",
             "details": {
+              "items": [],
+              "total": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "Every held write is tied to one page, or waits for its page to be created.",
+            "name": "write_gate_hold_ambiguous",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "by_source": {},
+              "complete": true,
+              "items": [],
+              "items_truncated": false,
+              "row_budget": 5000,
+              "scanned": 0,
+              "stranded": {
+                "no_page": 0,
+                "page_deleted": 0
+              }
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No held write is without a live page (0 held write(s) read).",
+            "name": "write_gate_holds_stranded",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
               "bad_config": [],
               "chars_limit": 4000,
               "chars_used": 0,
@@ -9658,6 +10002,19 @@
           {
             "category": "brain",
             "details": {
+              "by_source": [],
+              "count": 0,
+              "docs": "docs/guides/repair.md#slug-spelling",
+              "truncated": false
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No page is stored under an older spelling of its name.",
+            "name": "legacy_slug_spellings",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
               "parked": 0
             },
             "elapsed_ms": "<volatile>",
@@ -9674,6 +10031,18 @@
             "elapsed_ms": "<volatile>",
             "message": "No soft-deleted page is kept from the purge to keep a page derived from it private.",
             "name": "derived_origin_parked",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "missing": 0,
+              "path": "<home>/.gbrain/purge-events.jsonl",
+              "recent": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No purge in the last 30 days to check against the purge mirror at <home>/.gbrain/purge-events.jsonl.",
+            "name": "purge_mirror",
             "status": "ok"
           },
           {
@@ -9883,6 +10252,43 @@
           {
             "category": "brain",
             "details": {
+              "counts": {
+                "by_class": {
+                  "clean": 0,
+                  "conflict": 0,
+                  "likely": 0,
+                  "thin": 0,
+                  "weak": 0
+                },
+                "by_kind": {
+                  "conflict": 0,
+                  "cross_source": 0,
+                  "in_source": 0,
+                  "thin": 0
+                },
+                "crowded_key_values": 0
+              },
+              "groups": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No likely duplicate person or company pages.",
+            "name": "entity_duplicates",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "classes": [],
+              "links": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No person pages linked or collapsed automatically in the last 24 hours.",
+            "name": "dedupe_auto_links",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
               "docs": "docs/guides/write-refusals.md#file_database_drift",
               "sources": []
             },
@@ -9981,6 +10387,53 @@
             "elapsed_ms": "<volatile>",
             "message": "Every fact line on 0 facts page(s) carries a date.",
             "name": "facts_undated_lines",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "backup": {
+                "backend": false,
+                "carried_by": "database_backup",
+                "last_failure": null,
+                "last_success": null
+              },
+              "by_rule": {},
+              "checkouts": [],
+              "docs": "docs/guides/secret-store.md#health-and-backups",
+              "entries": 0,
+              "keys": {
+                "current": null,
+                "escrow_exported": [],
+                "in_use": [],
+                "missing": [],
+                "origin": "none",
+                "present": []
+              },
+              "occurrences": 0,
+              "spooled": 0,
+              "unreferenced": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "The secret store holds no entries.",
+            "name": "secret_store",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
+              "entity_basis": "reserved_page",
+              "identifier_kinds": [],
+              "identifier_shared": 0,
+              "identifiers": 0,
+              "owner_member_set": false,
+              "person_types_unavailable": false,
+              "several_pages": false,
+              "unbound_google_sources": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No owner identifier yet: set the owner member's email (gbrain access member set <id> --email <addr>) or connect a Google source. The owner page is memory/owner.",
+            "name": "owner_identity",
             "status": "ok"
           },
           {
@@ -10445,7 +10898,7 @@
             "category": "meta",
             "details": {
               "counts": {
-                "global": 18,
+                "global": 19,
                 "mixed": 2,
                 "source": 12
               },
@@ -10468,6 +10921,7 @@
                 "facts_drain": "global",
                 "fence_repair": "global",
                 "grade_takes": "global",
+                "learning_derive": "global",
                 "lint": "source",
                 "orphans": "global",
                 "patterns": "mixed",
@@ -10485,7 +10939,7 @@
               }
             },
             "elapsed_ms": "<volatile>",
-            "message": "Phase taxonomy: 12 source-scoped, 18 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, schema-suggest]. Brain-global: [fence_repair, content_repair, unindexed_files, resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, edge_contradictions, claim_conflicts, drift, standing_questions, chronicle, facts_drain, skillopt, embed, orphans, purge, bookkeeping_gc]. Mixed: [synthesize, patterns].",
+            "message": "Phase taxonomy: 12 source-scoped, 19 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, schema-suggest]. Brain-global: [fence_repair, content_repair, unindexed_files, resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, edge_contradictions, claim_conflicts, drift, standing_questions, chronicle, facts_drain, skillopt, embed, orphans, learning_derive, purge, bookkeeping_gc]. Mixed: [synthesize, patterns].",
             "name": "cycle_phase_scope",
             "status": "ok"
           },
@@ -10594,14 +11048,14 @@
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "Active pack gbrain-base-v2@1.7.0+e142684a is current (no successor declared)",
+            "message": "Active pack gbrain-base-v2@1.7.0+f1691ae3 is current (no successor declared)",
             "name": "pack_upgrade_available",
             "status": "ok"
           },
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "5 distinct typed values (pack gbrain-base-v2 declares 25)",
+            "message": "5 distinct typed values (pack gbrain-base-v2 declares 28)",
             "name": "type_proliferation",
             "status": "ok"
           },

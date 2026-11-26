@@ -14,14 +14,16 @@
  * origin, and when the origin lookup itself fails it soft-deletes and keeps any park (purge_held derived_origin_unchecked). Every expiry (carryPrivateBeforePurge, from purgeDeletedPagesCoordinated) labels the dependents of each expired
  * private origin and parks the ones it could not (persistence/derived-origin-hold.ts), so no purge removes them.
  */
+import { normalizeSlug } from '../utils.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
+import { assertPurgeAge } from '../engine-errors.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
 import { isSegmentedPage } from '../page-body/page-shape.ts';
 import type { LabelEdit } from '../persistence/label-edit.ts';
 import { maintenancePreflight, publishMaintenancePages } from '../persistence/prepared-maintenance.ts';
-import { clearDerivedOriginParks, DERIVED_ORIGIN_PARKED_CODE, derivedOriginPurgeHold, finishPurgeNote, parkDerivedOrigin, pruneDerivedOriginParks, readDerivedOriginParks, type DerivedOriginPark } from '../persistence/derived-origin-hold.ts';
+import { clearDerivedOriginParks, DERIVED_ORIGIN_PARKED_CODE, derivedOriginPurgeHold, finishPurgeNote, parkDerivedOrigin, pruneDerivedOriginParks, readDerivedOriginParks, recordOwedPurge, type DerivedOriginPark } from '../persistence/derived-origin-hold.ts';
 import { privacyPartSql, readHonorAliases, withoutCallerAccess } from '../search/private-visibility.ts';
 import { faultPoint } from '../persistence/fault-points.ts';
 import { filesInCheckout, importAtRevision, writeLabelFile } from './label-write.ts';
@@ -143,7 +145,7 @@ export async function deletePageCarryingPrivate(ctx: OperationContext, p: Record
   const { finishPagePurge } = await import('../persistence/page-purge.ts');
   p.request_id ??= randomUUID();
   const batch = `derived-origin-carry:${String(p.request_id)}`;
-  const slug = typeof p.slug === 'string' ? p.slug.toLowerCase() : null;
+  const slug = typeof p.slug === 'string' ? normalizeSlug(p.slug) : null;
   if (p.purge !== true) {
     const origin = slug ? await originOf(ctx.engine, sourceId, slug).catch(() => null) : null;
     const result = await submitPageMutation(ctx, { operation: 'delete_page', params: p });
@@ -167,6 +169,7 @@ export async function deletePageCarryingPrivate(ctx: OperationContext, p: Record
   await parkDerivedOrigin(ctx.engine, { ...parked(origin, block), held_request_id: String(p.request_id) });
   const result = origin.deleted ? { status: 'held', slug: origin.slug, source_id: sourceId, request_id: p.request_id }
     : await submitPageMutation(ctx, { operation: 'delete_page', params: { ...p, purge: false, request_id: derivedRequestId(String(p.request_id)) } });
+  await recordOwedPurge(ctx.engine, origin.id, String(p.request_id));
   return { ...result, purge_held: { code: DERIVED_ORIGIN_PARKED_CODE,
     message: `Not purged: ${block.slug ?? 'a page derived from it'} is private only through ${origin.slug} and could not be labelled private (${block.code ?? 'error'}: ${block.reason}). `
       + `${origin.slug} is soft-deleted and parked: no purge removes it until that page carries its own label; gbrain doctor names it as derived_origin_parked. `
@@ -193,6 +196,7 @@ async function expiringOrigins(engine: BrainEngine, olderThanHours: number): Pro
  * applies: the caller clears those after its purge, so an origin parked when the purge was previewed stays this run.
  */
 export async function carryPrivateBeforePurge(engine: BrainEngine, olderThanHours: number): Promise<{ parks: DerivedOriginPark[]; unparked: Origin[] }> {
+  assertPurgeAge(olderThanHours);
   await pruneDerivedOriginParks(engine);
   const parks: DerivedOriginPark[] = [];
   const batch = `derived-origin-carry:purge-${randomUUID()}`;
@@ -218,6 +222,7 @@ export interface CarryForecast { release: Origin[]; hold: Origin[] }
  * origin not parked but blocked is held. A failed read holds every origin, as a failed carry parks every origin.
  */
 export async function forecastCarry(engine: BrainEngine, olderThanHours: number): Promise<CarryForecast> {
+  assertPurgeAge(olderThanHours);
   const parks = new Set((await readDerivedOriginParks(engine)).map(park => park.page_id));
   return withoutCallerAccess(async () => {
     let origins: Origin[] = [];

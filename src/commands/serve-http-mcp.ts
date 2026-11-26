@@ -24,6 +24,7 @@ import { resolveAuthCapabilities } from '../core/harness/capabilities.ts';
 import { ambientOptsFrom, writebackCaller, type WritebackConfig } from '../core/facts/writeback-config.ts';
 import { resolveAgentWriteback } from '../core/facts/writeback-settings.ts';
 import { OWNER_MEMBER_KEY } from '../core/search/private-visibility.ts';
+import { credentialHolders } from '../core/access/owner.ts';
 import { hasScope, operationScopesAllowed } from '../core/scope.ts';
 import { summarizeMcpParams, dispatchToolCall, requestLogStatusForResult, requestMetaSessionId, hotMemoryOffIn, acceptedPendingReceipt, unknownToolEnvelope, errorResult, dispatchRenderContext, grantBlockedNotices, admitNotices, audienceRefusal, type ToolResult } from '../mcp/dispatch.ts';
 import { toAgentError } from '../core/agent-output.ts';
@@ -61,6 +62,7 @@ import { VERSION } from '../version.ts';
 import { executeRawJsonb } from '../core/sql-query.ts';
 import { withRequestConfigSnapshot } from '../core/config-snapshot.ts';
 import { withBearerScopeHint } from './serve-http-oauth.ts';
+import { mcpForegroundMiddleware } from '../core/foreground-activity.ts';
 import type { ServeHttpContext } from './serve-http.ts';
 
 /** Per-request state shared by the tools/list and tools/call handlers of one POST /mcp. */
@@ -162,7 +164,7 @@ export function mountMcp(app: Express, ctx: ServeHttpContext): void {
     req => createHash('sha256').update(((req as any).auth as AuthInfo).token).digest('hex'), 'Too many requests for this token');
   app.post('/mcp', ipLimit, withBearerScopeHint(
     requireBearerAuth({ verifier: resourceVerifier, resourceMetadataUrl }), ['read', 'write'],
-  ), tokenLimit, (req: Request, res: Response) => withEngineScope(engine, () => withRequestConfigSnapshot(engine, () => handleMcpPost(req, res))));
+  ), mcpForegroundMiddleware, tokenLimit, (req: Request, res: Response) => withEngineScope(engine, () => withRequestConfigSnapshot(engine, () => handleMcpPost(req, res))));
 
   // #6721: one config snapshot serves every config read of one POST /mcp (the
   // surface, row-shape and writeback reads below, tools/list and a read op's
@@ -243,7 +245,8 @@ function createMcpRequestServer(
   const server = new Server(
     { name: 'gbrain', version: VERSION, description: MCP_SERVER_DESCRIPTION },
     {
-      capabilities: { tools: {}, resources: {} },
+      // listChanged: request_tools sends tools/list_changed on its own response stream after a persisted surface change.
+      capabilities: { tools: { listChanged: true }, resources: {} },
       // #4748: contract (+ opt-in writeback section) + deployment identity.
       instructions: resolveMcpInstructions(config, process.env, { writeback: writebackOpts }),
     },
@@ -277,7 +280,8 @@ function createMcpRequestServer(
     return server;
   }
   server.setRequestHandler(ListToolsRequestSchema, async () => listMcpTools(ctx, state));
-  server.setRequestHandler(CallToolRequestSchema, async (request) => callMcpTool(ctx, state, request));
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => callMcpTool(ctx, state, request,
+    () => extra.sendNotification({ method: 'notifications/tools/list_changed' })));
   return server;
 }
 
@@ -353,7 +357,7 @@ async function listMcpTools(ctx: ServeHttpContext, state: McpRequestState) {
   return { tools };
 }
 
-async function callMcpTool(ctx: ServeHttpContext, state: McpRequestState, request: CallToolRequest): Promise<ToolResult> {
+async function callMcpTool(ctx: ServeHttpContext, state: McpRequestState, request: CallToolRequest, notifyToolListChanged?: () => Promise<void>): Promise<ToolResult> {
   const { engine, broadcastEvent, logFullParams } = ctx;
   const { authInfo, agentName, startTime, mcpOperations, surface, surfaceCeiling, surfaceAllowedOps, resultRows, thinClient } = state;
   const { name, arguments: params } = request.params;
@@ -412,11 +416,11 @@ async function callMcpTool(ctx: ServeHttpContext, state: McpRequestState, reques
   // ToolResult and we read isError + _meta to pick the right branch.
   // #2529: takesHoldersAllowList is a typed AuthInfo field populated by
   // verifyAccessToken from access_tokens.permissions.takes_holders for
-  // legacy bearer tokens ([] preserved as deny-all). The fail-closed
-  // ['world'] default covers OAuth-client tokens (no per-client storage
-  // yet — see TODOS.md) and pre-v29 brains (no permissions column →
-  // isUndefinedColumnError fallback in verifyAccessToken).
-  const tokenAllowList = authInfo.takesHoldersAllowList ?? ['world'];
+  // legacy bearer tokens ([] preserved as deny-all). A credential with no
+  // stored list gets the fail-closed ['world'] default (pre-v29 brains too:
+  // isUndefinedColumnError fallback in verifyAccessToken), except one bound
+  // to the brain owner, which reads every holder (GST-3058, credentialHolders).
+  const tokenAllowList = await credentialHolders(engine, authInfo.takesHoldersAllowList, authInfo.member?.id);
   // v0.34.1 (#861, D13): AuthInfo.sourceId is now a real typed field
   // populated from oauth_clients.source_id (migration v60 backfilled
   // NULL → 'default'). Pre-fix this site cast through AuthInfo and
@@ -480,6 +484,7 @@ async function callMcpTool(ctx: ServeHttpContext, state: McpRequestState, reques
       surface,
       // WP4 (D2): request_tools bounds its catalog + persist by this.
       surfaceCeiling,
+      ...(notifyToolListChanged ? { notifyToolListChanged } : {}),
       // D2: a callable tool the advertised surface leaves out of tools/list (same rule as listMcpTools).
       isListed: async op => advertisedOps([op], surface, await clientAdvertisedSurface(authInfo, engine, ctx.config, ctx.advertise ?? null)).length > 0,
       resultRows,

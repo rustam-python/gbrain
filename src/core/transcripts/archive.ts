@@ -51,12 +51,13 @@ import { classifyItemFailure } from '../item-failure.ts';
 import { classifyBrainAudience } from '../facts/writeback-audience.ts';
 import { ARCHIVE_ENABLED_KEY, resolveArchiveEnabled } from './archive-default.ts';
 import { listGroups, listMembers } from '../access/members.ts';
-import { ownerView } from '../access/owner.ts';
+import { ownerMemberId, ownerView } from '../access/owner.ts';
+import { SPEAKER_OWNER_KEY } from '../identity/speaker-owner.ts';
 import { holdPageEmbedding } from '../page-embedding-budget.ts';
 import { PAGE_MAX_BYTES } from '../page-size-policy.ts';
 import type { ParsedSession, TranscriptFormat } from './types.ts';
 import { transcriptFullId } from './types.ts';
-import { loadImportRedactionPatterns, PAGE_CEILING_FILL, redactSession, type RedactedSession, type RenderedPart } from './render.ts';
+import { loadImportRedactionPatterns, PAGE_CEILING_FILL, redactSession, type RedactedSession, type RenderedPart, type SpeakerOwnerStamp } from './render.ts';
 import { deleteStaleTranscriptPart, submitTranscriptPart, transcriptPageCeiling } from './ingest.ts';
 import {
   addDays, assertTimeZone, localDay, renderArchiveDay, renderDayIndex, sliceSessionByDay, conversationHash8,
@@ -85,6 +86,8 @@ const AUDIENCE_PREFIX = 'transcripts.archive.audience.';
 const RESCOPE_CAPPED_PREFIX = 'transcripts.archive.rescope_capped.';
 /** Days whose index page still has to be written (a failed or interrupted index write), per source. */
 const INDEX_PENDING_PREFIX = 'transcripts.archive.index_pending.';
+/** What the last run that read each reader found, per source: status and doctor report it without reading again. */
+const LAST_READ_PREFIX = 'transcripts.archive.last_read.';
 const INGESTED_VIA = 'cli:transcripts-archive';
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -170,7 +173,33 @@ export interface ArchiveDayOutcome {
   message?: string;
 }
 
-export interface ArchiveReaderError { harness: string; reader: string; code: string; message: string; fix?: Action }
+export interface ArchiveReaderError { harness: string; reader: string; code: string; message: string; fix?: Action; /** When the run that met it read (status only). */ at?: string }
+
+/**
+ * One thing a run could not do: a reader that failed (reader set), a conversation day that failed (day set), the day
+ * index, or the owner-unset hold on a shared brain. A run returns exit 1 exactly when this list is not empty.
+ */
+export interface ArchiveRunError { harness: string; reader?: string; day?: string; conversation_key_hash?: string; code: string; message: string; fix?: Action }
+
+/** One reader as the last run that read it found it: the newest message any run saw, and the last run's error until a later read succeeds. */
+interface ArchiveReadRecord {
+  harness: string;
+  at?: string;
+  mode?: 'run' | 'backfill';
+  conversations?: number;
+  newest?: string;
+  error?: { at: string; code: string; message: string; fix?: Action };
+}
+
+async function readArchiveReads(engine: BrainEngine, sourceId: string): Promise<Record<string, ArchiveReadRecord>> {
+  const raw = await engine.getConfig(`${LAST_READ_PREFIX}${sourceId}`);
+  try {
+    const doc = raw ? JSON.parse(raw) as unknown : null;
+    return doc && typeof doc === 'object' && !Array.isArray(doc) ? doc as Record<string, ArchiveReadRecord> : {};
+  } catch {
+    return {};
+  }
+}
 
 export interface ArchiveRunResult {
   mode: 'run' | 'backfill';
@@ -192,7 +221,8 @@ export interface ArchiveRunResult {
   index_pages: string[];
   deferred_days: string[];
   info: string[];
-  errors: ArchiveReaderError[];
+  /** Every failure of this run (ArchiveRunError); empty exactly when the run exits 0. */
+  errors: ArchiveRunError[];
   message?: string;
   fix?: Action;
   /** The run reached deadlineAtMs and left conversations for the next run. */
@@ -219,6 +249,8 @@ export interface ArchiveRunOpts {
   deadlineAtMs?: number;
   /** Repository path: import the committed files (default an in-process sync of the source). */
   syncSource?: (engine: BrainEngine, sourceId: string, root: string) => Promise<void>;
+  /** Reads the audience again before each day is published (a repository batch: before its files); a run on a personal brain that turned shared stops with archive_audience_changed. */
+  recheckAudienceEachDay?: boolean;
 }
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
@@ -237,7 +269,7 @@ export async function setArchiveEnabled(engine: BrainEngine, on: boolean): Promi
   await engine.setConfig(ARCHIVE_ENABLED_KEY, on ? 'true' : 'false');
 }
 
-async function configuredSource(engine: BrainEngine, sourceId?: string): Promise<string> {
+export async function configuredSource(engine: BrainEngine, sourceId?: string): Promise<string> {
   return sourceId ?? ((await engine.getConfig(ARCHIVE_SOURCE_KEY))?.trim() || DEFAULT_ARCHIVE_SOURCE);
 }
 
@@ -284,10 +316,19 @@ async function writeLedger(engine: BrainEngine, entry: ArchiveLedgerEntry): Prom
   await engine.setConfig(ledgerKey(source_id, harness, conversation_key_hash, day), JSON.stringify({ ...value, updated_at: new Date().toISOString() }));
 }
 
-async function legacyCovered(engine: BrainEngine, sourceId: string): Promise<Set<string>> {
-  const prefix = LEGACY_PREFIX + sourceId + '.';
-  const rows = await engine.executeRaw<{ key: string }>('SELECT key FROM config WHERE key LIKE $1', [prefix + '%']);
-  return new Set(rows.map(r => r.key.slice(prefix.length)));
+/**
+ * Days an old archive folder covers, as adopt-legacy recorded them. adopt-legacy records them under the source it
+ * resolved then (the configured archive source, or its <source>-owner twin on a shared brain whose source is a
+ * checkout), so they are read under both ids: a brain that turned shared or personal in between still skips them.
+ */
+async function legacyCovered(engine: BrainEngine, configured: string): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (const id of [configured, configured + '-owner']) {
+    const prefix = LEGACY_PREFIX + id + '.';
+    const rows = await engine.executeRaw<{ key: string }>('SELECT key FROM config WHERE key LIKE $1', [prefix + '%']);
+    for (const r of rows) out.add(r.key.slice(prefix.length));
+  }
+  return out;
 }
 
 function machineTimeZone(): string {
@@ -302,9 +343,9 @@ async function archiveTimeZone(engine: BrainEngine, sourceId: string): Promise<{
 }
 
 /** unproven: the brain reads as personal only because its client-usage check failed, so it may still be shared. */
-interface Privacy { shared: boolean; owner: string | null; unproven?: boolean }
+export interface Privacy { shared: boolean; owner: string | null; unproven?: boolean }
 
-async function resolvePrivacy(engine: BrainEngine): Promise<Privacy> {
+export async function resolvePrivacy(engine: BrainEngine): Promise<Privacy> {
   const { loadConfigFileOnly } = await import('../config.ts');
   const audience = await classifyBrainAudience(engine, loadConfigFileOnly());
   const enabled = (await listMembers(engine)).filter(m => m.status === 'enabled').length;
@@ -334,7 +375,7 @@ async function readersFor(engine: BrainEngine, privacy: Privacy, conv: ArchiveCo
  * conversations/ replaces them, so later group conversations stay owner-only too (archive_rescope_folder_cap). No other rule is
  * dropped, so a source that already held MAX_RULES other rules ends one rule over (rescopeCapped reports it). A source whose rules live in git is left to its access.yml.
  */
-async function reconcileAudience(engine: BrainEngine, sourceId: string, privacy: Privacy): Promise<void> {
+async function reconcileAudience(engine: BrainEngine, sourceId: string, privacy: Privacy, record = true): Promise<void> {
   const now = privacy.shared ? 'shared' : 'personal';
   const recorded = await engine.getConfig(`${AUDIENCE_PREFIX}${sourceId}`);
   if (recorded === now) return;
@@ -361,7 +402,7 @@ async function reconcileAudience(engine: BrainEngine, sourceId: string, privacy:
     }
     if (capped) await engine.setConfig(`${RESCOPE_CAPPED_PREFIX}${sourceId}`, String(folders.length));
   }
-  await engine.setConfig(`${AUDIENCE_PREFIX}${sourceId}`, now);
+  if (record) await engine.setConfig(`${AUDIENCE_PREFIX}${sourceId}`, now);
 }
 
 export interface ArchiveRescopeSkip { code: 'archive_rescope_owner_unset' | 'archive_rescope_git_rules' | 'archive_rescope_pending' | 'archive_rescope_folder_cap'; message: string }
@@ -370,13 +411,81 @@ export interface ArchiveRescopeSkip { code: 'archive_rescope_owner_unset' | 'arc
  * Runs the owner-only re-scope for a brain archived while personal that is now shared, whether or not the archive is
  * still on (an unset switch resolves off once the brain is shared). Returns whether one was due.
  */
-export async function reconcileArchiveAudience(engine: BrainEngine, sourceId?: string): Promise<boolean> {
+export async function reconcileArchiveAudience(engine: BrainEngine, sourceId?: string, holdsRunLock = false): Promise<boolean> {
   const configured = await configuredSource(engine, sourceId);
   if (await engine.getConfig(`${AUDIENCE_PREFIX}${configured}`) !== 'personal') return false;
   const privacy = await resolvePrivacy(engine);
   if (!privacy.shared) return false;
-  await reconcileAudience(engine, configured, privacy);
+  await (holdsRunLock ? reconcileAudience(engine, configured, privacy) : reconcileWithoutRunLock(engine, configured, privacy));
   return true;
+}
+
+/**
+ * reconcileAudience for a caller that does not hold the source's run lock (an archive run on the <source>-owner twin,
+ * or one that found the archive off): the audience is recorded only under that lock. While another run holds it, that
+ * run may have started on the personal brain and still be writing pages with no readers, so the rules apply and the
+ * audience stays recorded personal, and the next run re-scopes what that run wrote (archive_rescope_pending).
+ */
+async function reconcileWithoutRunLock(engine: BrainEngine, sourceId: string, privacy: Privacy): Promise<void> {
+  const { withRefreshingLock, LockUnavailableError } = await import('../db-lock.ts');
+  try {
+    await withRefreshingLock(engine, ARCHIVE_LOCK_PREFIX + sourceId, () => reconcileAudience(engine, sourceId, privacy));
+  } catch (err) {
+    if (!(err instanceof LockUnavailableError)) throw err;
+    await reconcileAudience(engine, sourceId, privacy, false);
+  }
+}
+
+/**
+ * The owner-only re-scope for every archive source written while the brain was personal, run by the commands that can
+ * turn a brain shared (gbrain access member add and member enable, gbrain access owner set, gbrain config set
+ * brain.audience) so earlier pages are kept to the owner before a second member reads them, not at the next archive
+ * run or maintenance pass. Returns each source whose re-scope was due, with why it could not apply (null when it did).
+ * It holds the source's archive run lock. While a run that started on the personal brain holds it, that run keeps
+ * writing pages with no readers into folders no rule covers yet, so the pages archived so far are kept to the owner now
+ * but the audience stays recorded personal and the next run re-scopes again (archive_rescope_pending).
+ */
+export async function rescopeArchiveOnShared(engine: BrainEngine): Promise<Array<{ source_id: string; skipped: ArchiveRescopeSkip | null }>> {
+  const rows = await engine.executeRaw<{ key: string }>("SELECT key FROM config WHERE key LIKE $1 AND value = 'personal' ORDER BY key", [AUDIENCE_PREFIX + '%']);
+  if (!rows.length) return [];
+  const privacy = await resolvePrivacy(engine);
+  if (!privacy.shared) return [];
+  const { withRefreshingLock, LockUnavailableError } = await import('../db-lock.ts');
+  const out: Array<{ source_id: string; skipped: ArchiveRescopeSkip | null }> = [];
+  for (const { key } of rows) {
+    const sourceId = key.slice(AUDIENCE_PREFIX.length);
+    try {
+      if (!await withRefreshingLock(engine, ARCHIVE_LOCK_PREFIX + sourceId, () => reconcileArchiveAudience(engine, sourceId, true))) continue;
+    } catch (err) {
+      if (!(err instanceof LockUnavailableError)) throw err;
+      await reconcileAudience(engine, sourceId, privacy, false);
+      const skipped = await archiveRescopeSkipped(engine, sourceId);
+      out.push({ source_id: sourceId, skipped: skipped?.code !== 'archive_rescope_pending' ? skipped : { code: 'archive_rescope_pending', message: 'Conversation archive pages archived so far are kept to the owner, but an archive run that started while this brain was personal is writing source ' + sourceId + ' now and its new pages are not (gbrain status --section locks --json shows the holder); once it finishes, run gbrain transcripts archive run.' } });
+      continue;
+    }
+    out.push({ source_id: sourceId, skipped: await archiveRescopeSkipped(engine, sourceId) });
+  }
+  return out;
+}
+
+/**
+ * Before a member change that adds an enabled member (gbrain access member add, or member enable of a disabled one)
+ * and so may make the brain shared: keeps the archive pages written while personal to the owner first, so the member's
+ * credentials never read them, even for the moment between the change and rescopeArchiveOnShared. The audience is not
+ * recorded here; rescopeArchiveOnShared does that once the change has committed. Throws when the re-scope fails, so the
+ * caller makes no change.
+ */
+export async function rescopeArchiveBeforeJoin(engine: BrainEngine, memberId: string): Promise<void> {
+  const rows = await engine.executeRaw<{ key: string }>("SELECT key FROM config WHERE key LIKE $1 AND value = 'personal' ORDER BY key", [AUDIENCE_PREFIX + '%']);
+  if (!rows.length) return;
+  let privacy = await resolvePrivacy(engine);
+  if (!privacy.shared) {
+    const enabled = (await listMembers(engine)).filter(m => m.status === 'enabled').map(m => m.id);
+    if (enabled.includes(memberId) || enabled.length + 1 < 2) return;
+    const view = await ownerView(engine);
+    privacy = { shared: true, owner: view.owner ?? (view.inactive?.value === memberId ? memberId : null) };
+  }
+  for (const { key } of rows) await reconcileAudience(engine, key.slice(AUDIENCE_PREFIX.length), privacy, false);
 }
 
 /** Why the owner-only re-scope (reconcileAudience) has not run on a brain that became shared, or null. */
@@ -386,7 +495,7 @@ export async function archiveRescopeSkipped(engine: BrainEngine, sourceId?: stri
   const privacy = await resolvePrivacy(engine);
   if (!privacy.shared) return null;
   if (!privacy.owner) {
-    return { code: 'archive_rescope_owner_unset', message: 'Conversation archive pages written while this brain was personal are not yet kept to the owner, because the shared brain names no owner; run gbrain access owner set <member> and the next archive run applies the owner-only rules.' };
+    return { code: 'archive_rescope_owner_unset', message: 'Conversation archive pages written while this brain was personal are not yet kept to the owner, because the shared brain names no owner; run gbrain access owner set <member>, which applies the owner-only rules at once.' };
   }
   const policy = await import('../access/policy.ts');
   const pending: ArchiveRescopeSkip = { code: 'archive_rescope_pending', message: 'Conversation archive pages written while this brain was personal are not yet kept to the owner; the next maintenance pass applies the owner-only rules, or run gbrain transcripts archive run now.' };
@@ -515,32 +624,86 @@ interface DayWrite {
   pending?: string[];
 }
 
+/** Reads every reader once for a run, and unless it is a dry run records what each one found (transcripts.archive.last_read.<source>) for status and doctor. */
+async function readReaders(engine: BrainEngine, readers: ArchiveReader[], scanOpts: ArchiveScanOpts,
+  ctx: { sourceId: string; mode: 'run' | 'backfill'; dryRun: boolean; at: string; result: ArchiveRunResult; pastDeadline: () => boolean }): Promise<ArchiveScanEntry[]> {
+  const entries: ArchiveScanEntry[] = [];
+  const { result, pastDeadline } = ctx;
+  const reads = new Map<string, { harness: string; conversations: number; newest?: string; error?: ArchiveReaderError }>();
+  for (const reader of readers) {
+    if (entries.length && pastDeadline()) break;
+    if (reader.unavailable) { result.info.push(reader.unavailable); continue; }
+    try {
+      let found = 0;
+      let newest: string | undefined;
+      for await (const entry of scanReader(reader, scanOpts)) {
+        entries.push(entry);
+        found++;
+        if (entry.newest && (!newest || entry.newest > newest)) newest = entry.newest;
+      }
+      reads.set(reader.name, { harness: reader.harness, conversations: found, ...(newest ? { newest } : {}) });
+      if (found === 0) result.info.push('no readable sessions for ' + reader.harness + '; use gbrain connectors or an export with gbrain transcripts ingest');
+    } catch (err) {
+      if (classifyItemFailure(err).scope === 'run') throw err;
+      const e = err as { code?: string; message?: string; fix?: Action };
+      const error = { harness: reader.harness, reader: reader.name, code: e.code ?? 'archive_reader_failed', message: e.message ?? String(err), ...(e.fix ? { fix: e.fix } : {}) };
+      result.errors.push(error);
+      reads.set(reader.name, { harness: reader.harness, conversations: 0, error });
+    }
+  }
+  if (ctx.dryRun || !reads.size) return entries;
+  const { at } = ctx;
+  const record = await readArchiveReads(engine, ctx.sourceId);
+  for (const [name, read] of reads) {
+    const prior = record[name];
+    if (read.error) {
+      record[name] = { ...prior, harness: read.harness, error: { at, code: read.error.code, message: read.error.message, ...(read.error.fix ? { fix: read.error.fix } : {}) } };
+      continue;
+    }
+    const newest = [prior?.newest, read.newest].filter((v): v is string => !!v).sort().pop();
+    record[name] = { harness: read.harness, at, mode: ctx.mode, conversations: read.conversations, ...(newest ? { newest } : {}) };
+  }
+  await engine.setConfig(LAST_READ_PREFIX + ctx.sourceId, JSON.stringify(record));
+  return entries;
+}
+
 export async function runTranscriptArchive(engine: BrainEngine, opts: ArchiveRunOpts): Promise<ArchiveRunResult> {
   const dryRun = opts.dryRun === true;
-  const enabled = await archiveEnabled(engine);
-  if (!enabled && !dryRun) {
-    await reconcileArchiveAudience(engine, opts.sourceId);
+  const off = async (holdsRunLock = false) => {
+    await reconcileArchiveAudience(engine, opts.sourceId, holdsRunLock);
     return emptyResult(opts.mode, {
       source_id: await configuredSource(engine, opts.sourceId),
       message: 'The conversation archive is off on this brain, so nothing was read or written. It stays off until the owner turns it on (a shared brain is only offered it).',
       fix: offFix,
     });
-  }
+  };
+  const enabled = await archiveEnabled(engine);
+  if (!enabled && !dryRun) return off();
   const { sourceId, privacy } = await effectiveSource(engine, opts.sourceId);
   if (dryRun) return archiveSource(engine, opts, { enabled, sourceId, privacy });
-  if (privacy.unproven) {
-    const { opError } = await import('../ops/contract.ts');
-    throw opError('archive_audience_unproven', 'The brain\'s audience could not be checked (its client-usage read failed), so the conversation archive wrote nothing: a page written as personal could be open to other members.',
-      'Rerun gbrain transcripts archive run; if it repeats, declare the audience with gbrain config set brain.audience personal|shared.');
-  }
+  const { opError } = await import('../ops/contract.ts');
+  const unproven = () => opError('archive_audience_unproven', 'The brain\'s audience could not be checked (its client-usage read failed), so the conversation archive wrote nothing: a page written as personal could be open to other members.',
+    'Rerun gbrain transcripts archive run; if it repeats, declare the audience with gbrain config set brain.audience personal|shared.');
+  if (privacy.unproven) throw unproven();
   // One run per source at a time: a run decides from the ledger it read at its start, so an overlapping run could publish
   // older history over what the other run just wrote.
   const { withRefreshingLock, LockUnavailableError } = await import('../db-lock.ts');
   try {
-    return await withRefreshingLock(engine, ARCHIVE_LOCK_PREFIX + sourceId, signal => archiveSource(engine, opts, { enabled, sourceId, privacy, signal }));
+    return await withRefreshingLock(engine, ARCHIVE_LOCK_PREFIX + sourceId, async signal => {
+      // The audience and the archive switch are read again under the lock: a member add or audience change that finished
+      // after the reads above re-scoped under this lock and recorded the brain shared, so writing with the earlier reads
+      // would publish pages with no readers, or archive a shared brain whose unset switch now resolves off.
+      const locked = await effectiveSource(engine, opts.sourceId);
+      if (locked.sourceId !== sourceId) {
+        throw opError('archive_audience_changed', 'The brain\'s audience changed while the conversation archive was starting, so it now archives into source ' + locked.sourceId + ' instead of ' + sourceId + '; this run read and wrote nothing.',
+          'Rerun gbrain transcripts archive run.');
+      }
+      if (locked.privacy.unproven) throw unproven();
+      if (!await archiveEnabled(engine)) return off(sourceId === await configuredSource(engine, opts.sourceId));
+      return archiveSource(engine, opts, { enabled: true, sourceId, privacy: locked.privacy, signal });
+    });
   } catch (err) {
     if (!(err instanceof LockUnavailableError)) throw err;
-    const { opError } = await import('../ops/contract.ts');
     throw opError('archive_run_busy', 'Another conversation archive run holds source ' + sourceId + ', so this run read and wrote nothing.',
       'Wait for the other run to finish, then rerun; gbrain status --section locks --json shows the holder.');
   }
@@ -555,9 +718,13 @@ async function archiveSource(engine: BrainEngine, opts: ArchiveRunOpts, ctx: { e
     : await ensureSource(engine, sourceId);
   const context = dryRun ? undefined
     : opts.context ?? (opts.makeContext && await managedPersistenceEnabled(engine) ? await opts.makeContext(sourceId) : undefined);
-  const managed = !!context && await managedPersistenceEnabled(engine);
+  // A dry run builds no write context, but reports the write path the real run would take with the same options.
+  const managed = (dryRun ? !!(opts.context ?? opts.makeContext) : !!context) && await managedPersistenceEnabled(engine);
   const writeMode: ArchiveRunResult['write_mode'] = managed ? 'coordinator' : (!privacy.shared && isGitRepo(source.local_path) ? 'repo' : 'database');
-  if (!dryRun) await reconcileAudience(engine, await configuredSource(engine, opts.sourceId), privacy);
+  if (!dryRun) {
+    const configured = await configuredSource(engine, opts.sourceId);
+    await (configured === sourceId ? reconcileAudience(engine, configured, privacy) : reconcileWithoutRunLock(engine, configured, privacy));
+  }
   const tz = await archiveTimeZone(engine, sourceId);
   if (!tz.pinned && !dryRun) await engine.setConfig(PIN_PREFIX + sourceId, tz.timezone);
   const today = localDay(now.toISOString(), tz.timezone);
@@ -584,6 +751,7 @@ async function archiveSource(engine: BrainEngine, opts: ArchiveRunOpts, ctx: { e
   if (privacy.shared && !privacy.owner) {
     result.message = 'This brain is shared and names no owner member, so every archive day is held (archive_owner_unset) and nothing was written.';
     result.fix = ownerFix;
+    result.errors.push({ harness: '*', code: 'archive_owner_unset', message: result.message, fix: ownerFix });
   }
 
   const readers = opts.readers ?? await defaultArchiveReaders();
@@ -591,20 +759,7 @@ async function archiveSource(engine: BrainEngine, opts: ArchiveRunOpts, ctx: { e
   const minMtimeMs = opts.mode === 'backfill' ? Date.parse(from + 'T00:00:00.000Z') - 2 * 86_400_000 : sinceMs;
   const dayOf = (ts: string) => localDay(ts, tz.timezone);
   const pastDeadline = () => opts.deadlineAtMs !== undefined && Date.now() >= opts.deadlineAtMs && (result.stopped_at_deadline = true);
-  const entries: ArchiveScanEntry[] = [];
-  for (const reader of readers) {
-    if (entries.length && pastDeadline()) break;
-    if (reader.unavailable) { result.info.push(reader.unavailable); continue; }
-    try {
-      let found = 0;
-      for await (const entry of scanReader(reader, { sinceMs, minMtimeMs, dayOf })) { entries.push(entry); found++; }
-      if (found === 0) result.info.push('no readable sessions for ' + reader.harness + '; use gbrain connectors or an export with gbrain transcripts ingest');
-    } catch (err) {
-      if (classifyItemFailure(err).scope === 'run') throw err;
-      const e = err as { code?: string; message?: string; fix?: Action };
-      result.errors.push({ harness: reader.harness, reader: reader.name, code: e.code ?? 'archive_reader_failed', message: e.message ?? String(err), ...(e.fix ? { fix: e.fix } : {}) });
-    }
-  }
+  const entries = await readReaders(engine, readers, { sinceMs, minMtimeMs, dayOf }, { sourceId, mode: opts.mode, dryRun, at: now.toISOString(), result, pastDeadline });
   // A Gateway conversation and the session files of the same session id are one conversation: a reset in place leaves
   // the earlier messages only in the .jsonl.reset.* file, so the file messages merge in, each message once.
   const filesBySession = new Map<string, ArchiveScanEntry[]>();
@@ -623,7 +778,7 @@ async function archiveSource(engine: BrainEngine, opts: ArchiveRunOpts, ctx: { e
   const patterns = loadImportRedactionPatterns();
   const redactionVersion = sha256(ARCHIVE_REDACTION_RULES + '\u0000' + patterns.map(p => p.source).join('\u0000'));
   const ledger = new Map((await readArchiveLedger(engine, sourceId)).map(e => [e.harness + '.' + e.conversation_key_hash + '.' + e.day, e]));
-  const legacy = await legacyCovered(engine, sourceId);
+  const legacy = await legacyCovered(engine, await configuredSource(engine, opts.sourceId));
   const covered = (harness: string, day: string) => legacy.has(harness + '.' + day) || legacy.has('*.' + day);
 
   interface Item { entry: ArchiveScanEntry; hash: string; days: string[] }
@@ -654,6 +809,7 @@ async function archiveSource(engine: BrainEngine, opts: ArchiveRunOpts, ctx: { e
 
   const redact = opts.redact ?? ((s: ParsedSession) => redactSession(s, { patterns }));
   const pageCeiling = dryRun ? Math.floor(PAGE_MAX_BYTES * PAGE_CEILING_FILL) : await transcriptPageCeiling(engine);
+  const ownerMember = dryRun ? null : await ownerMemberId(engine);
   const quietMs = positiveInt(await engine.getConfig(ARCHIVE_QUIET_MINUTES_KEY), DEFAULT_QUIET_MINUTES) * 60_000;
   const groups = new Map<string, boolean>();
   const pending: ArchiveDayOutcome[] = [];
@@ -664,7 +820,7 @@ async function archiveSource(engine: BrainEngine, opts: ArchiveRunOpts, ctx: { e
   const flushBatch = async () => {
     if (!batch.length) return;
     if (ctx.signal?.aborted) throw ctx.signal.reason;
-    await flushWrites(engine, opts, { sourceId, writeMode, root: source.local_path, context }, batch);
+    await flushWrites(engine, opts, { sourceId, writeMode, root: source.local_path, context, shared: privacy.shared }, batch);
     for (const w of batch) {
       if ((w.outcome.status !== 'written' && w.outcome.status !== 'accepted') || !w.ledger) continue;
       ledger.set(w.ledger.harness + '.' + w.ledger.conversation_key_hash + '.' + w.ledger.day, w.ledger);
@@ -725,16 +881,23 @@ async function archiveSource(engine: BrainEngine, opts: ArchiveRunOpts, ctx: { e
       const hold: DayWrite['hold'] = opts.mode === 'backfill' ? 'backfill' : (!complete && !quiet ? 'open' : 'release');
       const dayInput = {
         harness: conv.harness, conversationKey: conv.conversationKey, ...(conv.scopeKey ? { scopeKey: conv.scopeKey } : {}), channel: conv.channel, day: outcome.day, timezone: tz.timezone,
-        redacted, slice, complete, partTargetBytes: pageCeiling, readableBy,
+        redacted, slice, complete, partTargetBytes: pageCeiling, readableBy, owner: { member: ownerMember } as SpeakerOwnerStamp | undefined,
       };
       let rendered = renderArchiveDay(dayInput);
-      const contentHash = sha256(rendered.parts.map(p => p.content).join('\u0000'));
+      let contentHash = sha256(rendered.parts.map(p => p.content).join('\u0000'));
       Object.assign(outcome, {
         slug: rendered.baseSlug, parts: rendered.parts.length, messages: rendered.messages,
         redactions: Object.values((rendered.parts[0]!.frontmatter.transcript_archive as { redactions: Record<string, number> }).redactions).reduce((a, b) => a + b, 0),
         ...(readableBy ? { readable_by: readableBy } : {}),
       });
       const before = prior(outcome.day);
+      // GST-3216: a day archived before speaker_owner existed gets the marker only on a write it needs anyway; adding
+      // it alone would rewrite every archived day of a session that is read again. `gbrain identity backfill` adds it.
+      if (before?.hash && before.hash !== contentHash && rendered.parts.some(p => p.frontmatter[SPEAKER_OWNER_KEY])) {
+        const plain = renderArchiveDay({ ...dayInput, owner: undefined });
+        const plainHash = sha256(plain.parts.map(p => p.content).join('\u0000'));
+        if (plainHash === before.hash) { rendered = plain; contentHash = plainHash; dayInput.owner = undefined; }
+      }
       const lost = before?.ids ? before.ids.some(id => !ids.includes(id)) : (before?.messages ?? 0) > rendered.messages;
       if (before?.hash && lost) {
         outcome.status = 'kept';
@@ -748,6 +911,7 @@ async function archiveSource(engine: BrainEngine, opts: ArchiveRunOpts, ctx: { e
           const { pending, ...rest } = before;
           await writeLedger(engine, { ...rest, hash: pending.hash, complete: pending.complete });
           outcome.status = 'unchanged';
+          if (hold === 'release') await releaseOpenDayHold(engine, sourceId, rendered.parts.map(p => p.slug));
           continue;
         }
         if (states.length === before.pending.requests.length && states.every(s => s === 'committed' || !isTerminalWriteState(s as WriteRequestState))) { outcome.status = 'accepted'; continue; }
@@ -815,7 +979,7 @@ async function archiveSource(engine: BrainEngine, opts: ArchiveRunOpts, ctx: { e
     await flushBatch();
     if (touched.size) {
       indexWrites = indexFor(touched, ledger);
-      await flushWrites(engine, opts, { sourceId, writeMode, root: source.local_path, context }, indexWrites);
+      await flushWrites(engine, opts, { sourceId, writeMode, root: source.local_path, context, shared: privacy.shared }, indexWrites);
     }
   }
   if (!dryRun && touched.size) await engine.setConfig(pendingKey, JSON.stringify(indexWrites.filter(w => w.outcome.status !== 'written' && w.outcome.status !== 'accepted' && w.outcome.status !== 'unchanged').map(w => w.outcome.day).sort()));
@@ -826,6 +990,9 @@ async function archiveSource(engine: BrainEngine, opts: ArchiveRunOpts, ctx: { e
 
   pending.sort((a, b) => b.day.localeCompare(a.day));
   result.days.push(...pending);
+  for (const d of pending) {
+    if (d.status === 'error') result.errors.push({ harness: d.harness, day: d.day, conversation_key_hash: d.conversation_key_hash, code: d.code ?? 'archive_day_failed', message: d.message ?? 'no detail' });
+  }
   for (const d of result.days) {
     if (d.status === 'written') result.written++;
     else if (d.status === 'accepted') result.accepted++;
@@ -871,10 +1038,25 @@ async function releaseOpenDayHold(engine: BrainEngine, sourceId: string | null, 
   await engine.executeRaw("UPDATE page_embedding_budget SET state = 'open', reason = NULL, updated_at = now() WHERE page_id = ANY($1::int[]) AND state = 'held' AND reason = $2", [ids, ARCHIVE_OPEN_DAY_HOLD_REASON]);
 }
 
-async function flushWrites(engine: BrainEngine, opts: ArchiveRunOpts, target: { sourceId: string; writeMode: ArchiveRunResult['write_mode']; root: string | null; context?: OperationContext }, writes: DayWrite[]): Promise<void> {
+/**
+ * The publication-time audience check (recheckAudienceEachDay): a member add or audience change that finished after
+ * the run read the audience under its lock leaves this run's later days unwritten instead of publishing them with no
+ * readers. A brain whose audience can no longer be proven stops the same way.
+ */
+async function assertAudienceUnchanged(engine: BrainEngine, sourceId: string, wasShared: boolean): Promise<void> {
+  const now = await resolvePrivacy(engine);
+  if (now.shared === wasShared && !now.unproven) return;
+  const { opError } = await import('../ops/contract.ts');
+  throw opError('archive_audience_changed', 'The brain\'s audience changed while the conversation archive was writing source ' + sourceId + ', so it stopped before writing the next day; days already written stay as they are and the owner-only re-scope covers them.',
+    'Rerun gbrain transcripts archive run.');
+}
+
+async function flushWrites(engine: BrainEngine, opts: ArchiveRunOpts, target: { sourceId: string; writeMode: ArchiveRunResult['write_mode']; root: string | null; context?: OperationContext; shared?: boolean }, writes: DayWrite[]): Promise<void> {
   const { sourceId, writeMode } = target;
+  const recheck = opts.recheckAudienceEachDay && !opts.dryRun ? () => assertAudienceUnchanged(engine, sourceId, target.shared === true) : null;
   const provenance = (harness: string) => ({ source_kind: 'transcript:' + harness, source_uri: 'archive:' + harness, ingested_via: INGESTED_VIA });
   if (writeMode === 'repo') {
+    if (recheck) await recheck();
     const root = target.root!;
     const paths: string[] = [];
     for (const w of writes) {
@@ -914,6 +1096,7 @@ async function flushWrites(engine: BrainEngine, opts: ArchiveRunOpts, target: { 
     let submitted = 0;
     for (const w of writes) {
       if (writeMode === 'coordinator' && deadline !== undefined && w.harness !== 'index' && submitted && Date.now() >= deadline) break;
+      if (recheck) await recheck();
       if (w.harness !== 'index') submitted++;
       try {
         const accepted: string[] = [];
@@ -967,15 +1150,25 @@ export interface ArchiveStatus {
   source_id: string;
   timezone: string | null;
   configured_timezone: string;
-  harnesses: Array<{ harness: string; reader: string; conversations: number; newest_session_day: string | null; newest_archived_day: string | null; info?: string }>;
+  /**
+   * One row per reader on this machine. conversations and newest_session_day are as of the last run that read it
+   * (read_at, read_mode; null when no run has read it yet): status never reads a reader itself. In run mode a run
+   * reads only recently active conversations, so conversations counts those; newest_session_day is the newest any run saw.
+   */
+  harnesses: Array<{ harness: string; reader: string; conversations: number; newest_session_day: string | null; newest_archived_day: string | null; read_at: string | null; read_mode?: 'run' | 'backfill'; info?: string }>;
   archived_days: number;
   held: Array<{ harness: string; day: string; code: string }>;
   legacy_days: number;
+  /** Readers whose last run failed, with when (at); a later successful read clears one. */
   errors: ArchiveReaderError[];
   /** The brain became shared but the pages archived while personal could not be kept to the owner yet. */
   rescope?: ArchiveRescopeSkip;
 }
 
+/**
+ * The archive's own records: config, ledger and what the last run read. It runs no reader (no Gateway call, no session
+ * file parsed); building the reader list only checks which harness folders exist and whether openclaw is on PATH.
+ */
 export async function archiveStatus(engine: BrainEngine, opts: { sourceId?: string; readers?: ArchiveReader[] } = {}): Promise<ArchiveStatus> {
   const { sourceId } = await effectiveSource(engine, opts.sourceId);
   const pinned = (await engine.getConfig(`${PIN_PREFIX}${sourceId}`))?.trim() || null;
@@ -985,27 +1178,20 @@ export async function archiveStatus(engine: BrainEngine, opts: { sourceId?: stri
     enabled: await archiveEnabled(engine), source_id: sourceId, timezone: pinned, configured_timezone: configured, harnesses: [],
     archived_days: entries.filter(e => e.hash && !e.held).length,
     held: entries.filter(e => e.held).map(e => ({ harness: e.harness, day: e.day, code: e.held!.code })),
-    legacy_days: (await legacyCovered(engine, sourceId)).size, errors: [],
+    legacy_days: (await legacyCovered(engine, await configuredSource(engine, opts.sourceId))).size, errors: [],
   };
+  const reads = await readArchiveReads(engine, sourceId);
+  const zone = pinned ?? configured;
   for (const reader of opts.readers ?? await defaultArchiveReaders()) {
     const archived = entries.filter(e => e.harness === reader.harness && e.hash).map(e => e.day).sort();
-    const row = { harness: reader.harness, reader: reader.name, conversations: 0, newest_session_day: null as string | null, newest_archived_day: archived[archived.length - 1] ?? null };
+    const row = { harness: reader.harness, reader: reader.name, conversations: 0, newest_session_day: null as string | null, newest_archived_day: archived[archived.length - 1] ?? null, read_at: null as string | null };
     if (reader.unavailable) { out.harnesses.push({ ...row, info: reader.unavailable }); continue; }
-    try {
-      const zone = pinned ?? configured;
-      let conversations = 0;
-      let newest: string | undefined;
-      for await (const entry of scanReader(reader, { dayOf: ts => localDay(ts, zone) })) {
-        conversations++;
-        if (entry.newest && (!newest || entry.newest > newest)) newest = entry.newest;
-      }
-      out.harnesses.push({ ...row, conversations, newest_session_day: newest ? localDay(newest, zone) : null,
-        ...(conversations ? {} : { info: 'no readable sessions for ' + reader.harness + '; use gbrain connectors or an export with gbrain transcripts ingest' }) });
-    } catch (err) {
-      const e = err as { code?: string; message?: string; fix?: Action };
-      out.errors.push({ harness: reader.harness, reader: reader.name, code: e.code ?? 'archive_reader_failed', message: e.message ?? String(err), ...(e.fix ? { fix: e.fix } : {}) });
-      out.harnesses.push(row);
-    }
+    const read = reads[reader.name];
+    if (read?.error) out.errors.push({ harness: reader.harness, reader: reader.name, code: read.error.code, message: read.error.message, ...(read.error.fix ? { fix: read.error.fix } : {}), at: read.error.at });
+    const newest = read?.newest ? localDay(read.newest, zone) : null;
+    if (!read?.at) { out.harnesses.push({ ...row, newest_session_day: newest }); continue; }
+    out.harnesses.push({ ...row, conversations: read.conversations ?? 0, newest_session_day: newest, read_at: read.at, ...(read.mode ? { read_mode: read.mode } : {}),
+      ...(newest ? {} : { info: 'no readable sessions for ' + reader.harness + '; use gbrain connectors or an export with gbrain transcripts ingest' }) });
   }
   const rescope = await archiveRescopeSkipped(engine, opts.sourceId);
   if (rescope) out.rescope = rescope;

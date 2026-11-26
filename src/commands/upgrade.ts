@@ -8,7 +8,7 @@ import { opError, type OperationError } from '../core/ops/contract.ts';
 import { writeCliError } from '../cli/cli-error.ts';
 import { VERSION } from '../version.ts';
 import type { InteractiveProbe } from '../core/interaction.ts';
-import { forwardProgressPast, migrationLedgerSummary, wedgedLedgerHint } from '../core/migration-ledger.ts';
+import { forwardProgressPast, hostWorkOwedForVersion, hostWorkOwedMessage, indexCompletedEntries, migrationLedgerSummary, wedgedLedgerHint } from '../core/migration-ledger.ts';
 import { loadCompletedMigrations } from '../core/preferences.ts';
 import { MIGRATIONS_RUNNING_EXIT_CODE, readMigrationLockHolder } from '../core/migration-orchestration-lock.ts';
 import { loadConfig, gbrainPath } from '../core/config.ts';
@@ -523,7 +523,11 @@ export async function describeMigrationFailure(error: unknown, newVersion: strin
       + 'Wait for it to finish; `gbrain doctor` shows migration progress.';
   }
   const ledger = newVersion ? loadCompletedMigrations() : [];
-  const wedged = newVersion ? migrationLedgerSummary(newVersion).wedged.filter(v => forwardProgressPast(v, ledger) === null) : [];
+  const history = indexCompletedEntries(ledger);
+  const summary = newVersion ? migrationLedgerSummary(newVersion).wedged : [];
+  const owed = summary.filter(v => hostWorkOwedForVersion(v, history));
+  const wedged = summary.filter(v => !owed.includes(v) && forwardProgressPast(v, ledger) === null);
+  if (owed.length > 0 && wedged.length === 0) return `Migrations: wedged. ${hostWorkOwedMessage(owed)}`;
   if (wedged.length > 0) {
     return `Migrations: wedged (${wedged.map(v => `v${v}`).join(', ')} ended partial 3+ times in a row). Fix the cause recorded in ${wedgedLedgerHint()}, then run: `
       + `${wedged.map(v => `gbrain apply-migrations --force-retry ${v}`).join(' && ')} && gbrain apply-migrations --yes`;
@@ -886,6 +890,8 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
       const state = JSON.parse(readFileSync(statePath, 'utf-8'));
       const from = state?.last_upgrade?.from;
       if (from) {
+        const summary = (await import('../core/upgrade-summary.ts')).upgradeSummary(from);
+        if (summary) console.log(['', ...summary, ''].join('\n'));
         const { migrations } = await import('./migrations/index.ts');
         for (const m of migrations) {
           if (isNewerThan(m.version, from)) {
@@ -907,6 +913,8 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
   (await import('../core/setup/brain-first-upgrade-notice.ts')).printBrainFirstUpgradeNotice(); // GBRA-188: the command that writes a missing brain-first block
   await (await import('../core/setup/hook-launcher-refresh.ts')).refreshHookLaunchers(); // #8424: hooks that start gbrain in the session's directory move onto the launcher
   (await import('../core/post-upgrade-notice.ts')).writePostUpgradeCliNotice(); // F7: safety notice ([AGENT] block for agents)
+  const addonWarning = await (await import('./rust-addon-upgrade.ts')).refreshRustAddonForConfiguredBrain(); // Rust brain or shadow on only; best effort
+  if (addonWarning) report.warnings.push(addonWarning);
   // Mechanical: run every outstanding migration. Idempotent; exits 0 quickly
   // when nothing is pending. Stays inside the same process so a long Phase F
   // (autopilot install) doesn't hit a subprocess boundary.

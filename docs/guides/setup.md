@@ -24,9 +24,9 @@ Before it writes anything, setup resolves and prints:
 |---|---|
 | Brain | This install's config (`GBRAIN_HOME`). With none, a new keyless PGLite brain from `gbrain init --pglite --no-embedding`. |
 | Source | `--source`, else `GBRAIN_SOURCE`, else unpinned (the server uses the brain's default source). |
-| Transport | Local stdio: the harness starts `<launcher> serve --surface <surface>`, plus `--advertise verbs` on a new registration that chose no surface. |
+| Transport | Local stdio: the harness starts `<launcher> serve --surface <surface>`, plus `--advertise verbs` on a new Claude Code registration that chose no surface. |
 | Launcher | `--gbrain-bin`, else the absolute `gbrain` on `PATH` (GUI-launched hosts inherit no `PATH`, so a bare name is never written). |
-| Surface | `--surface`, else `GBRAIN_SURFACE`, else the surface already registered, else `starter`, listing only the seven memory verbs and `request_tools` (`--advertise verbs`). A chosen surface is listed in full; `--surface full` is the opt-in for every tool; an existing registration keeps its surface and listing. |
+| Surface | `--surface` (with `--advertise` to narrow its listing), else `GBRAIN_SURFACE`, else the surface already registered, else the harness default: Claude Code `starter`, listing only the seven memory verbs and `request_tools` (`--advertise verbs`); Codex `full`, listed whole, because Codex does not reload its tool list and never calls a tool `request_tools` unlocks. A chosen surface is listed in full and recorded as pinned (`surface_origin: explicit` in the Codex receipt); an existing Claude Code registration keeps its surface and listing. A Codex entry that follows the default (`surface_origin: default`) moves with it on a re-run, and setup prints the move and the line that keeps the old entry; `gbrain setup codex --surface starter --advertise verbs` pins the old registration. `gbrain config set mcp.default_surface_<claude_code\|codex\|hermes> full\|starter` turns one harness's default (the activation and rollback knob; `config unset` restores the shipped default). |
 | Owner | Who owns the MCP name now: nobody, this setup (its receipt), or the gbrain Claude Code or Codex plugin (setup then adds hooks only). |
 
 It refuses with a coded error, before any write, when the target is not safe:
@@ -75,6 +75,13 @@ in effect and how to change them, and applies a choice whenever the user makes
 one. Automatic saving is separate from the capture decision above; while
 unanswered it comes back in a later session until the user answers or mutes
 it.
+
+A new personal brain that `gbrain setup claude-code` or `gbrain setup codex`
+created also gets the [first-session suggestion](first-session-suggestion.md):
+for the first 3 sessions within 14 days, the session-start context tells the
+agent to offer one thing it found in the brain, then one more import.
+`--no-suggestion` turns it off at install time (`gbrain onboarding off` later),
+and `--json` reports it as the `suggestion` marker next to `history`.
 
 ## States
 
@@ -127,7 +134,11 @@ table with its `trusted_hash`, otherwise Codex lists it and silently skips it.
   SECURITY.md)
   (15 s), plus the detached `hook session-end --harness codex` capture command
   (3 s) only after `--capture`;
-- one trust table per group.
+- one trust table per group;
+- the top-level `mcp_optional_startup_grace_ms = 0`, only when the key is
+  unset, so Codex 0.151 and newer wait for gbrain to start instead of leaving
+  its tools out of the session after one second ([Codex guide](../mcp/CODEX.md)).
+  A value you set is kept, and `--remove` deletes the key only while it is still setup's `0`.
 
 Each of these entries is owned by its sha256 fingerprint (canonical JSON of the
 exact parsed entry), stored per entry in
@@ -179,8 +190,54 @@ other pages no rule or `readable_by` restricts, which every member's key still r
 by folder, with the commands that label them; `--labelled-only` keeps each member to
 the pages labelled for it instead (never the owner). See
 [pages every member's key can read](access-designations.md#pages-every-members-key-can-read).
+When the brain serves one person and already holds such pages (a journal, DMs, chat,
+mail, the conversation archive), setup asks for that choice before it writes anything:
+it refuses with `setup_history_choice_required`, naming the count, how many are DMs,
+chat or mail and how many are in the conversation archive, until you pass
+`--labelled-only` (keep that history private) or `--open-history` (every member reads
+it). It also refuses when it could not count them, and the `--labelled-only` command it
+suggests leaves the owner out of `--members`, since the owner reads the whole brain. When the brain has the `company` source (`--shape company`), a `--labelled-only` run
+also adds one folder rule, `company/` in source `company`, readable by the owner, the
+run's members and every member who is not labelled-only, so the members still read the
+company pages and imported calls; only keys bound to those members read pages under
+`company/`. A re-run adds new members to that rule and never removes one; because that
+widens it, the new readers wait for `gbrain access apply --source company` (preview, then
+the `--yes --expect` line it prints). A run without `--labelled-only` adds no such rule. A
+new brain, one with no such pages and one that already serves several people are not asked.
+On a brain with no owner, setup also names one: `--owner <id>`, or by default your
+login name as a member id. It adds that member and runs `gbrain access owner set`;
+the preview shows it first, and an owner that is already set is kept. No key is
+rebound: the receipt lists each live token or OAuth client bound to no member with
+the `gbrain auth rescope --token|--client <name> --member <owner>` command that
+binds it, so you bind your own keys on purpose.
+Each key setup mints writes to the run's source and reads a fixed list: that source,
+the `company` source when it exists (`--shape company`), and every source federated
+when the key is minted. The preview names the list and how many pages `company` holds,
+how many of them are imported calls, and that every member reads them all, calls they
+did not attend included. A source federated later reaches these keys only when you run
+setup again: a re-run adds sources to a key setup minted with a list and never removes
+one, but only while the key's list is still the one setup gave it. A key you changed by
+hand (`gbrain auth rescope`) is skipped: the receipt names it, with `action: skipped` on
+its `keys` row under `--json`, and the rescope command that adds the new sources. A
+source archived since the key was minted is dropped from its list; when that source is
+the key's write source, setup blocks the key instead and names the commands that repoint
+or revoke it. Unfederating a source does not take it away from these keys either:
+`gbrain sources unfederate <id>` lists each member key that still reads it, with the
+`gbrain auth rescope --token <name> --sources <ids>` command that drops it.
+Keys minted before this (the default grant) are never changed. When the same run
+adds the `company` source (`--shape company`), setup labels the people first and then
+gives their new keys `company`; `company` itself stays out of default search.
 Setup leaves the stdio server unbound: stdio sessions read only pages no rule
 restricts, and the harness's instructions keep the one-person scoping lines.
+The one exception is a company brain (`--shape company` or `both`): there setup
+ties the Claude Code or Codex entry it installs to the brain owner
+(`serve --stdio-member <owner>`), so your own assistant reads every page and every
+imported call, and calls can be kept to the people on them
+([calls not scoped](repair.md#calls-not-scoped)). It never ties an entry that
+already names a member, one a plugin serves, or one on a host running OpenClaw or
+Hermes; `--no-stdio-member` leaves the entry unbound. With `--transcripts`, setup
+prints one line per imported call with its readers, and each name it could not
+match with the `gbrain repair visibility` command that adds a reader.
 For a Claude Code or Codex install only one person uses, bind that harness alone:
 `gbrain setup claude-code --stdio-member <member>` (or `codex`) writes
 `serve --stdio-member <member>` into that harness's MCP entry, so its sessions read
@@ -188,7 +245,7 @@ as that member, including pages only that member may read. Other harnesses on th
 machine, and other machines that open the same brain (PGLite or Postgres), are
 unchanged. The member must be enabled (or one of `--members` in the same run).
 Re-runs, `gbrain post-upgrade` and doctor fixes keep the entry's member and never
-add one; `--no-stdio-member` removes it, also on a brain that serves several
+add one outside that company case; `--no-stdio-member` removes it, also on a brain that serves several
 people. Setup refuses `--stdio-member` where OpenClaw or Hermes is installed,
 because those harnesses serve several people, and `gbrain serve` refuses to start
 with the flag there too: a bot that answers several people runs
@@ -213,6 +270,25 @@ a brain setup cannot read refuses (`setup_serves_unreadable`).
 `people/<name>/` folder with pages and no rule naming its readers.
 `gbrain access serves several --members ...` does the labelling alone (preview, then
 `--yes`).
+
+### A member's key into their harness
+
+A member key (`member-keys/<member>.key`) is a plain bearer key for
+`gbrain serve --http`. Hand the file to its member privately; on their machine they
+put it into Claude Code, Codex or opencode with the bearer-token form of
+`gbrain connect`, which reads the key from `GBRAIN_REMOTE_TOKEN` so it never lands in
+shell history:
+
+```bash
+GBRAIN_REMOTE_TOKEN="$(cat alice-example.key)" \
+  gbrain connect https://brain.example.com/mcp --agent claude-code --install
+# --agent codex or --agent opencode for those harnesses
+```
+
+`gbrain whoami` over that connection names the member. `--harness` and
+`--credentials-file` take only the credential handoff that `gbrain mcp grant`
+writes, never a member key; given one, `gbrain connect` refuses and prints the
+command above.
 
 On such a brain every remote read must say whom it reads for. A token, OAuth
 client or stdio server bound to no member is refused with
@@ -261,7 +337,7 @@ may read (see below).
 | claude-code | `~/.claude/CLAUDE.md` (`--scope project`: `./CLAUDE.local.md`) |
 | codex | `$CODEX_HOME/AGENTS.md`, or a non-empty `AGENTS.override.md` (the file Codex loads) |
 | opencode | `~/.config/opencode/AGENTS.md` |
-| openclaw | `<workspace>/AGENTS.md` (`agents.defaults.workspace`, else `~/.openclaw/workspace`; several agents need `--workspace`) |
+| openclaw | `<workspace>/AGENTS.md` (`agents.defaults.workspace`, else `~/.openclaw/workspace`, under `$OPENCLAW_HOME` when set; several agents need `--workspace`) |
 | hermes | `$HERMES_HOME/SOUL.md`, after the identity text; never created, since a SOUL.md replaces Hermes's default identity |
 | cursor | `./.cursor/rules/gbrain-brain-first.mdc` (an always-applied project rule) |
 
@@ -308,6 +384,11 @@ client and from a compiled binary. The index names the absolute launcher the
 install recorded, so the index and the skills it loads come from the same
 gbrain. MCP `get_skill` is unchanged.
 
+A tool that reads gbrain's skill files from disk (for example `skills/conventions/`)
+can ask `gbrain bundled-skill --json` for `skills_root`, the skills folder of
+the gbrain that is running, instead of walking up from the binary. It is
+`null` for a single-file binary, whose skills are read with `--asset`.
+
 | | |
 |---|---|
 | Select | `--skill-loading off\|spring` on `gbrain setup <harness>` (`resolve` on `setup claude-code\|codex` turns on the per-turn skill resolver instead: [skill-resolver guide](skill-resolver.md#hook-lane-claude-code-and-codex); on `setup openclaw`, `resolve\|shadow` installs the [skill-resolver plugin](skill-resolver.md#openclaw-plugin)), `gbrain connect --install`, `gbrain connect --harness … --install` and `gbrain bootstrap harness`; or `GBRAIN_SKILL_LOADING`. Flag, then env, then the recorded choice, then `off`. |
@@ -330,7 +411,7 @@ claimed from documentation alone.
 | codex | local stdio | supported | native-verified: on codex-cli 0.162.1, after a fresh `gbrain setup codex`, the `UserPromptSubmit` hook put a randomized brain item into a fresh native `codex exec` session, which answered it with no tool call (3 of 3 installs); a `--no-hooks` control answered NONE |
 | openclaw | local context engine | instruction block; MCP per [its guide](../mcp/OPENCLAW.md) | native-pending |
 | openclaw | thin client | instruction block; MCP per [its guide](../mcp/OPENCLAW.md) | unsupported |
-| hermes | local stdio | instruction block; MCP per [its guide](../mcp/HERMES.md) | unsupported |
+| hermes | local stdio | instruction block and turn hook; MCP through `hermes mcp add` ([its guide](../mcp/HERMES.md)) | unsupported |
 
 ## How setup relates to the other entry points
 

@@ -61,18 +61,22 @@ const sqlOf = (db: Db): SqlQuery => typeof db === 'function' ? db : sqlQueryForE
  */
 export async function markedScopeSources(db: Db, ids: readonly string[], lock?: 'share' | 'update'): Promise<Set<string>> {
   if (!ids.length) return new Set();
-  const sql = sqlOf(db);
+  const rows = typeof db === 'function' ? await scopeSourceRows(db, ids, lock) : await db.readScopeSourceConfigs(ids, lock);
+  return new Set(rows.filter(r => isScopeSourceConfig(r.config)).map(r => String(r.id)));
+}
+
+/** The same read through a caller's SqlQuery (a transaction handle the grant writes hold). */
+async function scopeSourceRows(sql: SqlQuery, ids: readonly string[], lock?: 'share' | 'update'): Promise<Record<string, unknown>[]> {
   const list = JSON.stringify([...new Set(ids)]);
-  const rows = lock === 'update'
+  return lock === 'update'
     ? await sql`SELECT id, config FROM sources WHERE id IN (SELECT jsonb_array_elements_text(${list}::text::jsonb)) ORDER BY id FOR UPDATE`
     : lock === 'share'
       ? await sql`SELECT id, config FROM sources WHERE id IN (SELECT jsonb_array_elements_text(${list}::text::jsonb)) ORDER BY id FOR SHARE`
       : await sql`SELECT id, config FROM sources WHERE id IN (SELECT jsonb_array_elements_text(${list}::text::jsonb))`;
-  return new Set(rows.filter(r => isScopeSourceConfig(r.config)).map(r => String(r.id)));
 }
 
 export interface CredentialRef { kind: 'token' | 'client'; id: string }
-interface CredentialSources { ref: CredentialRef; reads: string[]; write: string | null; attest: string[]; privatePages: boolean; label: string }
+interface CredentialSources { ref: CredentialRef; reads: string[]; write: string | null; attest: string[]; privatePages: boolean; privateFacts: boolean; label: string }
 
 const same = (a: CredentialRef, b: CredentialRef | null | undefined) => !!b && a.kind === b.kind && a.id === b.id;
 const strings = (v: unknown): string[] => Array.isArray(v) ? v.filter((s): s is string => typeof s === 'string') : [];
@@ -98,10 +102,10 @@ async function credentialSources(sql: SqlQuery): Promise<CredentialSources[]> {
     ...clients.map(row => {
       const g = grantFromRow(row);
       return { ref: { kind: 'client' as const, id: g.clientId }, reads: clientGrantReads(g), write: g.sourcesNone === true ? null : g.sourceId ?? 'default',
-        attest: strings(row.attest_sources), privatePages: row.private_pages === 'granted_sources', label: `OAuth client ${g.clientId}` };
+        attest: strings(row.attest_sources), privatePages: row.private_pages === 'granted_sources', privateFacts: row.private_facts === 'granted_sources', label: `OAuth client ${g.clientId}` };
     }),
     ...tokens.map(row => ({ ref: { kind: 'token' as const, id: String(row.id) }, ...sourcesOf(grantFromTokenRow(row).sources),
-      attest: strings(row.attest_sources), privatePages: row.private_pages === 'granted_sources', label: `token ${String(row.name ?? row.id)}` })),
+      attest: strings(row.attest_sources), privatePages: row.private_pages === 'granted_sources', privateFacts: row.private_facts === 'granted_sources', label: `token ${String(row.name ?? row.id)}` })),
   ];
 }
 
@@ -110,12 +114,16 @@ async function credentialSources(sql: SqlQuery): Promise<CredentialSources[]> {
  * being written (null for one not inserted yet), whose stored attest_sources are honoured. `default` is never a scope
  * source (applyAttestSources refuses it), so a default-only grant reads nothing.
  */
-export async function assertScopeSourceGrant(db: Db, self: CredentialRef | null, reads: readonly string[], opts: { privatePages?: boolean; writeSource?: string | null } = {}): Promise<void> {
+export async function assertScopeSourceGrant(db: Db, self: CredentialRef | null, reads: readonly string[], opts: { privatePages?: boolean; privateFacts?: boolean; writeSource?: string | null } = {}): Promise<void> {
   const sql = sqlOf(db);
-  const attest = self && (opts.privatePages || opts.writeSource) ? (await credentialSources(sql)).find(c => same(c.ref, self))?.attest ?? [] : [];
+  const attest = self && (opts.privatePages || opts.privateFacts || opts.writeSource) ? (await credentialSources(sql)).find(c => same(c.ref, self))?.attest ?? [] : [];
   if (opts.privatePages && attest.length) {
     throw new GrantError('invalid_grant', 'This credential lists scope sources (--attest-sources), so it cannot hold the private-pages grant; nothing changed. '
       + 'A scope credential reads only shared memory: use a separate credential for private pages.');
+  }
+  if (opts.privateFacts && attest.length) {
+    throw new GrantError('invalid_grant', 'This credential lists scope sources (--attest-sources), so it cannot hold the private-facts grant; nothing changed. '
+      + 'A scope credential reads only shared memory: use a separate credential for private facts.');
   }
   if (opts.writeSource && attest.includes(opts.writeSource)) {
     throw new GrantError('invalid_grant', `Source ${opts.writeSource} is in this credential's --attest-sources, so it cannot be its write source (where member pages live); nothing changed. `
@@ -159,6 +167,9 @@ export async function applyAttestSources(db: Db, self: CredentialRef, next: read
   }
   if (added.length && mine?.privatePages) {
     throw attestInvalid('This credential holds the private-pages grant, so it cannot list scope sources; nothing changed.', 'Clear it first (gbrain auth rescope ... --private-pages none): a scope credential reads only shared memory.');
+  }
+  if (added.length && mine?.privateFacts) {
+    throw attestInvalid('This credential holds the private-facts grant, so it cannot list scope sources; nothing changed.', 'Clear it first (gbrain auth rescope ... --private-facts none): a scope credential reads only shared memory.');
   }
   for (const s of added) {
     const [row] = await sql`SELECT archived, config FROM sources WHERE id = ${s}`;

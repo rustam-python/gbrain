@@ -174,6 +174,10 @@ export interface ServeOptions {
   // Defaults to GBRAIN_SERVE_BOOT_TIMEOUT_SECONDS (seconds; 60 when
   // unset, 0 disables) when omitted.
   bootTimeoutMs?: number;
+  // Test seam for the boot-readiness deadline's clock and timers, so tests
+  // drive the no-progress window without real time. Defaults to Date.now and
+  // unref'd global timers.
+  bootClock?: { now: () => number; setTimeout: (fn: () => void, ms: number) => unknown; clearTimeout: (handle: unknown) => void };
   // Test seam for the idle maintenance sweep [ENG-5]. Replaces the sweep
   // body so unit tests can assert timer wiring without importing the real
   // sweep core (which opens engine work). Defaults to a lazy-imported
@@ -287,6 +291,8 @@ async function serveBrain(
   const isHttp = args.includes('--http');
   // Wakeshift (docs/guides/wakeshift.md): the 5 s wake drainer for stdio and HTTP alike; a no-op tick while reporting back is off.
   (await import('../core/wakeshift/drain.ts')).startWakeDrain(engine);
+  // #7082: a keyword statement that timed out is re-run in the background so its skip ends once the cache is warm.
+  (await import('../core/postgres-engine/keyword-timeout-cache.ts')).setKeywordTimeoutReruns(true);
 
   // MEMORY_VERBS v1: tool-surface mode. stdio: GBRAIN_SURFACE > --surface >
   // config `mcp_surface` > 'full'; --http ignores GBRAIN_SURFACE (an HTTP
@@ -307,6 +313,8 @@ async function serveBrain(
   }
   console.error(`[gbrain serve] surface=${surface} (source: ${SURFACE_SOURCE_LABEL[resolved.source]})${advertise ? ` advertise=${advertise}` : ''}`);
   void (await import('../core/serve-behavior-notice.ts')).logServeBehaviorNotice(engine, loadConfig());
+  // brain_ref for `gbrain engine status --probe`, which cannot open a PGLite brain this serve holds (serve-brain-ref.ts).
+  void import('./serve-brain-ref.ts').then(m => m.recordServeBrainRefAtStart(engine)).catch(() => undefined);
   // #6543 (A6): serve's stuck, desync and recovery events go to the pool-recovery audit `doctor --only pool_reap_health` reads.
   if (engine.kind === 'postgres') {
     const { logPoolRecovery } = await import('../core/audit/pool-recovery-audit.ts');
@@ -347,6 +355,8 @@ async function serveBrain(
   const sourceGuard = args.includes('--source-guard');
   // Opt-in warm CLI socket (core/cli-socket/server.ts): off, the serve loads nothing and reads nothing for it.
   const cliSocketOn = args.includes('--cli-socket') || MERGED_CONFIG_BY_ENGINE.get(engine)?.serve_cli_socket === true;
+  // Opt-in Google token socket (core/google-socket/server.ts, file-plane google.mint_socket): off, the serve loads none of it.
+  const googleSocketOn = (await import('../core/config.ts')).loadConfigFileOnly()?.google?.mint_socket === true;
   // Opt-in vector index prewarm (core/vector-prewarm.ts): off, the serve loads nothing and reads nothing for it.
   if (MERGED_CONFIG_BY_ENGINE.get(engine)?.serve_vector_prewarm === true) {
     void import('../core/vector-prewarm.ts').then(m => m.prewarmAtServeStart(engine, opts.log ?? ((msg: string) => console.error(msg))));
@@ -451,6 +461,7 @@ async function serveBrain(
     const mcpLogPrune = installMcpLogPrune(engine, opts, httpLog, () => false);
 
     const cliSocket = cliSocketOn ? await (await import('../core/cli-socket/server.ts')).startCliSocket(engine, httpLog) : null;
+    const googleSocket = googleSocketOn ? await (await import('../core/google-socket/server.ts')).startGoogleSocketForServe(httpLog) : null;
     try {
       await runHttp(engine, { port, tokenTtl, enableDcr, enableDcrInsecure, publicUrl, logFullParams, bind, suppressBootstrapToken, printAdminToken, surface, ...(advertise ? { advertise } : {}), adoptServer: opts.adoptServer });
     } finally {
@@ -459,6 +470,7 @@ async function serveBrain(
       idleUpkeep?.stop();
       mcpLogPrune?.stop();
       cliSocket?.close();
+      googleSocket?.close();
     }
 
     await finishHttpServe(engine, opts);
@@ -495,16 +507,21 @@ async function serveBrain(
   // same as the graceful-shutdown path, so a wedged WASM close can't trap
   // us either.
   const bootTimeoutMs = opts.bootTimeoutMs ?? resolveBootTimeoutMs();
-  let bootDeadline: ReturnType<typeof setTimeout> | null = null;
+  const clock = opts.bootClock ?? {
+    now: () => Date.now(),
+    setTimeout: (fn: () => void, ms: number) => { const t = setTimeout(fn, ms); t.unref?.(); return t; },
+    clearTimeout: (h: unknown) => clearTimeout(h as ReturnType<typeof setTimeout>),
+  };
+  let bootDeadline: unknown = null;
   let bootPhase = 'starting';
-  let bootProgressAt = Date.now();
+  let bootProgressAt = clock.now();
   const bootStartedAt = bootProgressAt;
-  const stopProgressWatch = bootTimeoutMs > 0 ? onForwardProgress(() => { bootProgressAt = Date.now(); }) : () => {};
+  const stopProgressWatch = bootTimeoutMs > 0 ? onForwardProgress(() => { bootProgressAt = clock.now(); }) : () => {};
   if (bootTimeoutMs > 0) {
     const log = opts.log ?? ((msg: string) => console.error(msg));
     const exit = opts.exit ?? ((code?: number) => { process.exit(code); });
     const fire = () => {
-      log(formatBootTimeout(bootTimeoutMs, bootPhase, engine, Date.now() - bootStartedAt));
+      log(formatBootTimeout(bootTimeoutMs, bootPhase, engine, clock.now() - bootStartedAt));
       const cleanup = setTimeout(() => { exit(1); }, CLEANUP_DEADLINE_MS);
       cleanup.unref?.();
       Promise.resolve()
@@ -522,17 +539,15 @@ async function serveBrain(
     // whatever remains of the window since the last phase change or
     // progress note, and fires only once a full window passed without one.
     const check = () => {
-      const idle = Date.now() - bootProgressAt;
+      const idle = clock.now() - bootProgressAt;
       if (idle >= bootTimeoutMs) { fire(); return; }
-      bootDeadline = setTimeout(check, bootTimeoutMs - idle);
-      bootDeadline.unref?.();
+      bootDeadline = clock.setTimeout(check, bootTimeoutMs - idle);
     };
-    bootDeadline = setTimeout(check, bootTimeoutMs);
-    bootDeadline.unref?.();
+    bootDeadline = clock.setTimeout(check, bootTimeoutMs);
   }
 
   try {
-    await start(engine, { surface, surfaceSource: resolved.source, ...(resolved.invalidEnv !== undefined ? { invalidSurfaceEnv: resolved.invalidEnv } : {}), ...(sourceGuard ? { sourceGuard } : {}), onBootPhase: phase => { bootPhase = phase; bootProgressAt = Date.now(); }, ...(access === 'read-only' ? { access } : {}), ...(advertise ? { advertise } : {}), ...(stdioMember !== undefined ? { stdioMember } : {}) });
+    await start(engine, { surface, surfaceSource: resolved.source, ...(resolved.invalidEnv !== undefined ? { invalidSurfaceEnv: resolved.invalidEnv } : {}), ...(sourceGuard ? { sourceGuard } : {}), onBootPhase: phase => { bootPhase = phase; bootProgressAt = clock.now(); }, ...(access === 'read-only' ? { access } : {}), ...(advertise ? { advertise } : {}), ...(stdioMember !== undefined ? { stdioMember } : {}) });
     // `--stdio-idle-timeout` arms its timer during lifecycle installation,
     // but its stdin activity listener must wait until startMcpServer has
     // attached the MCP SDK transport listener. Attaching any `data` listener
@@ -542,7 +557,7 @@ async function serveBrain(
     // Opt-in warm CLI socket; bound after the stdout redirect so a request's captured console output keeps its stream.
     if (cliSocketOn) void import('../core/cli-socket/server.ts').then(m => m.startCliSocket(engine, opts.log ?? ((msg: string) => console.error(msg))));
   } finally {
-    if (bootDeadline) clearTimeout(bootDeadline);
+    if (bootDeadline) clock.clearTimeout(bootDeadline);
     stopProgressWatch();
   }
   // startMcpServer returns after the SDK has wired up its stdin 'data'
@@ -695,6 +710,7 @@ function installStdioLifecycle(
   const beginShutdown = (reason: string): void => {
     if (shuttingDown) return;
     shuttingDown = true;
+    void import('../core/postgres-engine/keyword-timeout-cache.ts').then(m => m.setKeywordTimeoutReruns(false));
 
     // Stop the parent-watchdog interval as soon as a shutdown begins so
     // it cannot fire a redundant 'parent-died' shutdown while the first

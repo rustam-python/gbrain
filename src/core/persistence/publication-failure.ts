@@ -69,7 +69,7 @@ export const SOURCE_CHECKOUT_MISSING = 'source_checkout_missing';
  * (`storedCheckoutRefusal` in verb-errors.ts): the checkout is missing, was recreated at its recorded path
  * (`physicalRootDirectoryChangedError`), or holds an ownership record other users can read (`ownershipRecordNotPrivateError`).
  */
-export const CHECKOUT_REFUSAL_ORIGINS = [SOURCE_CHECKOUT_MISSING, 'physical_root_directory_changed', 'ownership_record_not_private'] as const;
+export const CHECKOUT_REFUSAL_ORIGINS = [SOURCE_CHECKOUT_MISSING, 'physical_root_directory_changed', 'ownership_record_not_private', 'ownership_reservation_missing'] as const;
 export type CheckoutRefusalOrigin = typeof CHECKOUT_REFUSAL_ORIGINS[number];
 export interface CheckoutRefusalDetail { origin: CheckoutRefusalOrigin; stage?: PublicationStage; attempt?: { consumer_version: string; consumer_host_id: string | null } }
 /** #6693: a page write refused because its file holds a committed change sync has not imported (`pending_import`) or sync holds the file (`sync_held`). */
@@ -135,8 +135,12 @@ const RELATIONSHIP_TEXT: Record<string, string> = {
   topology_outside_administration: 'a source topology change outside writer administration',
   unreadable_state: 'writer state this database role cannot fully read (row-level security hides it or applies to the role, or a singleton row is missing)',
 };
-/** #7780: the tables an unreadable_state raise names in its DETAIL `state` (writer-guard-schema.ts, git-canonical-schema.ts). */
-const UNREADABLE_STATES: ReadonlySet<unknown> = new Set(['persistence_brain', 'git_canonical_brain', 'sources', 'pages', 'guest_sources']);
+/**
+ * #7780: the tables an unreadable_state raise names in its DETAIL `state` (writer-guard-schema.ts, git-canonical-schema.ts),
+ * and since #7632 the ledgers the purge and withdrawal guards read (derived-state-maintainers.ts requireLedgerPoliciesSql).
+ */
+const UNREADABLE_STATES: ReadonlySet<unknown> = new Set(['persistence_brain', 'git_canonical_brain', 'sources', 'pages', 'guest_sources',
+  'facts', 'fact_purges', 'fact_withdrawals', 'take_purges', 'page_purges', 'page_segment_derivation_purges', 'page_segment_derivation_purge_pages']);
 
 /**
  * #7777: the persistence protocol guards (shared-skills/persistence-schema.ts) raise SQLSTATE 42501, which is also

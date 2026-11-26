@@ -522,7 +522,7 @@ function makeServiceEngine(chunks: ChunkInput[]) {
         deleted_at: null,
       };
     },
-    async executeRaw(sql: string, params: unknown[] = []) {
+    async executeRaw(sql: string) {
       if (sql.includes('FROM config')) return [
         { key: 'embedding_columns', value: JSON.stringify({ embedding: {
           type: 'vector', dimensions: TEST_DIMS, provider: TEST_EMBEDDING_MODEL,
@@ -533,21 +533,23 @@ function makeServiceEngine(chunks: ChunkInput[]) {
       if (sql.startsWith('SELECT chunker_version')) {
         return [{ chunker_version: MARKDOWN_CHUNKER_VERSION, corpus_generation: null }];
       }
-      if (sql.startsWith('UPDATE content_chunks SET')) {
-        for (const row of JSON.parse(String(params[1])) as Array<{ id: number; chunk_text: string; embedding: string | null; model: string | null }>) {
-          const original = storedChunks.find(chunk => chunk.id === row.id);
-          if (!original || params[0] !== original.page_id || row.chunk_text !== original.chunk_text) {
-            throw new Error('Embedding update must address the existing chunk row and text');
-          }
-          embeddedChunks.push({ ...original,
-            embedding: row.embedding == null ? undefined : new Float32Array(JSON.parse(row.embedding)),
-            model: typeof row.model === 'string' ? row.model : undefined,
-          });
+      throw new Error(`Unexpected fixture SQL: ${sql}`);
+    },
+    // installPageEmbeddings writes each vector batch through the typed member.
+    async installChunkEmbeddings(pageId: number, _column: unknown, batch: string) {
+      for (const row of JSON.parse(batch) as Array<{ id: number; chunk_text: string; embedding: string | null; model: string | null }>) {
+        const original = storedChunks.find(chunk => chunk.id === row.id);
+        if (!original || pageId !== original.page_id || row.chunk_text !== original.chunk_text) {
+          throw new Error('Embedding update must address the existing chunk row and text');
         }
-        return [];
+        embeddedChunks.push({ ...original,
+          embedding: row.embedding == null ? undefined : new Float32Array(JSON.parse(row.embedding)),
+          model: typeof row.model === 'string' ? row.model : undefined,
+        });
       }
-      if (!sql.includes('FROM sources')) throw new Error(`Unexpected fixture SQL: ${sql}`);
-      return [{
+    },
+    async getSource() {
+      return {
         id: 'default',
         name: 'Default',
         local_path: null,
@@ -557,7 +559,7 @@ function makeServiceEngine(chunks: ChunkInput[]) {
         created_at: new Date('2026-01-01T00:00:00Z'),
         contextual_retrieval_mode: null,
         trust_frontmatter_overrides: false,
-      }];
+      };
     },
     async getChunks() {
       return storedChunks;

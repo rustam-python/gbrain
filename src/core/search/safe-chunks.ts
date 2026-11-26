@@ -5,6 +5,23 @@ import { jsonRowBatches } from '../batch-rows.ts';
 /** First markdown index built from the strict full-body fence sanitizer. */
 export const SAFE_FENCE_CHUNKER_VERSION = 4;
 
+/**
+ * `pages.chunker_version` of a sealed segmented page whose live chunks were all made by this chunker. Segments are
+ * chunked by the markdown pipeline (chunkProjectedText, fencedCodeChunks) under the same safe-fence contract, so it
+ * stays at or above SAFE_FENCE_CHUNKER_VERSION, but it is its own identity: inline pages keep MARKDOWN_CHUNKER_VERSION.
+ *
+ * 5: the hard cap's forced cuts land on a sentence or line end (chunkProjectedText `boundaryCuts`), so a sentence the
+ * cap used to split now sits whole in one chunk; and a timeline segment with bullet lines breaks only at bullet starts
+ * chosen by the bullet itself (chunkers/bullet-chunks.ts), so an entry added at the top changes only the passage it joins.
+ * Pages sealed at 4 keep serving their chunks until
+ * `gbrain reindex --segmented --apply` re-chunks them (page-body/rechunk.ts). A change to the cuts or the stored
+ * per-segment metadata bumps SEGMENTER_VERSION instead.
+ *
+ * It lives here, not in page-body/segment-chunks.ts (which re-exports it), because the engines read it and this module
+ * has no chunker imports: the chunkers reach the tree-sitter wasm asset, which Node (the OpenClaw host) cannot load.
+ */
+export const SEGMENTED_CHUNKER_VERSION = 5;
+
 const PROTECTED_MARKER = '<!--- gbrain:(facts|takes):(begin|end) -->';
 
 export function hasProtectedBody(text: string): boolean {
@@ -27,6 +44,13 @@ export function protectedBodyFilter(alias: string): string {
     ELSE (${protectedTextFilter(`${alias}.compiled_truth`)} OR ${protectedTextFilter(`${alias}.timeline`)}) END)`;
 }
 
+/** GST-3058: protectedBodyFilter for takes fences only; a segmented page's flag does not tell the two apart, so it counts (fail closed). */
+export function protectedTakesFilter(alias: string): string {
+  const takes = (expression: string) => `COALESCE(${expression}, '') ~ '<!--- gbrain:takes:(begin|end) -->'`;
+  return `(CASE WHEN ${alias}.body_storage = 'segmented' THEN ${alias}.body_flags->>'has_protected' IS DISTINCT FROM 'false'
+    ELSE (${takes(`${alias}.compiled_truth`)} OR ${takes(`${alias}.timeline`)}) END)`;
+}
+
 /** A body-only write cannot certify old fragments, even after fence removal. */
 export function bodyWriteChunkVersion(compiledTruth: string, timeline: string): string {
   return `CASE WHEN pages.compiled_truth IS NOT DISTINCT FROM ${compiledTruth}
@@ -43,6 +67,23 @@ export function requiresSafeChunks(scope?: PageReadScope): boolean {
 /** Every user sees projections only from the current canonical revision. */
 export function currentTextProjectionFilter(alias: string): string {
   return `(${alias}.text_projection_revision = ${alias}.knowledge_revision) IS TRUE`;
+}
+
+/**
+ * #9192: the `text_projection_revision` v153's activation leaves on a page whose pre-upgrade index it keeps serving
+ * (PAGE_PROJECTION_ACTIVATION_SQL says which). The page stays unsealed (its rebuild is queued); any revision change
+ * clears the column (pages_knowledge_revision trigger), and so does the rebuild. A version-0 UUID: every revision is
+ * gen_random_uuid() (version 4), so the marker never equals one and every strict `= knowledge_revision` read treats
+ * the page as not current.
+ */
+export const ACTIVATION_SERVED_REVISION = '00000000-0000-0000-0000-000000000153';
+
+/**
+ * What search serves: the current projection, or the pre-activation index of a page unchanged since (#9192). The
+ * current-projection term stays its own disjunct so the planner keeps reading pages_text_projection_current_stats.
+ */
+export function servedTextProjectionFilter(alias: string): string {
+  return `(${currentTextProjectionFilter(alias)} OR (${alias}.text_projection_revision = '${ACTIVATION_SERVED_REVISION}'::uuid) IS TRUE)`;
 }
 
 /**
@@ -95,13 +136,14 @@ export async function chunkManifestReads(engine: Pick<BrainEngine, 'kind' | 'exe
 }
 
 /**
- * Search-facing chunk visibility: the current text projection and the live body generation. A sealed page holds no
+ * Search-facing chunk visibility: the served text projection and the live body generation; maintenance reads pass
+ * currentTextProjectionFilter. A sealed page holds no
  * rows of a retired occurrence (the flip deletes them in its transaction, or leaves the page unsealed until the
  * projection job has), so the row predicate needs no manifest probe, whose per-row cost moved vector search off its
  * HNSW plan (test/e2e/vector-chunk-statistics-postgres.test.ts).
  */
-export function chunkVisibleFilter(page: string, chunk: string): string {
-  return `(${currentTextProjectionFilter(page)}
+export function chunkVisibleFilter(page: string, chunk: string, projection = servedTextProjectionFilter): string {
+  return `(${projection(page)}
        AND (${chunk}.body_generation IS NULL OR ${chunk}.body_generation <= ${page}.body_generation))`;
 }
 

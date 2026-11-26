@@ -27,13 +27,6 @@
         },
         {
           "handlers": [
-            "mcpForegroundMiddleware"
-          ],
-          "method": "use",
-          "path": "/mcp"
-        },
-        {
-          "handlers": [
             "corsMiddleware"
           ],
           "method": "use",
@@ -673,6 +666,23 @@
             "<anonymous>"
           ],
           "method": "get",
+          "path": "/admin/api/access/handover/:id"
+        },
+        {
+          "handlers": [
+            "requireAdmin#4",
+            "jsonParser",
+            "<anonymous>"
+          ],
+          "method": "post",
+          "path": "/admin/api/access/handover"
+        },
+        {
+          "handlers": [
+            "requireAdmin#4",
+            "<anonymous>"
+          ],
+          "method": "get",
           "path": "/admin/api/memory-proposals"
         },
         {
@@ -691,6 +701,23 @@
           ],
           "method": "post",
           "path": "/admin/api/memory-proposals/:request_id"
+        },
+        {
+          "handlers": [
+            "requireAdmin#4",
+            "<anonymous>"
+          ],
+          "method": "get",
+          "path": "/admin/api/policy"
+        },
+        {
+          "handlers": [
+            "requireAdmin#4",
+            "jsonParser",
+            "<anonymous>"
+          ],
+          "method": "post",
+          "path": "/admin/api/policy/accept"
         },
         {
           "handlers": [
@@ -734,6 +761,7 @@
           "handlers": [
             "<anonymous>",
             "<anonymous>",
+            "mcpForegroundMiddleware",
             "<anonymous>",
             "<anonymous>"
           ],
@@ -781,13 +809,6 @@
           ],
           "method": "use",
           "path": null
-        },
-        {
-          "handlers": [
-            "mcpForegroundMiddleware"
-          ],
-          "method": "use",
-          "path": "/mcp"
         },
         {
           "handlers": [
@@ -1474,6 +1495,23 @@
             "<anonymous>"
           ],
           "method": "get",
+          "path": "/admin/api/access/handover/:id"
+        },
+        {
+          "handlers": [
+            "requireAdmin#4",
+            "jsonParser",
+            "<anonymous>"
+          ],
+          "method": "post",
+          "path": "/admin/api/access/handover"
+        },
+        {
+          "handlers": [
+            "requireAdmin#4",
+            "<anonymous>"
+          ],
+          "method": "get",
           "path": "/admin/api/memory-proposals"
         },
         {
@@ -1492,6 +1530,23 @@
           ],
           "method": "post",
           "path": "/admin/api/memory-proposals/:request_id"
+        },
+        {
+          "handlers": [
+            "requireAdmin#4",
+            "<anonymous>"
+          ],
+          "method": "get",
+          "path": "/admin/api/policy"
+        },
+        {
+          "handlers": [
+            "requireAdmin#4",
+            "jsonParser",
+            "<anonymous>"
+          ],
+          "method": "post",
+          "path": "/admin/api/policy/accept"
         },
         {
           "handlers": [
@@ -1535,6 +1590,7 @@
           "handlers": [
             "<anonymous>",
             "<anonymous>",
+            "mcpForegroundMiddleware",
             "<anonymous>",
             "<anonymous>"
           ],
